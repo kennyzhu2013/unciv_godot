@@ -44,6 +44,8 @@ internal class GameSession(private val root: File) {
                 return response
             }
             ensure(request.integer("revision") == revision, "STALE_STATE", "状态已变化，请刷新后重试")
+            if (action == "diplomacyOptions") return reply("data" to DiplomacyCommands(requireGame(), sessionId, revision).options())
+            if (action == "religionOptions") return reply("data" to ReligionCommands(requireGame(), sessionId, revision).options())
             if (action == "unitOptions" || action == "cityOptions") {
                 val snapshot = PlayerSnapshot(requireGame())
                 val data = if (action == "unitOptions") snapshot.unitOptions(unit(snapshot, request.integer("unitId")))
@@ -69,6 +71,8 @@ internal class GameSession(private val root: File) {
             } else null
             if (action == "combatPreview") return reply("data" to preparedAttack!!.preview())
             val preparedAction: (() -> Unit)? = when (action) {
+                "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision" ->
+                    DiplomacyCommands(requireGame(), sessionId, revision).prepare(request)
                 "cityBuyTile" -> CityEconomyCommands(requireGame()).prepareBuyTile(request)
                 "cityPurchase" -> CityEconomyCommands(requireGame()).preparePurchase(request)
                 "citySellBuilding" -> CityEconomyCommands(requireGame()).prepareSellBuilding(request)
@@ -81,6 +85,8 @@ internal class GameSession(private val root: File) {
                 "cityResetCitizens" -> { validateGame(requireGame()); CityDevelopmentCommands(requireGame()).prepareReset(request.text("cityId")) }
                 "citySpecialists" -> { validateGame(requireGame()); CityDevelopmentCommands(requireGame()).prepareSpecialists(request.text("cityId"), request.text("type"), request.text("name"), request["enabled"]?.jsonPrimitive?.booleanOrNull) }
                 "cityQueue" -> { validateGame(requireGame()); CityDevelopmentCommands(requireGame()).prepareQueue(request.text("cityId"), request.text("type"), request.text("name"), request["index"]?.jsonPrimitive?.intOrNull) }
+                "religionUseProphet", "religionChooseBeliefs", "religionFound" ->
+                    ReligionCommands(requireGame(), sessionId, revision).prepare(request)
                 else -> null
             }
             if (action == "nextTurn") {
@@ -119,8 +125,10 @@ internal class GameSession(private val root: File) {
                 when (action) {
                     "load", "demo" -> Unit
                     "attack" -> battleResult = preparedAttack!!.execute()
+                    "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision",
                     "unitAction", "cityDecision", "workerOrder",
-                    "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding" -> preparedAction!!.invoke()
+                    "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding",
+                    "religionUseProphet", "religionChooseBeliefs", "religionFound" -> preparedAction!!.invoke()
                     "move" -> {
                         val unit = unit(snapshot, request.integer("unitId"))
                         val tile = destination(snapshot, request)
@@ -277,7 +285,9 @@ internal class GameSession(private val root: File) {
             AlertType.ReligionSpreadDespiteOurPromise, AlertType.AttackedUsDespitePromise)
         /** 原客户端直接作用于当前局、会修改状态的玩家命令；save 只读不改，nextTurn 在副本上执行。 */
         val inPlaceCommands = setOf("move", "foundCity", "production", "research", "policy", "deferPolicy", "acknowledge", "declineTrade",
+                    "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision",
                     "attack", "unitAction", "cityDecision", "workerOrder",
-                    "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding")
+                    "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding",
+                    "religionUseProphet", "religionChooseBeliefs", "religionFound")
     }
 }

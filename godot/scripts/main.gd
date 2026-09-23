@@ -63,6 +63,7 @@ var focus_option: OptionButton = null
 const TAB_UNIT := 0
 const TAB_CITY := 1
 const TAB_MATTERS := 2
+const TAB_DIPLOMACY := 3
 const CTAB_OVERVIEW := 0
 const CTAB_POPULATION := 1
 const CTAB_QUEUE := 2
@@ -102,6 +103,22 @@ var city_stamp: Dictionary = {}
 var economy_transaction := false
 var buy_tile_mode := false
 var buy_tile_target: Dictionary = {}
+# 外交上下文独立于单位／城市选择；事务覆盖写请求及其后的详情刷新。
+var diplomacy_civ_id := ""
+var diplomacy_generation := 0
+var diplomacy_data: Dictionary = {}
+var diplomacy_stamp: Dictionary = {}
+var diplomacy_payload: Dictionary = {}
+var diplomacy_transaction := false
+var diplomacy_confirmation := ConfirmationDialog.new()
+var diplomacy_picker := OptionButton.new()
+var diplomacy_pending := VBoxContainer.new()
+var diplomacy_details := VBoxContainer.new()
+var diplomacy_scroll: ScrollContainer
+var diplomacy_our_gold := SpinBox.new()
+var diplomacy_their_gold := SpinBox.new()
+var diplomacy_gold_box := VBoxContainer.new()
+var diplomacy_open_button: Button
 
 const ACTION_NAMES := {"skip": "跳过／取消跳过本回合", "fortify": "驻防", "fortifyUntilHealed": "驻防至恢复",
 	"sleep": "休眠", "sleepUntilHealed": "休眠至恢复", "setUp": "架设"}
@@ -122,6 +139,7 @@ func _ready() -> void:
 	client.busy_changed.connect(_on_busy)
 	client.state_invalidated.connect(_clear_combat)
 	client.state_invalidated.connect(_cancel_economy)
+	client.state_invalidated.connect(_invalidate_diplomacy)
 	map.tile_selected.connect(_select_tile)
 	map.move_requested.connect(_preview_target)
 	var hello: Dictionary = await execute("hello")
@@ -230,6 +248,7 @@ func _build_right_panel(parent: Node) -> void:
 	_build_unit_tab()
 	_build_city_tab()
 	_build_matters_tab()
+	_build_diplomacy_tab()
 
 func _page_scroll(name: String) -> VBoxContainer:
 	var scroll: ScrollContainer
@@ -404,6 +423,255 @@ func _build_economy_tab() -> void:
 	economy_confirmation.theme = dialog_theme
 	add_child(economy_confirmation)
 
+func _build_diplomacy_tab() -> void:
+	var page := VBoxContainer.new()
+	page.name = "外交"
+	page.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	page.add_theme_constant_override("separation", 8)
+	tabs.add_child(page)
+	diplomacy_picker.name = "DiplomacyPicker"
+	diplomacy_picker.fit_to_longest_item = false
+	diplomacy_picker.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	diplomacy_picker.custom_minimum_size.y = 34
+	page.add_child(diplomacy_picker)
+	diplomacy_picker.item_selected.connect(_select_diplomacy_civ)
+	diplomacy_scroll = ScrollContainer.new()
+	diplomacy_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	diplomacy_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	page.add_child(diplomacy_scroll)
+	var content := VBoxContainer.new()
+	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	content.add_theme_constant_override("separation", 8)
+	diplomacy_scroll.add_child(content)
+	content.add_child(diplomacy_pending)
+	content.add_child(diplomacy_details)
+	content.add_child(diplomacy_gold_box)
+	for pair in [["我方支付（一次性金币）", diplomacy_our_gold, "OurGold"], ["对方支付（一次性金币）", diplomacy_their_gold, "TheirGold"]]:
+		_diplomacy_text(diplomacy_gold_box, pair[0])
+		var spin: SpinBox = pair[1]
+		spin.name = pair[2]
+		spin.min_value = 0
+		spin.step = 1
+		spin.rounded = true
+		spin.custom_minimum_size.y = 34
+		diplomacy_gold_box.add_child(spin)
+	var propose := button(diplomacy_gold_box, "发送和平提案", _request_peace)
+	propose.name = "ProposePeace"
+	diplomacy_gold_box.hide()
+	diplomacy_confirmation.name = "DiplomacyConfirmation"
+	diplomacy_confirmation.title = "确认外交操作"
+	diplomacy_confirmation.get_ok_button().text = "确认"
+	diplomacy_confirmation.get_cancel_button().text = "取消"
+	diplomacy_confirmation.dialog_autowrap = true
+	var dialog_theme := Theme.new()
+	dialog_theme.set_constant("buttons_min_height", "AcceptDialog", 34)
+	diplomacy_confirmation.theme = dialog_theme
+	diplomacy_confirmation.confirmed.connect(_confirm_diplomacy)
+	diplomacy_confirmation.canceled.connect(_cancel_diplomacy)
+	diplomacy_confirmation.close_requested.connect(_cancel_diplomacy)
+	add_child(diplomacy_confirmation)
+
+func _diplomacy_text(parent: Node, text: String) -> void:
+	var line := Label.new()
+	line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	line.text = text
+	parent.add_child(line)
+
+func _open_diplomacy() -> void:
+	if _input_locked():
+		return
+	var alert = client.snapshot.get("pending", []).filter(func(item): return item.get("diplomacy", false))
+	if not alert.is_empty():
+		diplomacy_civ_id = str(alert[0].get("target", ""))
+	if tabs.current_tab == TAB_DIPLOMACY:
+		await _refresh_diplomacy()
+	else:
+		tabs.current_tab = TAB_DIPLOMACY
+
+func _cancel_diplomacy() -> void:
+	diplomacy_payload = {}
+	diplomacy_confirmation.hide()
+	_on_busy(client.busy)
+
+func _invalidate_diplomacy() -> void:
+	diplomacy_generation += 1
+	diplomacy_stamp = {}
+	diplomacy_data = {}
+	diplomacy_our_gold.value = 0
+	diplomacy_their_gold.value = 0
+	_cancel_diplomacy()
+
+func _diplomacy_state_stamp(ticket := "") -> Dictionary:
+	return {"session": client.session, "gameId": current_game, "revision": client.revision,
+		"loadEpoch": load_epoch, "selectionGeneration": selection_generation, "diplomacyGeneration": diplomacy_generation,
+		"civId": diplomacy_civ_id, "ticket": ticket}
+
+func _diplomacy_stamp_valid(stamp: Dictionary) -> bool:
+	if stamp.is_empty() or stamp != _diplomacy_state_stamp(str(stamp.get("ticket", ""))):
+		return false
+	var ticket := str(stamp.get("ticket", ""))
+	if ticket.is_empty():
+		return true
+	for pending_item in [diplomacy_data.get("incomingTrade"), diplomacy_data.get("pendingAlert")]:
+		if pending_item is Dictionary and ticket == str(pending_item.get("tradeToken", pending_item.get("alertToken", ""))):
+			return true
+	return _diplomacy_civ().get("outgoingTrades", []).any(func(offer): return str(offer.tradeToken) == ticket)
+
+func _refresh_diplomacy() -> void:
+	if client.busy or client.snapshot.is_empty():
+		return
+	var stamp := _diplomacy_state_stamp()
+	var result: Dictionary = await client.command("diplomacyOptions")
+	_apply_diplomacy_response(result, stamp)
+
+# 旧响应注入测试也调用本入口；不将注入声称为网络乱序。
+func _apply_diplomacy_response(result: Dictionary, stamp: Dictionary) -> bool:
+	if not _diplomacy_stamp_valid(stamp):
+		return false
+	if not result.get("ok", false):
+		diplomacy_stamp = {}
+		diplomacy_data = {}
+		_populate_diplomacy()
+		message.text = str(result.get("error", {}).get("message", "外交查询失败"))
+		return false
+	if str(result.get("session", "")) != str(stamp.session) or int(result.get("revision", -1)) != int(stamp.revision):
+		return false
+	diplomacy_data = result.data
+	var civs: Array = diplomacy_data.get("civilizations", [])
+	if not civs.any(func(civ): return str(civ.civId) == diplomacy_civ_id):
+		diplomacy_civ_id = str(civs[0].civId) if not civs.is_empty() else ""
+		diplomacy_generation += 1
+	diplomacy_stamp = _diplomacy_state_stamp()
+	_populate_diplomacy()
+	return true
+
+func _select_diplomacy_civ(index: int) -> void:
+	if _input_locked() or index < 0:
+		return
+	diplomacy_civ_id = str(diplomacy_picker.get_item_metadata(index))
+	diplomacy_generation += 1
+	diplomacy_our_gold.value = 0
+	diplomacy_their_gold.value = 0
+	diplomacy_stamp = _diplomacy_state_stamp()
+	_populate_diplomacy()
+
+func _diplomacy_civ() -> Dictionary:
+	for civ in diplomacy_data.get("civilizations", []):
+		if str(civ.civId) == diplomacy_civ_id:
+			return civ
+	return {}
+
+func _trade_terms(trade: Dictionary) -> String:
+	var lines := PackedStringArray()
+	for side in [["ourOffers", "我方给出"], ["theirOffers", "对方给出"]]:
+		var terms := PackedStringArray()
+		for item in trade.get(side[0], []):
+			terms.append("%s ×%s%s" % [item.label, _num(item.get("amount"), true), "（%s 回合）" % _num(item.duration, true) if item.get("duration") != null else ""])
+		lines.append("%s：%s" % [side[1], "、".join(terms) if not terms.is_empty() else "无"])
+	return "\n".join(lines)
+
+func _diplomacy_choice(parent: Node, option: Dictionary, action: String, params: Dictionary, description: String) -> Button:
+	var payload := {"action": action, "params": params.duplicate(true), "description": description,
+		"stamp": _diplomacy_state_stamp(str(params.get("tradeToken", params.get("alertToken", ""))))}
+	var control := button(parent, str(option.label), _open_diplomacy_confirmation.bind(payload))
+	control.name = "Diplomacy_" + str(option.id)
+	control.set_meta("allowed", option.get("enabled", false) and _diplomacy_stamp_valid(diplomacy_stamp))
+	control.tooltip_text = str(option.get("reason", ""))
+	if not option.get("enabled", false):
+		_diplomacy_text(parent, str(option.get("reason", "")))
+	return control
+
+func _populate_diplomacy() -> void:
+	_clear_dynamic(diplomacy_pending)
+	_clear_dynamic(diplomacy_details)
+	diplomacy_picker.clear()
+	for civ in diplomacy_data.get("civilizations", []):
+		diplomacy_picker.add_item(str(civ.name))
+		diplomacy_picker.set_item_metadata(diplomacy_picker.item_count - 1, str(civ.civId))
+		diplomacy_picker.set_item_tooltip(diplomacy_picker.item_count - 1, str(civ.name))
+	diplomacy_picker.select(_picker_index_by_str(diplomacy_picker, diplomacy_civ_id))
+	var alert = diplomacy_data.get("pendingAlert")
+	var trade = diplomacy_data.get("incomingTrade")
+	if alert is Dictionary:
+		_diplomacy_text(diplomacy_pending, "当前事件：" + str(alert.message))
+		for choice in alert.get("choices", []):
+			var warning := "\n" + "\n".join(alert.get("warWarnings", [])) if choice.id in ["declareWar", "refuseAndDeclareWar"] else ""
+			_diplomacy_choice(diplomacy_pending, choice, "diplomacyAlertDecision", {"alertToken": str(alert.alertToken), "choice": str(choice.id)}, str(alert.message) + "\n" + str(choice.label) + warning)
+	if trade is Dictionary:
+		_diplomacy_text(diplomacy_pending, "收到 %s 的提案\n%s" % [trade.name, _trade_terms(trade)])
+		if not trade.get("supported", false):
+			_diplomacy_text(diplomacy_pending, "含未支持条件：需原客户端接受，不能仅接受部分条款。")
+		for choice in trade.get("choices", []):
+			_diplomacy_choice(diplomacy_pending, choice, "diplomacyTradeDecision", {"tradeToken": str(trade.tradeToken), "choice": str(choice.id)}, "%s\n%s\n%s" % [trade.name, choice.label, _trade_terms(trade)])
+	if not alert is Dictionary and not trade is Dictionary:
+		_diplomacy_text(diplomacy_pending, "没有外交待决。其他强制选择请查看事项页。")
+	var civ := _diplomacy_civ()
+	diplomacy_gold_box.visible = civ.get("type", "") == "major"
+	if civ.is_empty():
+		_diplomacy_text(diplomacy_details, "尚无可显示的已接触文明。")
+		_on_busy(client.busy)
+		return
+	_diplomacy_text(diplomacy_details, "%s · %s\n关系：%s\n和平条约剩余：%s 回合 · 议和冷却：%s 回合" % [civ.name, civ.status, civ.relationship, _num(civ.get("peaceTreatyTurns"), true), _num(civ.get("peaceNegotiationBlockedTurns"), true)])
+	if civ.get("type") == "cityState":
+		_diplomacy_text(diplomacy_details, "城邦（只读）· 影响力：%s" % _num(civ.get("influence")))
+	else:
+		_diplomacy_text(diplomacy_details, "对方对我方评价：%s · 友好剩余：%s 回合" % [_num(civ.get("opinion")), _num(civ.get("friendshipTurns"), true)])
+		for modifier in civ.get("modifiers", []):
+			_diplomacy_text(diplomacy_details, "%s评价 · %s：%s" % ["我方" if modifier.observer == "us" else "对方", modifier.name, _num(modifier.value)])
+		for promise in civ.get("promises", []):
+			_diplomacy_text(diplomacy_details, "%s承诺 %s：%s 回合" % ["我方" if promise.giver == "us" else "对方", promise.type, _num(promise.turns, true)])
+		_diplomacy_choice(diplomacy_details, civ.actions.declareWar, "diplomacyDeclareWar", {"civId": str(civ.civId)}, "对 %s 宣战\n%s" % [civ.name, "\n".join(civ.get("warWarnings", []))])
+		diplomacy_our_gold.max_value = int(civ.gold.ourAvailable)
+		diplomacy_their_gold.max_value = int(civ.gold.theirAvailable)
+		var propose: Button = diplomacy_gold_box.get_node("ProposePeace")
+		propose.set_meta("allowed", civ.actions.proposePeace.enabled and _diplomacy_stamp_valid(diplomacy_stamp))
+		propose.tooltip_text = str(civ.actions.proposePeace.reason)
+		_diplomacy_text(diplomacy_details, "可报价余额：我方 %s／对方 %s\n%s" % [_num(civ.gold.ourAvailable, true), _num(civ.gold.theirAvailable, true), civ.actions.proposePeace.reason])
+		for offer in civ.get("outgoingTrades", []):
+			_diplomacy_text(diplomacy_details, "已发提案（等待对方回合）\n" + _trade_terms(offer))
+			_diplomacy_choice(diplomacy_details, offer.retract, "diplomacyRetractPeace", {"civId": str(civ.civId), "tradeToken": str(offer.tradeToken)}, "%s\n撤回提案\n%s" % [civ.name, _trade_terms(offer)])
+	_on_busy(client.busy)
+
+func _request_peace() -> void:
+	var civ := _diplomacy_civ()
+	if civ.is_empty() or not civ.get("actions", {}).get("proposePeace", {}).get("enabled", false):
+		return
+	var ours := int(diplomacy_our_gold.value)
+	var theirs := int(diplomacy_their_gold.value)
+	await _open_diplomacy_confirmation({"action": "diplomacyProposePeace", "params": {"civId": diplomacy_civ_id, "ourGold": ours, "theirGold": theirs}, "stamp": diplomacy_stamp.duplicate(true),
+		"description": "%s\n双方各签署和平条约（%s 回合）\n我方支付：%s 金币／对方支付：%s 金币\n发送不会立即停战，等待对方回合处理。" % [civ.name, _num(civ.proposedTreatyTurns, true), ours, theirs]})
+
+func _open_diplomacy_confirmation(payload: Dictionary) -> void:
+	if _input_locked():
+		return
+	if not _diplomacy_stamp_valid(diplomacy_stamp) or not _diplomacy_stamp_valid(payload.get("stamp", {})):
+		await _refresh_diplomacy()
+		message.text = "外交详情已过期，请重新确认。"
+		return
+	diplomacy_payload = payload.duplicate(true)
+	diplomacy_confirmation.dialog_text = str(payload.description)
+	diplomacy_confirmation.popup_centered(Vector2i(mini(480, int(size.x) - 48), mini(400, int(size.y) - 80)))
+	_on_busy(false)
+
+func _confirm_diplomacy() -> void:
+	var payload := diplomacy_payload.duplicate(true)
+	_cancel_diplomacy()
+	if client.busy or economy_transaction or diplomacy_transaction or payload.is_empty():
+		return
+	if not _diplomacy_stamp_valid(payload.get("stamp", {})):
+		await _refresh_diplomacy()
+		message.text = "外交选择已失效，未提交。请重新确认。"
+		return
+	diplomacy_transaction = true
+	_on_busy(true)
+	var result := await execute(str(payload.action), payload.params, false, true)
+	diplomacy_transaction = false
+	_on_busy(client.busy)
+	if result.get("ok", false):
+		message.text = "提案已发送，当前仍在战争中，等待对方回合。" if payload.action == "diplomacyProposePeace" else "外交操作完成 · 状态版本 %s" % client.revision
+	else:
+		message.text = str(result.get("error", {}).get("message", "外交操作失败"))
+
 func _city_sub_page(sub_name: String) -> VBoxContainer:
 	var scroll := ScrollContainer.new()
 	scroll.name = sub_name
@@ -424,7 +692,8 @@ func _build_matters_tab() -> void:
 	pending.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	page.add_child(pending)
 	button(page, "消息已阅", func(): await execute("acknowledge"))
-	button(page, "拒绝交易提议", func(): await execute("declineTrade"))
+	diplomacy_open_button = button(page, "打开外交处理", _open_diplomacy)
+	diplomacy_open_button.name = "OpenDiplomacy"
 	label(page, "科研")
 	page.add_child(research_picker)
 	button(page, "选择科技", func():
@@ -448,6 +717,10 @@ func _on_tab_selected(index: int) -> void:
 		_set_city_mode(false)
 	if index != TAB_CITY:
 		_set_buy_tile_mode(false)
+	if index == TAB_DIPLOMACY:
+		target.clear()
+		_clear_combat()
+		await _refresh_diplomacy()
 
 func _on_city_tab_selected(index: int) -> void:
 	# 切离人口子页即退出城市地块管理；返回时由用户显式重新进入。
@@ -520,7 +793,10 @@ func label(parent: Node, text: String) -> void:
 	parent.add_child(result)
 
 func _on_busy(is_busy: bool) -> void:
-	is_busy = is_busy or economy_transaction
+	is_busy = is_busy or economy_transaction or diplomacy_transaction or diplomacy_confirmation.visible or economy_confirmation.visible
+	diplomacy_picker.disabled = is_busy or diplomacy_picker.item_count == 0
+	for spin in [diplomacy_our_gold, diplomacy_their_gold]:
+		spin.editable = not is_busy and diplomacy_gold_box.visible
 	if tabs:
 		tabs.get_tab_bar().mouse_filter = Control.MOUSE_FILTER_IGNORE if is_busy else Control.MOUSE_FILTER_STOP
 	if city_tabs:
@@ -551,9 +827,14 @@ func _on_busy(is_busy: bool) -> void:
 	else:
 		message.text = "内核处理中……界面仍可拖动和缩放"
 
-func execute(action: String, params: Dictionary = {}, economic_commit := false) -> Dictionary:
-	if economy_transaction and not economic_commit and action not in ["cityOptions", "unitOptions", "snapshot"]:
-		return {"ok": false, "error": {"code": "BUSY", "message": "经济事务尚未完成"}}
+func execute(action: String, params: Dictionary = {}, economic_commit := false, diplomatic_commit := false) -> Dictionary:
+	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "snapshot"]
+	if (economy_transaction and not economic_commit or diplomacy_transaction and not diplomatic_commit) and not query:
+		return {"ok": false, "error": {"code": "BUSY", "message": "当前事务尚未完成"}}
+	if diplomacy_confirmation.visible and not query and action not in ["load", "demo"]:
+		return {"ok": false, "error": {"code": "BUSY", "message": "请先确认或取消外交选择"}}
+	if action == "snapshot":
+		_invalidate_diplomacy()
 	if action in ["load", "demo"]:
 		load_epoch += 1
 		_reset_selection()
@@ -567,11 +848,12 @@ func execute(action: String, params: Dictionary = {}, economic_commit := false) 
 			if confirmation.confirmed.is_connected(_confirm_founding):
 				confirmation.confirmed.disconnect(_confirm_founding)
 			confirmation.confirmed.connect(_confirm_founding, CONNECT_ONE_SHOT)
-		if failure.get("code") == "STALE_STATE":
+		if failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST"]:
 			_cancel_economy()
+			_invalidate_diplomacy()
 			await client.command("snapshot")
 			await _refresh_active_context()
-		elif economic_commit:
+		elif economic_commit or diplomatic_commit:
 			await _refresh_active_context()
 		message.text = str(failure.get("message", "请求失败"))
 	else:
@@ -663,13 +945,16 @@ func _rebuild_pending(data: Dictionary) -> void:
 				control.set_meta("allowed", option.enabled)
 				control.tooltip_text = option.reason
 	pending.text = "\n".join(lines) if not lines.is_empty() else "无强制选择；可以结束回合。"
-	bottom_pending.text = ("待办 %d 项（详见「事项」页）" % actionable) if actionable > 0 else "无强制选择；可以结束回合。"
+	bottom_pending.text = ("待办 %d 项（其中 %d 项已接入，详见「事项」页）" % [data.pending.size(), actionable]) if not data.pending.is_empty() else "无强制选择；可以结束回合。"
+	diplomacy_open_button.set_meta("allowed", data.pending.any(func(item): return item.get("diplomacy", false)))
 	# 待决占城优先显示处置区。
 	if not capture_id.is_empty():
 		tabs.current_tab = TAB_UNIT
 
 # 本地选择状态：用户切换选择或重载时自增代际；异步详情回填前比对，任一不符即丢弃。
 func _reset_selection() -> void:
+	_invalidate_diplomacy()
+	diplomacy_civ_id = ""
 	_set_buy_tile_mode(false)
 	city_stamp = {}
 	active_context = ""
@@ -709,6 +994,9 @@ func _own_city_exists(id: String) -> bool:
 
 # 写命令后统一按仍存在且仍己方的 ID 重新解析活动面板；对象消失或失去所有权则清空对应上下文。
 func _refresh_active_context() -> void:
+	if tabs and (tabs.current_tab == TAB_DIPLOMACY or diplomacy_transaction):
+		await _refresh_diplomacy()
+		return
 	if active_context == "unit":
 		if _own_unit_exists(unit_id):
 			await _resolve_unit(unit_id, selection_generation)
@@ -936,7 +1224,7 @@ func _stamp_valid(stamp: Dictionary) -> bool:
 	return not stamp.is_empty() and stamp == _state_stamp() and _own_city_exists(city_id)
 
 func _input_locked() -> bool:
-	return client.busy or economy_transaction or economy_confirmation.visible
+	return client.busy or economy_transaction or diplomacy_transaction or economy_confirmation.visible or diplomacy_confirmation.visible
 
 func _economy() -> Dictionary:
 	return city_data.get("economy", {})
@@ -1102,7 +1390,7 @@ func _open_economy(payload: Dictionary) -> void:
 func _confirm_economy() -> void:
 	var payload := economy_payload.duplicate(true)
 	_cancel_economy()
-	if client.busy or economy_transaction or payload.is_empty():
+	if client.busy or economy_transaction or diplomacy_transaction or payload.is_empty():
 		return
 	if not _stamp_valid(payload.get("stamp", {})):
 		await _refresh_active_context()
@@ -1625,7 +1913,7 @@ func _unit_action(type: String) -> void:
 	await execute("unitAction", {"unitId": unit_id, "type": type})
 
 func _preview_target(tile: Dictionary) -> void:
-	if city_mode or buy_tile_mode or _input_locked():
+	if city_mode or buy_tile_mode or _input_locked() or tabs.current_tab == TAB_DIPLOMACY:
 		return
 	if map.attack_targets.has(Vector2i(int(tile.x), int(tile.y))):
 		await _preview_attack(tile)

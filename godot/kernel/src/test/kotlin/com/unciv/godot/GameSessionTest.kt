@@ -246,6 +246,7 @@ class GameSessionTest {
                 }
                 "policy" -> civ.policies.adopt(native.game.ruleset.policies[args.text("name")]!!)
                 "acknowledge" -> civ.popupAlerts.removeAt(0)
+                "diplomacyAlertDecision" -> DiplomacyFixtures.alertDecision(native.game, args.text("choice"))
                 "declineTrade" -> {
                     // 与 TradePopup 的“Not this time.”按钮逐行一致。
                     val tradeRequest = civ.tradeRequests.first()
@@ -354,6 +355,12 @@ class GameSessionTest {
                 "research" -> decide("research", "name" to snapshot["technologies"]!!.jsonArray.first().jsonPrimitive.content)
                 "policy" -> decide("policy", "name" to snapshot["policies"]!!.jsonArray.first().jsonPrimitive.content)
                 "alert" -> decide("acknowledge")
+                "diplomacyAlert" -> {
+                    val alert = run(session, "diplomacyOptions")["data"]!!.jsonObject["pendingAlert"]!!.jsonObject
+                    val choices = alert["choices"]!!.jsonArray.map { it.jsonObject }.filter { it.boolean("enabled") }
+                    val choice = choices.firstOrNull { it.text("id") in listOf("decline", "dismiss", "agree") } ?: choices.first()
+                    decide("diplomacyAlertDecision", "alertToken" to alert.text("alertToken"), "choice" to choice.text("id"))
+                }
                 "trade" -> decide("declineTrade")
                 else -> fail("未处理的决策：$decision")
             }
@@ -438,6 +445,46 @@ class GameSessionTest {
         val result = session.handle(request(session, "nextTurn"))
         assertEquals("PENDING_DECISION", result["error"]!!.jsonObject.text("code"))
         assertEquals(0, session.game!!.turns)
+    }
+
+    /**
+     * 会话级接线守护：religionOptions 经只读分支返回且不推进 revision；宗教待决经通用 snapshot.pending() 阻塞 nextTurn；
+     * religionFound 经 preparedAction／execute／inPlaceCommands 事务写入，与独立原生期望全存档一致且重放不重复写入。
+     * 期望端仅用原生桥接与 chooseBeliefs，不经 ReligionCommands／DTO。
+     */
+    @Test fun religionCommandsRouteThroughSessionTransactionAndGateNextTurn() {
+        val file = ReligionFixtures.export(ReligionFixtures.foundingGame(true), "session-religion")
+        val session = loadedSession(file)
+        val expected = UncivFiles.gameInfoFromString(file.readText())
+
+        assertEquals("PENDING_DECISION", session.handle(request(session, "nextTurn"))["error"]!!.jsonObject.text("code"))
+
+        val game = session.game!!
+        val revision = session.revision
+        val options = run(session, "religionOptions")["data"]!!.jsonObject
+        assertSame(game, session.game)
+        assertEquals(revision, session.revision)
+        val decision = options["decision"]!!.jsonObject
+        assertEquals("foundReligion", decision.text("mode"))
+
+        val symbol = options["symbols"]!!.jsonArray.map { it.jsonObject }.first { it.boolean("available") }.text("id")
+        val used = HashSet<String>()
+        val beliefs = decision["slots"]!!.jsonArray.map { slot ->
+            slot.jsonObject["candidateIds"]!!.jsonArray.map { it.jsonPrimitive.content }.first { used.add(it) }
+        }
+        ReligionFixtures.foundReligion(expected, "会话信仰", symbol, beliefs)
+
+        val body = request(session, "religionFound", "decisionToken" to decision.text("token"),
+            "religionId" to symbol, "displayName" to "会话信仰", "beliefs" to beliefs)
+        val response = session.handle(body)
+        assertTrue(response.toString(), response["ok"]!!.jsonPrimitive.boolean)
+        assertEquals(revision + 1, session.revision)
+        assertSame(game, session.game)
+        assertGameplayEquals("religionFound 会话事务", expected, session.game!!)
+
+        assertEquals(response, session.handle(body))
+        assertEquals(revision + 1, session.revision)
+        assertGameplayEquals("religionFound 重放", expected, session.game!!)
     }
 
     private fun gameplay(game: GameInfo) = GameplayAssertions.gameplay(game)

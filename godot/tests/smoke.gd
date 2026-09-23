@@ -9,6 +9,12 @@ var run_id := ""
 var started_at := ""
 var development_steps := 0
 var economy_steps := 0
+var diplomacy_steps := 0
+var diplomacy_expected: Dictionary = {}
+var diplomacy_lock_handoffs := 0
+var diplomacy_lock_valid := true
+var diplomacy_pan_checked := false
+var diplomacy_pan_result: Dictionary = {}
 var economy_expected: Dictionary = {}
 var economy_lock_handoffs := 0
 var economy_lock_valid := true
@@ -18,7 +24,7 @@ func run(frontend) -> void:
 	app = frontend
 	run_id = "smoke-%d" % int(Time.get_unix_time_from_system() * 1000.0)
 	started_at = Time.get_datetime_string_from_system(true)
-	get_tree().create_timer(150.0).timeout.connect(func(): _fail("端到端验证超时"))
+	get_tree().create_timer(360.0).timeout.connect(func(): _fail("端到端验证超时"))
 	for x in range(-12, 13):
 		for y in range(-12, 13):
 			var coordinate := Vector2i(x, y)
@@ -104,6 +110,8 @@ func run(frontend) -> void:
 		return
 	if not await verify_window_sizes():
 		return
+	if not await verify_diplomacy_flow():
+		return
 	await get_tree().process_frame
 	await get_tree().process_frame
 	var directory := ProjectSettings.globalize_path("res://.local")
@@ -114,13 +122,13 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy"],
+		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy"],
 		"windowSizes": window_sizes_checked,
-		"inputMethod": "viewport-window-mouse-motion-press-release (Input.parse_input_event)",
+		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
 		"tiles": app.map.tiles.size(), "units": app.map.unit_nodes.size(),
 		"turn": app.client.snapshot.turn, "savedPath": app.last_saved_path,
-		"developmentSteps": development_steps, "economySteps": economy_steps,
+		"developmentSteps": development_steps, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 		"renderBackend": DisplayServer.get_name()}, "\t"))
 	report.close()
 	archive_smoke_result()
@@ -300,6 +308,312 @@ func verify_combat_flow() -> bool:
 		if not check(before[key] == app.client.snapshot[key], "陆战重载一致性：" + key):
 			return false
 	steps.append("陆战后原生 AI 回合、原格式保存重载一致")
+	return true
+
+# —— 外交：业务写入只由真实窗口控件触发；注入仅用于显式陈旧响应测试。 ——
+func observe_diplomacy_lock(busy: bool) -> void:
+	if not app.diplomacy_transaction:
+		return
+	for control in app.buttons:
+		diplomacy_lock_valid = diplomacy_lock_valid and control.disabled
+	diplomacy_lock_valid = diplomacy_lock_valid and app.diplomacy_picker.disabled \
+		and not app.diplomacy_our_gold.editable and not app.diplomacy_their_gold.editable \
+		and app.tabs.get_tab_bar().mouse_filter == Control.MOUSE_FILTER_IGNORE
+	if not busy:
+		diplomacy_lock_handoffs += 1
+	# HTTP 完成回调中投递输入，避开确认按钮 gui_input 内嵌套分发的鼠标捕获。
+	if not busy and not diplomacy_pan_checked:
+		diplomacy_pan_checked = true
+		var pos: Vector2 = app.map_area.get_global_rect().get_center()
+		var before: Vector2 = app.map.position
+		var zoom: Vector2 = app.map.scale
+		push_window_input(get_viewport(), InputEventMouseMotion.new(), pos)
+		var press := InputEventMouseButton.new()
+		press.button_index = MOUSE_BUTTON_MIDDLE
+		press.pressed = true
+		push_window_input(get_viewport(), press, pos)
+		var motion := InputEventMouseMotion.new()
+		motion.button_mask = MOUSE_BUTTON_MASK_MIDDLE
+		push_window_input(get_viewport(), motion, pos + Vector2(24, 12))
+		var dragged: Vector2 = app.map.position
+		var release := InputEventMouseButton.new()
+		release.button_index = MOUSE_BUTTON_MIDDLE
+		push_window_input(get_viewport(), release, pos + Vector2(24, 12))
+		var wheel := InputEventMouseButton.new()
+		wheel.button_index = MOUSE_BUTTON_WHEEL_UP
+		wheel.pressed = true
+		push_window_input(get_viewport(), wheel, pos)
+		var wheel_release := InputEventMouseButton.new()
+		wheel_release.button_index = MOUSE_BUTTON_WHEEL_UP
+		push_window_input(get_viewport(), wheel_release, pos)
+		diplomacy_pan_result = {"locked": app._input_locked(), "transaction": app.diplomacy_transaction,
+			"before": str(before), "dragged": str(dragged), "after": str(app.map.position), "zoomBefore": str(zoom), "zoomAfter": str(app.map.scale)}
+		diplomacy_lock_valid = diplomacy_lock_valid and dragged != before and app.map.scale != zoom
+
+func load_diplomacy(name: String, matters := false) -> bool:
+	if not await perform("load", {"path": ProjectSettings.globalize_path("res://.local/tests/diplomacy-" + name + ".json")}):
+		return false
+	if matters:
+		if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.diplomacy_open_button):
+			return false
+	elif not await click_tab(app.tabs, app.TAB_DIPLOMACY):
+		return false
+	for i in range(app.diplomacy_picker.item_count):
+		if app.diplomacy_picker.get_item_text(i) == "Greece":
+			if app.diplomacy_picker.selected != i and not await click_option(app.diplomacy_picker, i):
+				return false
+	return check(not app.diplomacy_data.is_empty(), "外交详情已取得新版本")
+
+func diplomacy_control(choice: String, pending := false):
+	return find_by_name(app.diplomacy_pending if pending else app.diplomacy_details, "Diplomacy_" + choice)
+
+func click_diplomacy_dialog(confirm: bool, twice := false) -> bool:
+	var dialog: ConfirmationDialog = app.diplomacy_confirmation
+	if not check(dialog.visible, "外交确认可见"):
+		return false
+	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
+	await get_tree().process_frame
+	var pos := control.get_global_rect().get_center()
+	if not check(dialog.get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34, "外交确认按钮完整可见且高度至少34"):
+		return false
+	await window_motion(dialog, pos)
+	if not check(dialog.gui_get_hovered_control() == control, "外交确认实际鼠标悬停命中"):
+		return false
+	var viewport: Viewport = dialog
+	while viewport is Window and viewport.is_embedded():
+		pos = Vector2(viewport.position) + viewport.get_final_transform() * pos
+		viewport = viewport.get_parent().get_viewport()
+	await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false)
+	if twice:
+		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
+	await settle()
+	return check(not dialog.visible and app.diplomacy_payload.is_empty(), "外交确认关闭且载荷清空")
+
+func diplomacy_key(code: Key, unicode_value := 0, ctrl := false) -> void:
+	for pressed in [true, false]:
+		var event := InputEventKey.new()
+		event.keycode = code
+		event.unicode = unicode_value
+		event.ctrl_pressed = ctrl
+		event.pressed = pressed
+		event.window_id = get_window().get_window_id()
+		Input.parse_input_event(event)
+		await get_tree().process_frame
+
+func enter_gold(spin: SpinBox, amount: int) -> bool:
+	if not await click_control(spin):
+		return false
+	await diplomacy_key(KEY_A, 0, true)
+	for digit in str(amount):
+		await diplomacy_key(KEY_0 + int(digit), digit.unicode_at(0))
+	await diplomacy_key(KEY_ENTER)
+	await settle()
+	return check(int(spin.value) == amount, "真实键盘编辑金币金额 %d" % amount)
+
+func normalize_diplomacy(value, key := ""):
+	if value is Dictionary:
+		var result := {}
+		for field in value:
+			result[field] = normalize_diplomacy(value[field], str(field))
+			if key in diplomacy_expected.mapOfSetFields and result[field] is Array:
+				result[field].sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	if value is Array:
+		var result: Array = value.map(func(item): return normalize_diplomacy(item))
+		if key in diplomacy_expected.setFields:
+			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	return value
+
+func diplomacy_matches(step: String) -> bool:
+	if not check(not app.diplomacy_transaction and not app.client.busy, "外交事务完整解锁：" + step):
+		return false
+	if not await perform("save", {"name": run_id + "-dip-" + step}):
+		return false
+	var zipped := Marshalls.base64_to_raw(FileAccess.get_file_as_string(app.last_saved_path).strip_edges())
+	var state: Dictionary = JSON.parse_string(zipped.decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_GZIP).get_string_from_utf8())
+	state.erase("currentTurnStartTime")
+	state.erase("checksum")
+	for civ in state.civilizations:
+		civ.erase("totalTurnTimeSeconds")
+	var actual = normalize_diplomacy(state)
+	var expected = normalize_diplomacy(diplomacy_expected.states[step])
+	# 先归档每步两端状态，失败或重跑都不会覆盖本次差分证据。
+	for side in [["actual", actual], ["expected", expected]]:
+		var evidence := FileAccess.open("res://.local/" + run_id + "-" + step + "-" + side[0] + ".json", FileAccess.WRITE)
+		evidence.store_string(JSON.stringify(side[1]))
+	if not equal_persisted(actual, expected, "外交完整原生存档 " + step):
+		return false
+	diplomacy_steps += 1
+	return check(true, "外交完整持久化状态一致：" + step)
+
+func verify_diplomacy_flow() -> bool:
+	diplomacy_expected = JSON.parse_string(FileAccess.get_file_as_string("res://.local/tests/diplomacy-expected.json"))
+	app.client.busy_changed.connect(observe_diplomacy_lock)
+	if not await load_diplomacy("peace") or not await diplomacy_matches("peace-initial"):
+		return false
+	var selected: String = app.diplomacy_civ_id
+	var old_stamp: Dictionary = app.diplomacy_stamp.duplicate(true)
+	if not await click_option(app.diplomacy_picker, 0 if app.diplomacy_picker.selected != 0 else 1):
+		return false
+	if not check(not app._diplomacy_stamp_valid(old_stamp) and app.diplomacy_our_gold.value == 0, "切文明使旧详情失效并清空金额"):
+		return false
+	for i in range(app.diplomacy_picker.item_count):
+		if str(app.diplomacy_picker.get_item_metadata(i)) == selected and not await click_option(app.diplomacy_picker, i):
+			return false
+	var revision: int = app.client.revision
+	for attempt in range(3):
+		if not await click_control(diplomacy_control("declareWar")) or not await click_diplomacy_dialog(false):
+			return false
+		if not check(app.client.revision == revision, "外交连续取消零写入"):
+			return false
+	if not await verify_diplomacy_stamps():
+		return false
+	revision = app.client.revision
+	if not await click_control(diplomacy_control("declareWar")):
+		return false
+	await screenshot("smoke-diplomacy-war-confirm.png")
+	if not await click_diplomacy_dialog(true, true) or not check(app.client.revision == revision + 1, "外交双击最多一次写入"):
+		return false
+	if not await diplomacy_matches("peace-war"):
+		return false
+	if not await load_diplomacy("war") or not await diplomacy_matches("war-initial"):
+		return false
+	if not await click_control(app.diplomacy_gold_box.get_node("ProposePeace")) or not await click_diplomacy_dialog(true):
+		return false
+	if not check(app.message.text.contains("仍在战争"), "发送完成提示不被详情刷新覆盖") or not await diplomacy_matches("war-pure"):
+		return false
+	await screenshot("smoke-diplomacy-outgoing.png")
+	revision = app.client.revision
+	if not await click_control(diplomacy_control("retract")):
+		return false
+	# 注入业务票据错误验证内核拒绝后的刷新；提交仍由真实确认按钮触发。
+	app.diplomacy_payload.params.tradeToken = "expired-ticket-injection"
+	if not await click_diplomacy_dialog(true) or not check(app.client.revision == revision and app.message.text.contains("重新确认"), "票据拒绝仅刷新且保留内核原因，不自动重交"):
+		return false
+	if not await click_control(diplomacy_control("retract")) or not await click_diplomacy_dialog(true) or not await diplomacy_matches("war-retract"):
+		return false
+	if not await enter_gold(app.diplomacy_our_gold, 1000) or not await enter_gold(app.diplomacy_their_gold, 0):
+		return false
+	if not await click_control(app.diplomacy_gold_box.get_node("ProposePeace")):
+		return false
+	await screenshot("smoke-diplomacy-gold-confirm.png")
+	if not await click_diplomacy_dialog(true) or not await diplomacy_matches("war-gold"):
+		return false
+	if not await click_control(app.turn_button) or not await diplomacy_matches("war-nextTurn"):
+		return false
+	var saved: String = app.last_saved_path
+	if not await perform("load", {"path": saved}) or not await diplomacy_matches("war-nextTurn"):
+		return false
+	for choice in ["accept", "decline", "dismiss", "mixed"]:
+		if not await load_diplomacy("trade-" + choice, true):
+			return false
+		if choice in ["mixed", "dismiss"] and not check(diplomacy_control("accept", true).disabled, "不支持／过期交易禁止接受"):
+			return false
+		if not await click_control(diplomacy_control("decline" if choice == "mixed" else choice, true)):
+			return false
+		await screenshot("smoke-diplomacy-trade-" + choice + ".png")
+		if not await click_diplomacy_dialog(true) or not await diplomacy_matches("trade-" + choice + "-done"):
+			return false
+	for pair in [["DeclarationOfFriendship", ["accept", "decline"]], ["DemandToStopSettlingCitiesNear", ["agree", "refuse"]],
+			["DemandToNotAttackUs", ["agree", "refuseAndDeclareWar"]], ["Denounced", ["dismiss", "declareWar"]]]:
+		for choice in pair[1]:
+			if not await load_diplomacy(pair[0], true) or not await click_control(diplomacy_control(choice, true)):
+				return false
+			if choice == "refuseAndDeclareWar" and not check(app.diplomacy_confirmation.dialog_text.contains("拒绝并宣战"), "不攻击拒绝明确提示战争"):
+				return false
+			if not await click_diplomacy_dialog(false) or not await click_control(diplomacy_control(choice, true)):
+				return false
+			await screenshot("smoke-diplomacy-" + pair[0] + "-" + choice + ".png")
+			if not await click_diplomacy_dialog(true) or not await diplomacy_matches(pair[0] + "-" + choice):
+				return false
+	if not check(diplomacy_lock_handoffs >= 30 and diplomacy_lock_valid and diplomacy_pan_checked,
+			"外交写HTTP至详情刷新持续互斥且真实中键拖动／滚轮缩放有效：%s 次交接，%s" % [diplomacy_lock_handoffs, diplomacy_pan_result]):
+		return false
+	if not await verify_diplomacy_sizes():
+		return false
+	steps.append("外交：真实窗口宣战、纯和平及金币提案、撤回、AI正常回合、接受／拒绝／清理、四类事件全部选择与逐步完整原生差分")
+	return true
+
+func verify_diplomacy_stamps() -> bool:
+	var revision: int = app.client.revision
+	if not await click_control(diplomacy_control("declareWar")):
+		return false
+	await diplomacy_key(KEY_ESCAPE)
+	if not check(not app.diplomacy_confirmation.visible and app.diplomacy_payload.is_empty(), "外交Esc清空确认载荷"):
+		return false
+	if not await click_control(diplomacy_control("declareWar")):
+		return false
+	var dialog: ConfirmationDialog = app.diplomacy_confirmation
+	var close_pos := Vector2(dialog.position) + Vector2(dialog.size.x - dialog.get_theme_constant("close_h_offset", "Window"),
+		-dialog.get_theme_constant("close_v_offset", "Window")) + dialog.get_theme_icon("close", "Window").get_size() / 2
+	await push_mouse(MOUSE_BUTTON_LEFT, close_pos)
+	await settle()
+	if not check(not dialog.visible and app.diplomacy_payload.is_empty() and app.client.revision == revision, "外交关闭窗口零写入"):
+		return false
+	for key in ["revision", "loadEpoch", "selectionGeneration", "diplomacyGeneration", "session", "gameId", "civId", "ticket"]:
+		if not await click_control(diplomacy_control("declareWar")):
+			return false
+		var old = app.diplomacy_payload.stamp[key]
+		app.diplomacy_payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		if not await click_diplomacy_dialog(true) or not check(app.client.revision == revision and app.message.text.contains("失效"), "注入旧外交确认拒绝提交：" + key):
+			return false
+	var fresh: Dictionary = app.diplomacy_stamp.duplicate(true)
+	var data: Dictionary = app.diplomacy_data.duplicate(true)
+	for key in ["revision", "loadEpoch", "selectionGeneration", "diplomacyGeneration", "session", "gameId", "civId"]:
+		var stale := fresh.duplicate(true)
+		var old = stale[key]
+		stale[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		if not check(not app._apply_diplomacy_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale)
+				and app.diplomacy_data == data, "注入旧外交响应不回填：" + key):
+			return false
+	if not await click_control(diplomacy_control("declareWar")) or not await load_diplomacy("peace"):
+		return false
+	return check(not app._diplomacy_stamp_valid(fresh) and not dialog.visible and app.diplomacy_payload.is_empty(), "同存档重载关闭外交确认且旧stamp失效")
+
+func verify_diplomacy_sizes() -> bool:
+	var original := get_window().size
+	for target_size in [Vector2i(1024, 720), Vector2i(1280, 800), Vector2i(1600, 900)]:
+		get_window().size = target_size
+		await get_tree().process_frame
+		await get_tree().process_frame
+		var label := "%dx%d" % [target_size.x, target_size.y]
+		if not await load_diplomacy("peace") or not await click_control(diplomacy_control("declareWar")):
+			return false
+		await screenshot("smoke-diplomacy-" + label + "-war.png")
+		if not await click_diplomacy_dialog(false):
+			return false
+		# 显式布局注入：长名称／长警告不改变内核，只检查展示与取消，不作为玩法证据。
+		var long_data: Dictionary = app.diplomacy_data.duplicate(true)
+		for civ in long_data.civilizations:
+			if str(civ.civId) == app.diplomacy_civ_id:
+				civ.name = "长名称布局注入·已接触文明的完整显示名称·验证折行与省略"
+				civ.warWarnings.append("长警告布局注入：宣战会取消相关条约和交易，并可能导致盟友连带参战，请核对不攻击承诺。")
+		if not check(app._apply_diplomacy_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": long_data}, app.diplomacy_stamp), label + " 长文本布局注入"):
+			return false
+		if not await click_control(diplomacy_control("declareWar")):
+			return false
+		await screenshot("smoke-diplomacy-" + label + "-long-injected.png")
+		if not await click_diplomacy_dialog(false) or not await load_diplomacy("trade-accept"):
+			return false
+		if not await click_control(diplomacy_control("accept", true)):
+			return false
+		await screenshot("smoke-diplomacy-" + label + "-incoming.png")
+		if not await click_diplomacy_dialog(false) or not await load_diplomacy("war"):
+			return false
+		for control in [app.diplomacy_picker, app.diplomacy_our_gold, app.diplomacy_their_gold, app.diplomacy_gold_box.get_node("ProposePeace")]:
+			scroll_into_view(control)
+			await get_tree().process_frame
+			await get_tree().process_frame
+			if not check(get_viewport().get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34, label + " 外交选择／金额／按钮可见可点"):
+				return false
+		if not await enter_gold(app.diplomacy_our_gold, 321) or not await enter_gold(app.diplomacy_their_gold, 123) \
+				or not await click_control(app.diplomacy_gold_box.get_node("ProposePeace")):
+			return false
+		await screenshot("smoke-diplomacy-" + label + "-gold.png")
+		if not await click_diplomacy_dialog(false):
+			return false
+	get_window().size = original
 	return true
 
 # —— 城市经济：写操作只由真实控件及模态窗口输入触发，逐步比较独立原生期望 ——
@@ -682,7 +996,7 @@ func _fail(message: String) -> void:
 		report.store_string(JSON.stringify({"ok": false, "runId": run_id, "startedAt": started_at,
 			"finishedAt": Time.get_datetime_string_from_system(true), "error": message,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
-			"inputTrace": input_trace, "economySteps": economy_steps}, "\t"))
+			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps}, "\t"))
 		report.close()
 	archive_smoke_result()
 	push_error("闭环验证失败：" + message)
@@ -1452,7 +1766,7 @@ func settle() -> void:
 	var guard := 0
 	while idle < 3 and guard < 900:
 		guard += 1
-		if app.client.busy or app.economy_transaction:
+		if app.client.busy or app.economy_transaction or app.diplomacy_transaction:
 			idle = 0
 		else:
 			idle += 1

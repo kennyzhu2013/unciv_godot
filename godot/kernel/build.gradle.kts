@@ -6,6 +6,7 @@ plugins {
 }
 
 kotlin.compilerOptions.jvmTarget = JvmTarget.JVM_1_8
+java.sourceCompatibility = JavaVersion.VERSION_1_8
 java.targetCompatibility = JavaVersion.VERSION_1_8
 
 dependencies {
@@ -34,6 +35,10 @@ tasks.test {
         rootProject.file("godot/.local/tests/development-ui.json"),
         rootProject.file("godot/.local/tests/economy.json"),
         rootProject.file("godot/.local/tests/economy-poor.json"),
-        rootProject.file("godot/.local/tests/economy-expected.json"))
+        rootProject.file("godot/.local/tests/economy-expected.json"),
+        rootProject.file("godot/.local/tests/diplomacy-expected.json"))
+    outputs.files(listOf("peace", "war", "trade-accept", "trade-decline", "trade-dismiss", "trade-mixed",
+        "DeclarationOfFriendship", "DemandToStopSettlingCitiesNear", "DemandToNotAttackUs", "Denounced")
+        .map { rootProject.file("godot/.local/tests/diplomacy-$it.json") })
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = true }
 }

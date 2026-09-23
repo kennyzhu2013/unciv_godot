@@ -95,6 +95,7 @@ internal class PlayerSnapshot(private val game: GameInfo) {
         "policies" to if (civ.policies.canAdoptPolicy())
             game.ruleset.policies.values.filter { civ.policies.isAdoptable(it) }.map { it.name } else emptyList<String>(),
         "pending" to pending(),
+        "religion" to ReligionCommands(game).snapshotSummary(),
         "notifications" to civ.notifications.map { it.text }
     )
 
@@ -110,21 +111,15 @@ internal class PlayerSnapshot(private val game: GameInfo) {
         if (civ.greatPeople.freeGreatPeople > 0) add("greatPerson", "免费伟人选择尚未接入，请保存后用原客户端处理", false)
         if (view.civView.canFoundPantheon() || view.civView.canExpandPantheon() || view.civView.isFoundingReligion()
             || view.civView.isEnhancingReligion() || view.civView.hasFreeBeliefs())
-            add("religion", "宗教选择尚未接入，请保存后用原客户端处理", false)
+            ReligionCommands(game).pending()?.let { add(it) }
         if (view.civView.mayVoteForDiplomaticVictory()) add("vote", "外交投票尚未接入", false)
-        if (civ.tradeRequests.isNotEmpty()) {
-            // 首版只接入拒绝（同 TradePopup 的“Not this time.”）；接受与还价需要完整交易界面。
-            val request = civ.tradeRequests.first()
-            fun offers(list: List<com.unciv.logic.trade.TradeOffer>) = list.joinToString("、") { offer ->
-                offer.name + (if (offer.amount != 1) " ×${offer.amount}" else "") + (if (offer.duration > 0) "（${offer.duration} 回合）" else "")
-            }
-            add("trade", "${game.getCivilization(request.requestingCiv).civName} 提议交易：对方给出 [${offers(request.trade.theirOffers)}]，" +
-                "要求我方 [${offers(request.trade.ourOffers)}]。首版只能拒绝；要接受请保存后用原客户端处理")
-        }
+        val diplomacy = DiplomacyCommands(game)
+        diplomacy.pendingTrade()?.let { add(it) }
         if (civ.popupAlerts.isNotEmpty()) {
             val alert = civ.popupAlerts.first()
             if (alert.type == com.unciv.logic.civilization.AlertType.CityConquered)
                 add(CityCaptureCommands(game).pending(alert))
+            else if (alert.type in DiplomacyCommands.alertTypes) add(diplomacy.pendingAlert(alert))
             else add("alert", "${alert.type}：${alert.value}" +
                 (if (alert.type in GameSession.informationalAlerts) "" else "；此选择尚未接入，请保存后用原客户端处理"),
                 alert.type in GameSession.informationalAlerts)
@@ -138,6 +133,7 @@ internal class PlayerSnapshot(private val game: GameInfo) {
         return dto("unitId" to unit.id,
             "actions" to combat.actions(unit), "attackTargets" to combat.attackTargets(unit),
             "worker" to WorkerCommands(game).workerDto(raw),
+            "religion" to ReligionCommands(game).unitDto(raw),
             "canFound" to (founding?.action != null),
             "foundReason" to if (founding?.action != null) "" else "此单位不能在当前地块建城，或行动力不足",
             "reachable" to if (!unit.hasMovement() || unit.cannotMove() || unit.isAirUnit() || unit.isPreparingParadrop()) emptyList<JsonObject>()
