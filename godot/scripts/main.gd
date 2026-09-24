@@ -1158,8 +1158,31 @@ func _vote_state_stamp(mode := "", choice := "", civ_id := "", ticket := "") -> 
 		"mode": mode, "choice": choice, "civId": civ_id, "ticket": ticket}
 
 func _vote_stamp_valid(stamp: Dictionary) -> bool:
-	if stamp.is_empty() or stamp != _vote_state_stamp(str(stamp.get("mode", "")), str(stamp.get("choice", "")), str(stamp.get("civId", "")), str(stamp.get("ticket", ""))):
+	if stamp.is_empty():
 		return false
+	# 基础字段必须与当前应用状态一致
+	if str(stamp.get("session", "")) != client.session or str(stamp.get("gameId", "")) != current_game:
+		return false
+	if str(stamp.get("player", "")) != str(client.snapshot.get("player", "")):
+		return false
+	if int(stamp.get("loadEpoch", -1)) != load_epoch:
+		return false
+	if int(stamp.get("selectionGeneration", -1)) != selection_generation:
+		return false
+	if int(stamp.get("voteGeneration", -1)) != vote_generation:
+		return false
+	# revision 必须匹配（未提交时）或小于等于当前（已提交后）
+	var stamp_rev = int(stamp.get("revision", -1))
+	if stamp_rev < 0 or stamp_rev > client.revision:
+		return false
+	# mode/choice/civId/ticket 必须与当前 vote_payload 一致
+	var payload = vote_payload.get("stamp") if vote_payload is Dictionary else {}
+	if payload.is_empty():
+		return false
+	for field in ["mode", "choice", "civId", "ticket"]:
+		if str(stamp.get(field, "")) != str(payload.get(field, "")):
+			return false
+	# 有 ticket 时需额外验证 decision token
 	if str(stamp.get("ticket", "")).is_empty():
 		return true
 	var decision = vote_data.get("decision")
