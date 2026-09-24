@@ -96,6 +96,7 @@ internal class PlayerSnapshot(private val game: GameInfo) {
             game.ruleset.policies.values.filter { civ.policies.isAdoptable(it) }.map { it.name } else emptyList<String>(),
         "pending" to pending(),
         "religion" to ReligionCommands(game).snapshotSummary(),
+        "diplomaticVote" to DiplomaticVoteCommands(game).snapshotSummary(),
         "notifications" to civ.notifications.map { it.text }
     )
 
@@ -103,16 +104,18 @@ internal class PlayerSnapshot(private val game: GameInfo) {
         fun add(kind: String, message: String, supported: Boolean = true, target: String = "") {
             add(dto("kind" to kind, "message" to message, "supported" to supported, "target" to target))
         }
+        val vote = DiplomaticVoteCommands(game).pending()
+        if (vote?.text("kind") == "voteResult") add(vote)
         for (city in view.civView.cities())
             if (!city.isPuppet() && city.currentConstructionName().isEmpty())
                 add("production", "${city.name} 需要选择生产")
         if (view.civView.shouldOpenTechPicker()) add("research", "请选择科技")
         if (view.civView.shouldShowPolicyPicker()) add("policy", "请选择政策，或明确暂缓")
-        if (civ.greatPeople.freeGreatPeople > 0) add("greatPerson", "免费伟人选择尚未接入，请保存后用原客户端处理", false)
+        GreatPersonCommands(game).pending()?.let { add(it) }
         if (view.civView.canFoundPantheon() || view.civView.canExpandPantheon() || view.civView.isFoundingReligion()
             || view.civView.isEnhancingReligion() || view.civView.hasFreeBeliefs())
             ReligionCommands(game).pending()?.let { add(it) }
-        if (view.civView.mayVoteForDiplomaticVictory()) add("vote", "外交投票尚未接入", false)
+        if (vote?.text("kind") == "vote") add(vote)
         val diplomacy = DiplomacyCommands(game)
         diplomacy.pendingTrade()?.let { add(it) }
         if (civ.popupAlerts.isNotEmpty()) {

@@ -36,9 +36,17 @@ tasks.test {
         rootProject.file("godot/.local/tests/economy.json"),
         rootProject.file("godot/.local/tests/economy-poor.json"),
         rootProject.file("godot/.local/tests/economy-expected.json"),
-        rootProject.file("godot/.local/tests/diplomacy-expected.json"))
+        rootProject.file("godot/.local/tests/diplomacy-expected.json"),
+        rootProject.file("godot/.local/tests/religion-expected.json"),
+        rootProject.file("godot/.local/tests/religion-pantheon.json"),
+        rootProject.file("godot/.local/tests/religion-found.json"))
     outputs.files(listOf("peace", "war", "trade-accept", "trade-decline", "trade-dismiss", "trade-mixed",
         "DeclarationOfFriendship", "DemandToStopSettlingCitiesNear", "DemandToNotAttackUs", "Denounced")
         .map { rootProject.file("godot/.local/tests/diplomacy-$it.json") })
+    outputs.files(listOf("expected", "liberty", "maya", "mixed", "blocked", "admiral-coastal", "admiral-inland")
+        .map { rootProject.file("godot/.local/tests/great-person-$it.json") })
+    outputs.files(listOf("expected", "choices", "natural", "abstain", "player-win", "ai-win", "results-edge-tie",
+        "results-edge-abstain", "results-edge-empty", "results-edge-dead", "results-edge-hidden")
+        .map { rootProject.file("godot/.local/tests/diplomatic-vote-$it.json") })
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = true }
 }

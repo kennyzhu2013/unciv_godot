@@ -396,6 +396,115 @@ class GatewayHttpTest {
 
     @Test fun religionFoundHttpContract() = religionHttp()
 
+    @Test fun greatPersonHttpGrantAndNotPlacedAreBothIdempotent() {
+        for (blocked in listOf(false, true)) {
+            val fixture = GreatPersonFixtures.export(GreatPersonFixtures.game(blocked = blocked), "http-great-person-$blocked")
+            fun call(body: JsonObject): JsonObject {
+                val response = send(body.toString())
+                assertEquals(200, response.statusCode())
+                return Json.parseToJsonElement(response.body()).jsonObject
+            }
+            assertTrue(call(BattleFixtures.request(session, "load", "path" to fixture.absolutePath)).boolean("ok"))
+            val expected = UncivFiles.gameInfoFromString(fixture.readText())
+            val before = UncivFiles.gameInfoToString(session.game!!, false)
+            val revision = session.revision
+            val query = BattleFixtures.request(session, "greatPersonOptions")
+            val data = call(query)["data"]!!.jsonObject
+            assertEquals(data, call(query)["data"])
+            assertEquals(before, UncivFiles.gameInfoToString(session.game!!, false))
+            assertEquals(revision, session.revision)
+            val body = BattleFixtures.request(session, "greatPersonChoose", "unitName" to "Great Scientist",
+                "decisionToken" to data["decision"]!!.jsonObject.text("token"))
+            assertHttpError(send(body.toString(), authorization = null), 401)
+            assertEquals("SESSION", call(JsonObject(body + ("session" to JsonPrimitive("old"))))["error"]!!.jsonObject.text("code"))
+            assertEquals("INVALID_ARGUMENT", call(JsonObject(body + ("x" to JsonPrimitive(0))))["error"]!!.jsonObject.text("code"))
+            assertEquals(before, UncivFiles.gameInfoToString(session.game!!, false))
+            GreatPersonFixtures.choose(expected, "Great Scientist")
+            assertIdempotentOverHttp(body.toString())
+            assertEquals(revision + 1, session.revision)
+            assertEquals(if (blocked) "notPlaced" else "granted", call(body)["greatPersonResult"]!!.jsonObject.text("outcome"))
+            GameplayAssertions.assertGameplayEquals("HTTP 免费伟人 $blocked", expected, session.game!!)
+            // 淘汰缓存后旧请求仍因旧 revision 被拒，不再次分配 ID。
+            repeat(33) { call(BattleFixtures.request(session, "save", "name" to "http-gp-cache")) }
+            val after = UncivFiles.gameInfoToString(session.game!!, false)
+            val finalRevision = session.revision
+            assertEquals("STALE_STATE", call(body)["error"]!!.jsonObject.text("code"))
+            assertEquals(after, UncivFiles.gameInfoToString(session.game!!, false))
+            assertEquals(finalRevision, session.revision)
+        }
+    }
+
+    private fun diplomaticVoteHttp(mode: String) {
+        try {
+            val fixture = DiplomaticVoteFixtures.export(if (mode == "acknowledge") DiplomaticVoteFixtures.results()
+                else DiplomaticVoteFixtures.voting(), "http-dv-$mode-${DiplomaticVoteFixtures.runId}")
+            fun call(body: JsonObject): JsonObject {
+                val response = send(body.toString())
+                assertEquals(200, response.statusCode())
+                return Json.parseToJsonElement(response.body()).jsonObject
+            }
+            assertTrue(call(BattleFixtures.request(session, "load", "path" to fixture.absolutePath)).boolean("ok"))
+            val current = session.game!!
+            val expected = UncivFiles.gameInfoFromString(fixture.readText())
+            val revision = session.revision
+            val before = UncivFiles.gameInfoToString(current, false)
+            val query = BattleFixtures.request(session, "diplomaticVoteOptions")
+            val response = call(query)
+            assertTrue(response.toString(), response.boolean("ok"))
+            val data = response["data"]!!.jsonObject
+            assertEquals(data, call(query)["data"])
+            val decisionToken = data["decision"]!!.jsonObject.text("token")
+            val action = if (mode == "acknowledge") "diplomaticVoteAcknowledge" else "diplomaticVoteCast"
+            val params = when (mode) {
+                "acknowledge" -> dto("resultToken" to decisionToken)
+                "abstain" -> dto("choice" to "abstain", "decisionToken" to decisionToken)
+                else -> dto("choice" to "civilization", "civId" to DiplomaticVoteFixtures.other(expected).civID,
+                    "decisionToken" to decisionToken)
+            }
+            val body = JsonObject(BattleFixtures.request(session, action) + params)
+            fun reject(body: JsonObject, code: String) {
+                val rejected = call(body)
+                assertEquals(rejected.toString(), code, rejected["error"]!!.jsonObject.text("code"))
+                assertSame(current, session.game)
+                assertEquals(revision, session.revision)
+                assertEquals(before, UncivFiles.gameInfoToString(current, false))
+            }
+            assertHttpError(send(body.toString(), authorization = null), 401)
+            reject(JsonObject(body + ("session" to JsonPrimitive("old"))), "SESSION")
+            reject(JsonObject(query + ("extra" to JsonNull)), "INVALID_ARGUMENT")
+            for (key in params.keys) {
+                reject(JsonObject(body - key), "INVALID_ARGUMENT")
+                for (bad in listOf(JsonNull, JsonPrimitive(""), JsonPrimitive(3), JsonPrimitive(true), dto(), JsonArray(emptyList())))
+                    reject(JsonObject(body + (key to bad)), "INVALID_ARGUMENT")
+            }
+            reject(JsonObject(body + ("x" to JsonPrimitive(0))), "INVALID_ARGUMENT")
+            if (mode == "abstain") reject(JsonObject(body + ("civId" to JsonNull)), "INVALID_ARGUMENT")
+            if (mode == "acknowledge") DiplomaticVoteFixtures.acknowledge(expected)
+            else DiplomaticVoteFixtures.cast(expected, if (mode == "abstain") null else DiplomaticVoteFixtures.other(expected).civID)
+            assertIdempotentOverHttp(body.toString())
+            assertSame(current, session.game)
+            assertEquals(revision + 1, session.revision)
+            GameplayAssertions.assertGameplayEquals("HTTP 外交投票 $mode", expected, current)
+            repeat(33) {
+                assertTrue(call(BattleFixtures.request(session, "save", "name" to "http-dv-$mode-${DiplomaticVoteFixtures.runId}")).boolean("ok"))
+            }
+            val after = UncivFiles.gameInfoToString(current, false)
+            val finalRevision = session.revision
+            assertEquals("STALE_STATE", call(body)["error"]!!.jsonObject.text("code"))
+            assertSame(current, session.game)
+            assertEquals(finalRevision, session.revision)
+            assertEquals(after, UncivFiles.gameInfoToString(current, false))
+            File(DiplomaticVoteFixtures.runDir, "http-$mode.json").writeText(dto("ok" to true).toString())
+        } catch (error: Throwable) {
+            File(DiplomaticVoteFixtures.runDir, "http-$mode.json").writeText(
+                dto("ok" to false, "error" to error.stackTraceToString()).toString())
+            throw error
+        }
+    }
+    @Test fun diplomaticVoteCastHttpContract() = diplomaticVoteHttp("cast")
+    @Test fun diplomaticVoteAbstainHttpContract() = diplomaticVoteHttp("abstain")
+    @Test fun diplomaticVoteAcknowledgeHttpContract() = diplomaticVoteHttp("acknowledge")
+
     @Test fun pendingEventBlocksDevelopmentWritesButQueriesAndSaveStillWork() {
         val (_, cityId) = loadDevelopment("http-pending", withWorker = false)
         // 注入一个尚未接入的待决事件（非白名单）：写操作应被阻止，只读查询与保存仍可用。

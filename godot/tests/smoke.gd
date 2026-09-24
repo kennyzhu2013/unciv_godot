@@ -15,16 +15,80 @@ var diplomacy_lock_handoffs := 0
 var diplomacy_lock_valid := true
 var diplomacy_pan_checked := false
 var diplomacy_pan_result: Dictionary = {}
+var religion_steps := 0
+var religion_expected: Dictionary = {}
+var religion_lock_handoffs := 0
+var religion_lock_valid := true
+var religion_pan_checked := false
+var religion_pan_result: Dictionary = {}
 var economy_expected: Dictionary = {}
 var economy_lock_handoffs := 0
 var economy_lock_valid := true
 var input_trace: Array[Dictionary] = []
+var great_person_steps := 0
+var great_person_expected: Dictionary = {}
+var great_person_lock_handoffs := 0
+var great_person_lock_valid := true
+var great_person_pan_checked := false
+var great_person_evidence: Array[Dictionary] = []
+var vote_steps := 0
+var vote_expected: Dictionary = {}
+var vote_evidence: Array[Dictionary] = []
+var vote_lock_valid := true
+var vote_lock_handoffs := 0
+var vote_pan_checked := false
+
+class VoteFaultClient extends "res://scripts/kernel_client.gd":
+	var drop_writes := 0
+	var fail_query := ""
+	var trace: Array[Dictionary] = []
+	func _send(payload: Dictionary) -> Dictionary:
+		var entry := {"request": payload.duplicate(true), "injected": false}
+		if payload.action == fail_query:
+			entry.injected = true
+			trace.append(entry)
+			await get_tree().process_frame
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：投票恢复查询失败"}}
+		var answer: Dictionary = await super._send(payload)
+		entry["answer"] = answer.duplicate(true)
+		if payload.action in ["diplomaticVoteCast", "diplomaticVoteAcknowledge"] and drop_writes > 0:
+			drop_writes -= 1
+			entry.injected = true
+			trace.append(entry)
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：真实写入后丢弃响应"}}
+		trace.append(entry)
+		return answer
+
+# 仅 smoke 使用：真实 HTTP 写入后在客户端边界丢弃响应，验证传输重试与恢复。
+# 这是可控故障注入，不冒称真实网络乱序；生产客户端及网关没有测试开关。
+class GreatPersonFaultClient extends "res://scripts/kernel_client.gd":
+	var drop_writes := 0
+	var fail_query := ""
+	var trace: Array[Dictionary] = []
+
+	func _send(payload: Dictionary) -> Dictionary:
+		var entry := {"request": payload.duplicate(true), "injected": false}
+		if payload.action == fail_query:
+			entry.injected = true
+			trace.append(entry)
+			await get_tree().process_frame
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：恢复查询响应丢失"}}
+		var answer: Dictionary = await super._send(payload)
+		entry["ok"] = answer.get("ok", false)
+		entry["result"] = answer.get("greatPersonResult", {})
+		if payload.action == "greatPersonChoose" and drop_writes > 0:
+			drop_writes -= 1
+			entry.injected = true
+			trace.append(entry)
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：领取响应丢失"}}
+		trace.append(entry)
+		return answer
 
 func run(frontend) -> void:
 	app = frontend
 	run_id = "smoke-%d" % int(Time.get_unix_time_from_system() * 1000.0)
 	started_at = Time.get_datetime_string_from_system(true)
-	get_tree().create_timer(360.0).timeout.connect(func(): _fail("端到端验证超时"))
+	get_tree().create_timer(900.0).timeout.connect(func(): _fail("端到端验证超时"))
 	for x in range(-12, 13):
 		for y in range(-12, 13):
 			var coordinate := Vector2i(x, y)
@@ -112,6 +176,12 @@ func run(frontend) -> void:
 		return
 	if not await verify_diplomacy_flow():
 		return
+	if not await verify_religion_flow():
+		return
+	if not await verify_great_person_flow():
+		return
+	if not await verify_vote_flow():
+		return
 	await get_tree().process_frame
 	await get_tree().process_frame
 	var directory := ProjectSettings.globalize_path("res://.local")
@@ -122,18 +192,754 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy"],
+		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote"],
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
 		"tiles": app.map.tiles.size(), "units": app.map.unit_nodes.size(),
 		"turn": app.client.snapshot.turn, "savedPath": app.last_saved_path,
-		"developmentSteps": development_steps, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
+		"developmentSteps": development_steps, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps, "religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
+		"greatPersonEvidence": great_person_evidence,
+		"diplomaticVoteSteps": vote_steps, "diplomaticVoteEvidence": vote_evidence,
 		"renderBackend": DisplayServer.get_name()}, "\t"))
 	report.close()
 	archive_smoke_result()
 	print("闭环验证通过：", " → ".join(steps))
 	get_tree().quit(0)
+
+# 免费伟人：原始姓名替换严格镜像未修改的 GameplayAssertions，其他集合沿用其字段表。
+func normalize_great_person(value, key := ""):
+	if value is Dictionary:
+		var result := {}
+		for field in value:
+			result[field] = normalize_great_person(value[field], str(field))
+			if key in great_person_expected.mapOfSetFields and result[field] is Array:
+				result[field].sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	if value is Array:
+		var result: Array = value.map(func(item): return normalize_great_person(item))
+		if key in great_person_expected.setFields:
+			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	return value
+
+func great_person_state(raw: String) -> Dictionary:
+	# 初次只取姓名出生表；替换精确字符串与通知中的 [name] 后重新解析完整状态。
+	var names: Array = JSON.parse_string(raw).get("unitNamesTaken", [])
+	var seen := {}
+	for index in range(names.size()):
+		if not check(not seen.has(names[index]), "伟人姓名唯一"):
+			return {}
+		seen[names[index]] = true
+		raw = raw.replace('"%s"' % names[index], '"<named unit %d>"' % index).replace("[%s]" % names[index], "[<named unit %d>]" % index)
+	var state: Dictionary = JSON.parse_string(raw)
+	state.erase("currentTurnStartTime")
+	state.erase("checksum")
+	for civ in state.civilizations:
+		civ.erase("totalTurnTimeSeconds")
+	return normalize_great_person(state)
+
+func great_person_matches(step: String) -> bool:
+	if not check(not app.great_person_transaction and not app.client.busy, "伟人事务完整解锁：" + step):
+		return false
+	if not await perform("save", {"name": run_id + "-gp-" + str(great_person_steps) + "-" + step}):
+		return false
+	var zipped := Marshalls.base64_to_raw(FileAccess.get_file_as_string(app.last_saved_path).strip_edges())
+	var raw := zipped.decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_GZIP).get_string_from_utf8()
+	var actual := great_person_state(raw)
+	var expected = normalize_great_person(great_person_expected.states[step])
+	var prefix := "res://.local/" + run_id + "-gp-" + str(great_person_steps) + "-" + step
+	var record := {"step": step, "savedPath": app.last_saved_path, "states": [], "matched": false}
+	great_person_evidence.append(record)
+	for side in [["actual-raw", raw], ["native-raw", great_person_expected.rawStates[step]],
+			["actual-normalized", JSON.stringify(actual)], ["native-normalized", JSON.stringify(expected)]]:
+		var evidence := FileAccess.open(prefix + "-" + side[0] + ".json", FileAccess.WRITE)
+		evidence.store_string(side[1])
+		record.states.append(ProjectSettings.globalize_path(prefix + "-" + side[0] + ".json"))
+	if not equal_persisted(great_person_state(great_person_expected.rawStates[step]), expected, "姓名归一化校准 " + step):
+		return false
+	if not equal_persisted(actual, expected, "伟人完整原生存档 " + step):
+		return false
+	record.matched = true
+	great_person_steps += 1
+	return check(true, "免费伟人完整持久状态一致：" + step)
+
+func load_great_person(name: String, open := true) -> bool:
+	if not await perform("load", {"path": ProjectSettings.globalize_path("res://.local/tests/great-person-" + name + ".json")}):
+		return false
+	if not await click_tab(app.tabs, app.TAB_MATTERS):
+		return false
+	return not open or await click_control(app.great_person_open)
+
+func pick_great_person(name: String) -> bool:
+	for index in range(app.great_person_picker.item_count):
+		if app.great_person_picker.get_item_metadata(index).unitName == name:
+			return await click_option(app.great_person_picker, index)
+	return check(false, "免费伟人候选不存在：" + name)
+
+func click_great_person_dialog(confirm: bool, twice := false) -> bool:
+	var dialog: ConfirmationDialog = app.great_person_confirmation
+	if not check(dialog.visible, "伟人确认可见"):
+		return false
+	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
+	await get_tree().process_frame
+	var pos := control.get_global_rect().get_center()
+	if not check(dialog.get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34, "伟人确认按钮完整可见"):
+		return false
+	await window_motion(dialog, pos)
+	if not check(dialog.gui_get_hovered_control() == control, "伟人确认实际悬停命中"):
+		return false
+	var viewport: Viewport = dialog
+	while viewport is Window and viewport.is_embedded():
+		pos = Vector2(viewport.position) + viewport.get_final_transform() * pos
+		viewport = viewport.get_parent().get_viewport()
+	await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false)
+	if twice:
+		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
+	await settle()
+	return check(not dialog.visible and app.great_person_payload.is_empty(), "伟人确认关闭且载荷清空")
+
+func choose_great_person(name: String, placed := true, twice := false) -> bool:
+	if not await pick_great_person(name) or not await click_control(app.great_person_submit):
+		return false
+	var revision: int = app.client.revision
+	if not app.great_person_confirmation.visible:
+		await screenshot("smoke-great-person-confirm-missing.png")
+	if not await click_great_person_dialog(true, twice):
+		return false
+	return check(app.client.revision == revision + 1 and app.great_person_picker.selected == -1
+		and app.great_person_result.text.contains("已领取" if placed else "未生成，额度保留"), "伟人一次尝试只提交一次，结果明确且不自动选下一位")
+
+func observe_great_person_lock(busy: bool) -> void:
+	if not app.great_person_transaction:
+		return
+	for control in app.buttons:
+		great_person_lock_valid = great_person_lock_valid and control.disabled
+	great_person_lock_valid = great_person_lock_valid and app._input_locked() and app.great_person_picker.disabled
+	if not busy:
+		great_person_lock_handoffs += 1
+	if not busy and not great_person_pan_checked:
+		great_person_pan_checked = true
+		var pos: Vector2 = app.map_area.get_global_rect().get_center()
+		var before: Vector2 = app.map.position
+		var zoom: Vector2 = app.map.scale
+		push_window_input(get_viewport(), InputEventMouseMotion.new(), pos)
+		var press := InputEventMouseButton.new()
+		press.button_index = MOUSE_BUTTON_MIDDLE
+		press.pressed = true
+		push_window_input(get_viewport(), press, pos)
+		var motion := InputEventMouseMotion.new()
+		motion.button_mask = MOUSE_BUTTON_MASK_MIDDLE
+		push_window_input(get_viewport(), motion, pos + Vector2(24, 12))
+		var dragged: Vector2 = app.map.position
+		var release := InputEventMouseButton.new()
+		release.button_index = MOUSE_BUTTON_MIDDLE
+		push_window_input(get_viewport(), release, pos + Vector2(24, 12))
+		for pressed in [true, false]:
+			var wheel := InputEventMouseButton.new()
+			wheel.button_index = MOUSE_BUTTON_WHEEL_UP
+			wheel.pressed = pressed
+			push_window_input(get_viewport(), wheel, pos)
+		great_person_lock_valid = great_person_lock_valid and dragged != before and app.map.scale != zoom
+
+func verify_great_person_disabled() -> bool:
+	var picker: OptionButton = app.great_person_picker
+	var disabled_index := -1
+	var enabled_index := -1
+	for index in range(picker.item_count):
+		if picker.get_item_metadata(index).unitName == "Great Engineer":
+			disabled_index = index
+		if picker.get_item_metadata(index).unitName == "Great Scientist":
+			enabled_index = index
+	if not check(disabled_index >= 0 and enabled_index >= 0 and picker.is_item_disabled(disabled_index), "真实点击前确认玛雅禁用项"):
+		return false
+	var revision: int = app.client.revision
+	var requests: int = app.client.request_counter
+	if not await click_control(picker):
+		return false
+	var popup := picker.get_popup()
+	# 此菜单每项均为单行、无图标。先用可选项校准主题行高，再命中同布局的禁用项。
+	var row_height := popup.get_theme_font("font").get_height(popup.get_theme_font_size("font_size")) + popup.get_theme_constant("v_separation")
+	var top := popup.get_theme_stylebox("panel").get_content_margin(SIDE_TOP)
+	var pos := Vector2(popup.size.x / 2.0, top + (enabled_index + 0.5) * row_height)
+	await window_motion(popup, pos)
+	if not check(popup.get_focused_item() == enabled_index, "禁用项点击坐标以真实可选项命中校准"):
+		return false
+	pos.y = top + (disabled_index + 0.5) * row_height
+	await window_mouse(popup, MOUSE_BUTTON_LEFT, pos)
+	await settle()
+	await screenshot("smoke-great-person-disabled-click.png")
+	if not check(popup.visible and picker.selected == -1 and app.great_person_submit.disabled
+			and app.great_person_payload.is_empty() and app.client.revision == revision and app.client.request_counter == requests,
+			"真实鼠标点击禁用伟人不选中、不确认、零请求"):
+		return false
+	await diplomacy_key(KEY_ESCAPE)
+	await settle()
+	return true
+
+func verify_great_person_stamps() -> bool:
+	if not await load_great_person("mixed") or not await verify_great_person_disabled():
+		return false
+	var revision: int = app.client.revision
+	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+		return false
+	await diplomacy_key(KEY_ESCAPE)
+	await settle()
+	if not check(not app.great_person_confirmation.visible and app.great_person_payload.is_empty() and app.client.revision == revision, "伟人 Escape 取消零写入"):
+		return false
+	for key in ["revision", "loadEpoch", "selectionGeneration", "greatPersonGeneration", "session", "gameId", "player", "unitName", "ticket"]:
+		if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+			return false
+		var old = app.great_person_payload.stamp[key]
+		app.great_person_payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		if not await click_great_person_dialog(true) or not check(app.client.revision == revision, "本地注入旧伟人确认拒绝提交：" + key):
+			return false
+	var fresh: Dictionary = app.great_person_stamp.duplicate(true)
+	var data: Dictionary = app.great_person_data.duplicate(true)
+	for key in ["revision", "loadEpoch", "selectionGeneration", "greatPersonGeneration", "session", "gameId", "player"]:
+		var stale := fresh.duplicate(true)
+		var old = stale[key]
+		stale[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		if not check(not app._apply_great_person_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale)
+				and app.great_person_data == data, "本地旧响应注入不回填：" + key):
+			return false
+	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+		return false
+	if not await perform("snapshot") or not check(not app.great_person_confirmation.visible and app.great_person_payload.is_empty(), "手动快照使伟人确认失效"):
+		return false
+	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit) or not await load_great_person("mixed"):
+		return false
+	if not check(not app._great_person_stamp_valid(fresh) and app.great_person_payload.is_empty(), "同存档重载使旧确认失效"):
+		return false
+	# 修改票据参数但保留本地 stamp，真实确认后由网关拒绝，只刷新不重交。
+	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+		return false
+	revision = app.client.revision
+	app.great_person_payload.params.decisionToken = "expired-ticket-injection"
+	if not await click_great_person_dialog(true) or not check(app.client.revision == revision and app.great_person_picker.selected == -1, "伟人票据拒绝后刷新且不重交"):
+		return false
+	if not await load_great_person("blocked") or not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+		return false
+	var old_choice: Dictionary = app.great_person_payload.duplicate(true)
+	revision = app.client.revision
+	if not await click_great_person_dialog(false) or not await pick_great_person("Great Engineer"):
+		return false
+	if not check(not app._great_person_stamp_valid(old_choice.stamp) and app.great_person_description.text.contains("Great Engineer"), "真实切换候选更新说明并使旧目标确认失效"):
+		return false
+	if not await click_control(app.great_person_submit):
+		return false
+	# 只回注已取消的旧载荷；切换与确认均由真实输入完成。
+	app.great_person_payload = old_choice
+	if not await click_great_person_dialog(true) or not check(app.client.revision == revision, "候选切换后回注旧确认仍零写入"):
+		return false
+	return await great_person_matches("blocked-initial")
+
+func swap_great_person_test_client(replacement) -> void:
+	var previous = app.client
+	for field in ["session", "revision", "snapshot", "save_directory", "request_counter", "client_id"]:
+		replacement.set(field, previous.get(field))
+	for signal_name in ["snapshot_changed", "busy_changed", "state_invalidated"]:
+		for connection in previous.get_signal_connection_list(signal_name):
+			previous.disconnect(signal_name, connection.callable)
+			replacement.connect(signal_name, connection.callable)
+	app.client = replacement
+
+func verify_great_person_transport() -> bool:
+	for kind in ["mixed", "blocked"]:
+		for mode in ["retry", "recover", "snapshot", "greatPersonOptions"]:
+			if not await load_great_person(kind) or not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+				return false
+			var original = app.client
+			var revision: int = original.revision
+			var fault := GreatPersonFaultClient.new()
+			app.add_child(fault)
+			fault.drop_writes = 1 if mode == "retry" else 2
+			fault.fail_query = mode if mode in ["snapshot", "greatPersonOptions"] else ""
+			swap_great_person_test_client(fault)
+			var clicked := await click_great_person_dialog(true, true)
+			var writes: Array = fault.trace.filter(func(entry): return entry.request.action == "greatPersonChoose")
+			var failures_expected := not fault.fail_query.is_empty()
+			var guarded: bool = app.great_person_submit.disabled and app.great_person_picker.selected == -1 \
+				and app.great_person_uncertain == failures_expected and not app.great_person_transaction and not fault.busy
+			if failures_expected:
+				guarded = guarded and app.great_person_data.is_empty() and app.great_person_result.text.contains("状态未确认")
+			var queries: Array = fault.trace.filter(func(entry): return entry.request.action != "greatPersonChoose")
+			var query_order: Array = queries.map(func(entry): return entry.request.action)
+			var expected_order: Array = ["greatPersonOptions"] if mode == "retry" else ["snapshot", "greatPersonOptions"]
+			if mode == "snapshot":
+				expected_order = ["snapshot", "snapshot"]
+			elif mode == "greatPersonOptions":
+				expected_order = ["snapshot", "greatPersonOptions", "greatPersonOptions"]
+			# 归档不含 Authorization，仅记录请求 envelope、参数及真实 HTTP 业务结果。
+			var evidence := FileAccess.open("res://.local/" + run_id + "-gp-transport-" + kind + "-" + mode + ".json", FileAccess.WRITE)
+			evidence.store_string(JSON.stringify({"method": "客户端边界丢响应注入，写入仍为真实HTTP", "trace": fault.trace, "guarded": guarded}, "\t"))
+			evidence.close()
+			swap_great_person_test_client(original)
+			fault.queue_free()
+			if not clicked or not check(writes.size() == 2 and writes[0].request == writes[1].request
+					and writes[0].ok and writes[1].ok and writes[0].result == writes[1].result
+					and writes[0].result.outcome == ("granted" if kind == "mixed" else "notPlaced"),
+					"丢响应后同完整请求只重试一次且原生结果相同：" + kind + "/" + mode):
+				return false
+			if not check(guarded and query_order == expected_order, "传输恢复顺序与禁用防重交：" + kind + "/" + mode):
+				return false
+			if failures_expected:
+				await screenshot("smoke-great-person-uncertain-" + kind + "-" + mode + ".png")
+				var requests: int = original.request_counter
+				scroll_into_view(app.great_person_submit)
+				await settle()
+				await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, app.great_person_submit.get_global_rect().get_center())
+				await settle()
+				if not check(original.request_counter == requests and not app.great_person_confirmation.visible, "状态未确认时实际点击领取零请求：" + kind + "/" + mode):
+					return false
+				if not await click_control(app.great_person_open):
+					return false
+			if not check(original.revision == revision + 1 and not app.great_person_uncertain and app.great_person_picker.selected == -1, "连接恢复后同步真实版本、不自动再领取：" + kind + "/" + mode):
+				return false
+			if not await great_person_matches("mixed-first" if kind == "mixed" else "blocked-notPlaced"):
+				return false
+	return true
+
+func verify_great_person_flow() -> bool:
+	great_person_expected = JSON.parse_string(FileAccess.get_file_as_string("res://.local/tests/great-person-expected.json"))
+	app.client.busy_changed.connect(observe_great_person_lock)
+	if not await verify_great_person_stamps() or not await verify_great_person_transport():
+		return false
+	for kind in ["liberty", "maya"]:
+		if not await load_great_person(kind, false) or not await great_person_matches(kind + "-initial"):
+			return false
+		if kind == "liberty":
+			for index in range(app.policy_picker.item_count):
+				if app.policy_picker.get_item_text(index) == "Meritocracy" and not await click_option(app.policy_picker, index):
+					return false
+			var adopt: Array = app.buttons.filter(func(b): return b.text == "采用政策")
+			if not await click_control(adopt[0]):
+				return false
+		elif not await click_control(app.turn_button):
+			return false
+		if not await great_person_matches(kind + "-reward"):
+			return false
+		if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches(kind + "-reward-reload"):
+			return false
+		if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_open):
+			return false
+		if not await choose_great_person("Great Scientist", true, true) or not await great_person_matches(kind + "-granted"):
+			return false
+		if not await click_control(app.great_person_locate) or not check(app.unit_id == app.great_person_unit_id, "按新快照定位伟人"):
+			return false
+		if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches(kind + "-granted-reload"):
+			return false
+		for index in range(int(great_person_expected.acknowledgements[kind])):
+			if not await perform("acknowledge") or not await great_person_matches(kind + "-ack-" + str(index + 1)):
+				return false
+		if not await click_control(app.turn_button) or not await great_person_matches(kind + "-nextTurn"):
+			return false
+	if not await load_great_person("mixed") or not await great_person_matches("mixed-initial"):
+		return false
+	if not check(app.great_person_data.decision.mode == "maya", "混合额度先受限"):
+		return false
+	for index in range(app.great_person_picker.item_count):
+		if app.great_person_picker.get_item_metadata(index).unitName == "Great Engineer" and not check(app.great_person_picker.is_item_disabled(index), "玛雅已不可选项保留且禁用"):
+			return false
+	if not await choose_great_person("Great Scientist") or not await great_person_matches("mixed-first"):
+		return false
+	if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches("mixed-reload"):
+		return false
+	if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_open):
+		return false
+	if not check(app.great_person_data.decision.mode == "ordinary", "混合第二份刷新为普通额度"):
+		return false
+	if not await pick_great_person("Great Engineer") or not await click_control(app.great_person_submit):
+		return false
+	# Enter 经窗口键盘输入确认，不直接触发 confirmed 信号。
+	app.great_person_confirmation.get_ok_button().grab_focus()
+	await diplomacy_key(KEY_ENTER)
+	await settle()
+	if not await great_person_matches("mixed-second"):
+		return false
+	if not await load_great_person("blocked") or not await great_person_matches("blocked-initial"):
+		return false
+	if not await choose_great_person("Great Scientist", false) or not await great_person_matches("blocked-notPlaced"):
+		return false
+	if not check(app.turn_button.disabled and not app.great_person_locate.visible, "未生成保留待决且不展示定位"):
+		return false
+	if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches("blocked-reload"):
+		return false
+	if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_open) or not await click_control(find_by_name(app, "GreatPersonBack")):
+		return false
+	app.map.center_on(Vector2i(10, 0))
+	await settle()
+	if not await click_map(Vector2i(10, 0)) or not await click_map(Vector2i(11, 0), MOUSE_BUTTON_RIGHT) or not await click_control(app.move_button):
+		return false
+	if not await great_person_matches("blocked-moved"):
+		return false
+	if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_open) or not await choose_great_person("Great Scientist") or not await great_person_matches("blocked-granted"):
+		return false
+	if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches("blocked-final-reload"):
+		return false
+	for kind in ["admiral-coastal", "admiral-inland"]:
+		if not await load_great_person(kind) or not await great_person_matches(kind + "-initial"):
+			return false
+		if not await choose_great_person("Great Admiral", kind == "admiral-coastal") or not await great_person_matches(kind + "-attempt"):
+			return false
+		if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches(kind + "-reload"):
+			return false
+	if not check(great_person_lock_valid and great_person_pan_checked and great_person_lock_handoffs >= 16, "伟人写入至详情刷新全程锁定且地图拖拽缩放有效"):
+		return false
+	if not await verify_great_person_sizes():
+		return false
+	steps.append("免费伟人：自然Liberty／玛雅、混合额度、未生成后移动恢复、Admiral、保存重载、幂等防旧确认与逐步完整原生差分")
+	return true
+
+func verify_great_person_sizes() -> bool:
+	var original := get_window().size
+	for target_size in [Vector2i(1024, 720), Vector2i(1280, 800), Vector2i(1600, 900)]:
+		get_window().size = target_size
+		await settle()
+		var size_name := "%dx%d" % [target_size.x, target_size.y]
+		if not await load_great_person("blocked") or not await pick_great_person("Great Scientist"):
+			return false
+		scroll_into_view(app.great_person_description)
+		await settle()
+		await screenshot("smoke-great-person-" + size_name + "-details.png")
+		if not await click_control(app.great_person_submit):
+			return false
+		await screenshot("smoke-great-person-" + size_name + "-confirm.png")
+		if not await click_great_person_dialog(false) or not await choose_great_person("Great Scientist", false):
+			return false
+		scroll_into_view(app.great_person_result)
+		await settle()
+		await screenshot("smoke-great-person-" + size_name + "-notPlaced.png")
+		if not await great_person_matches("blocked-notPlaced"):
+			return false
+		# 仅布局注入长名称／中文说明，不提交到内核；注入样本与真实玩法证据分开命名。
+		var layout: Dictionary = app.great_person_data.duplicate(true)
+		layout.candidates[0].unitName = "长名称布局样例·免费伟人完整名称·验证中文说明与换行"
+		layout.candidates[0].effects = ["长说明布局样例：一次只领取一位，未生成时额度保留。".repeat(10)]
+		if not check(app._apply_great_person_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": layout}, app.great_person_stamp), "长文本布局注入"):
+			return false
+		if not await click_option(app.great_person_picker, 0):
+			return false
+		scroll_into_view(app.great_person_submit)
+		await settle()
+		await screenshot("smoke-great-person-" + size_name + "-long-injected.png")
+		if not check(app.matters_scroll.get_v_scroll_bar().max_value > app.matters_scroll.size.y and app.great_person_description.size.x <= app.tabs.size.x, "长说明可纵向滚动且不横向溢出"):
+			return false
+		if not await click_control(find_by_name(app, "GreatPersonBack")):
+			return false
+		window_sizes_checked.append("great-person-" + size_name)
+	get_window().size = original
+	await settle()
+	return true
+
+func vote_scenario(name: String) -> Dictionary:
+	for scenario in vote_expected.scenarios:
+		if scenario.name == name:
+			return scenario
+	return {}
+
+func load_vote(name: String, open := true) -> bool:
+	if not await perform("load", {"path": vote_scenario(name).fixture}):
+		return false
+	return not open or await open_vote()
+
+func open_vote() -> bool:
+	if not await click_tab(app.tabs, app.TAB_MATTERS):
+		return false
+	return await click_control(app.vote_open)
+
+func pick_vote(id: String) -> bool:
+	for index in range(app.vote_picker.item_count):
+		if app.vote_picker.get_item_metadata(index).civId == id:
+			return await click_option(app.vote_picker, index)
+	return check(false, "缺少投票候选：" + id)
+
+func click_vote_dialog(confirm: bool, twice := false) -> bool:
+	var dialog: ConfirmationDialog = app.vote_confirmation
+	if not check(dialog.visible, "外交投票确认可见"):
+		return false
+	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
+	await get_tree().process_frame
+	var pos := control.get_global_rect().get_center()
+	if not check(dialog.get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34, "投票确认按钮完整可见"):
+		return false
+	await window_motion(dialog, pos)
+	if not check(dialog.gui_get_hovered_control() == control, "投票确认实际命中"):
+		return false
+	var viewport: Viewport = dialog
+	while viewport is Window and viewport.is_embedded():
+		pos = Vector2(viewport.position) + viewport.get_final_transform() * pos
+		viewport = viewport.get_parent().get_viewport()
+	await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false)
+	if twice:
+		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
+	await settle()
+	return check(not dialog.visible and app.vote_payload.is_empty(), "投票确认载荷清空")
+
+func vote_matches(name: String, step: String) -> bool:
+	if not check(not app.vote_transaction and not app.client.busy, "投票事务完整解锁：" + step):
+		return false
+	if not await perform("save", {"name": run_id + "-dv-" + str(vote_steps)}):
+		return false
+	var zipped := Marshalls.base64_to_raw(FileAccess.get_file_as_string(app.last_saved_path).strip_edges())
+	var raw := zipped.decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_GZIP).get_string_from_utf8()
+	var files: Dictionary = vote_scenario(name).states[step]
+	var native_raw := FileAccess.get_file_as_string(files.raw)
+	var expected = normalize_great_person(JSON.parse_string(FileAccess.get_file_as_string(files.normalized)))
+	var actual := great_person_state(raw)
+	var record := {"scenario": name, "step": step, "savedPath": app.last_saved_path, "states": [], "matched": false}
+	vote_evidence.append(record)
+	for side in [["actual-raw", raw], ["native-raw", native_raw], ["actual-normalized", JSON.stringify(actual)], ["native-normalized", JSON.stringify(expected)]]:
+		var path: String = "res://.local/" + run_id + "-dv-" + str(vote_steps) + "-" + side[0] + ".json"
+		var file := FileAccess.open(path, FileAccess.WRITE)
+		file.store_string(side[1])
+		file.close()
+		record.states.append(ProjectSettings.globalize_path(path))
+	if not equal_persisted(great_person_state(native_raw), expected, "投票比较器原生校准 " + step) or not equal_persisted(actual, expected, "外交投票完整状态 " + step):
+		return false
+	record.matched = true
+	vote_steps += 1
+	return true
+
+func observe_vote_lock(busy: bool) -> void:
+	if not app.vote_transaction:
+		return
+	vote_lock_valid = vote_lock_valid and app._input_locked() and app.vote_picker.disabled
+	for control in app.buttons:
+		vote_lock_valid = vote_lock_valid and control.disabled
+	if not busy:
+		vote_lock_handoffs += 1
+	if not busy and not vote_pan_checked:
+		vote_pan_checked = true
+		var pos: Vector2 = app.map_area.get_global_rect().get_center()
+		var before: Vector2 = app.map.position
+		var zoom: Vector2 = app.map.scale
+		push_window_input(get_viewport(), InputEventMouseMotion.new(), pos)
+		var press := InputEventMouseButton.new()
+		press.button_index = MOUSE_BUTTON_MIDDLE
+		press.pressed = true
+		push_window_input(get_viewport(), press, pos)
+		var motion := InputEventMouseMotion.new()
+		motion.button_mask = MOUSE_BUTTON_MASK_MIDDLE
+		push_window_input(get_viewport(), motion, pos + Vector2(24, 12))
+		var dragged: Vector2 = app.map.position
+		var release := InputEventMouseButton.new()
+		release.button_index = MOUSE_BUTTON_MIDDLE
+		push_window_input(get_viewport(), release, pos + Vector2(24, 12))
+		for pressed in [true, false]:
+			var wheel := InputEventMouseButton.new()
+			wheel.button_index = MOUSE_BUTTON_WHEEL_UP
+			wheel.pressed = pressed
+			push_window_input(get_viewport(), wheel, pos)
+		vote_lock_valid = vote_lock_valid and dragged != before and app.map.scale != zoom
+
+func verify_vote_stamps() -> bool:
+	if not await load_vote("choices"):
+		return false
+	var revision: int = app.client.revision
+	if not check(app.vote_picker.selected == -1 and app.vote_submit.disabled and not app.vote_abstain.disabled, "投票默认不选、不默认弃权"):
+		return false
+	if not await pick_vote("Greece") or not await click_control(app.vote_submit):
+		return false
+	var previous: Dictionary = app.vote_payload.duplicate(true)
+	if not await click_vote_dialog(false) or not await pick_vote("Egypt"):
+		return false
+	if not check(not app._vote_stamp_valid(previous.stamp), "真实候选切换使旧确认失效"):
+		return false
+	if not await click_control(app.vote_submit):
+		return false
+	await diplomacy_key(KEY_ESCAPE)
+	await settle()
+	if not check(app.client.revision == revision and app.vote_payload.is_empty() and not app.vote_confirmation.visible, "投票取消与 Escape 零写入"):
+		return false
+	for key in ["revision", "loadEpoch", "selectionGeneration", "voteGeneration", "session", "gameId", "player", "mode", "choice", "civId", "ticket"]:
+		if not await pick_vote("Greece") or not await click_control(app.vote_submit):
+			return false
+		var old = app.vote_payload.stamp[key]
+		app.vote_payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		if not await click_vote_dialog(true) or not check(app.client.revision == revision, "本地旧投票确认注入拒绝：" + key):
+			return false
+	var fresh: Dictionary = app.vote_stamp.duplicate(true)
+	var data: Dictionary = app.vote_data.duplicate(true)
+	for key in ["revision", "loadEpoch", "selectionGeneration", "voteGeneration", "session", "gameId", "player"]:
+		var stale := fresh.duplicate(true)
+		var old = stale[key]
+		stale[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		if not check(not app._apply_vote_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale) and app.vote_data == data, "本地旧投票响应不回填：" + key):
+			return false
+	if not await pick_vote("Greece") or not await click_control(app.vote_submit) or not await perform("snapshot"):
+		return false
+	if not check(app.vote_payload.is_empty() and not app.vote_confirmation.visible, "手动 snapshot 废弃投票确认"):
+		return false
+	if not await pick_vote("Greece") or not await click_control(app.vote_submit) or not await load_vote("choices"):
+		return false
+	if not check(not app._vote_stamp_valid(fresh) and app.vote_payload.is_empty(), "同存档 load 废弃投票确认"):
+		return false
+	revision = app.client.revision
+	if not await pick_vote("Greece") or not await click_control(app.vote_submit):
+		return false
+	app.vote_payload.params.decisionToken = "expired-ticket-injection"
+	if not await click_vote_dialog(true) or not check(app.client.revision == revision and app.vote_picker.selected == -1, "网关旧票据拒绝只刷新、不重交"):
+		return false
+	if not await click_control(find_by_name(app, "DiplomaticVoteBack")) or not check(app.turn_button.disabled, "关闭投票面板保留待决"):
+		return false
+	return await vote_matches("choices", "choices-0-initial")
+
+func verify_vote_transport() -> bool:
+	for action in ["diplomaticVoteCast", "diplomaticVoteAcknowledge"]:
+		for mode in ["retry", "recover", "snapshot", "diplomaticVoteOptions"]:
+			var cast: bool = action == "diplomaticVoteCast"
+			var scenario := "choices" if cast else "results-edge-tie"
+			if not await load_vote(scenario):
+				return false
+			if cast and (not await pick_vote("Greece") or not await click_control(app.vote_submit)):
+				return false
+			var original = app.client
+			var revision: int = original.revision
+			var fault := VoteFaultClient.new()
+			app.add_child(fault)
+			fault.drop_writes = 1 if mode == "retry" else 2
+			fault.fail_query = mode if mode in ["snapshot", "diplomaticVoteOptions"] else ""
+			swap_great_person_test_client(fault)
+			var clicked := await click_vote_dialog(true, true) if cast else await click_control(app.vote_continue)
+			var writes: Array = fault.trace.filter(func(entry): return entry.request.action == action)
+			var query_order: Array = fault.trace.filter(func(entry): return entry.request.action != action).map(func(entry): return entry.request.action)
+			var expected_order: Array = ["diplomaticVoteOptions"] if mode == "retry" else ["snapshot", "diplomaticVoteOptions"]
+			if mode == "snapshot":
+				expected_order = ["snapshot", "snapshot"]
+			elif mode == "diplomaticVoteOptions":
+				expected_order = ["snapshot", "diplomaticVoteOptions", "diplomaticVoteOptions"]
+			var uncertain: bool = not fault.fail_query.is_empty()
+			var guarded: bool = app.vote_submit.disabled and app.vote_abstain.disabled and app.vote_continue.disabled and app.vote_uncertain == uncertain and not app.vote_transaction
+			if uncertain:
+				guarded = guarded and app.vote_data.is_empty() and app.vote_description.text.contains("状态未确认")
+			var path: String = "res://.local/" + run_id + "-dv-transport-" + action + "-" + mode + ".json"
+			var file := FileAccess.open(path, FileAccess.WRITE)
+			file.store_string(JSON.stringify({"method": "客户端边界故障注入；写操作仍走真实 HTTP", "trace": fault.trace, "guarded": guarded}))
+			file.close()
+			vote_evidence.append({"fault": action + "/" + mode, "path": ProjectSettings.globalize_path(path)})
+			swap_great_person_test_client(original)
+			fault.queue_free()
+			if not clicked or not check(writes.size() == 2 and writes[0].request == writes[1].request and writes[0].answer == writes[1].answer and writes[0].answer.ok, "外交写入重试一次、同请求同响应：" + action + "/" + mode):
+				return false
+			if not check(guarded and query_order == expected_order, "投票恢复顺序与禁用：" + action + "/" + mode):
+				return false
+			if uncertain:
+				await screenshot("smoke-vote-uncertain-" + action + "-" + mode + ".png")
+				var requests: int = original.request_counter
+				for control in [app.vote_submit, app.vote_abstain, app.vote_continue]:
+					scroll_into_view(control)
+					await settle()
+					await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, control.get_global_rect().get_center())
+				if not check(original.request_counter == requests, "状态未确认真实点击零请求") or not await click_control(app.vote_open):
+					return false
+			if not check(original.revision == revision + 1 and not app.vote_uncertain, "恢复后仅一次写入、不自动重交"):
+				return false
+			if not await vote_matches(scenario, "choices-2-diplomaticVoteCast" if cast else "results-edge-tie-2-diplomaticVoteAcknowledge"):
+				return false
+	return true
+
+func verify_vote_sequence(scenario: Dictionary) -> bool:
+	if not await load_vote(str(scenario.name), false) or not await vote_matches(scenario.name, scenario.initial):
+		return false
+	for step in scenario.steps:
+		var params: Dictionary = step.params
+		var revision: int = app.client.revision
+		match str(step.action):
+			"reload":
+				if not await perform("load", {"path": app.last_saved_path}):
+					return false
+			"diplomaticVoteCast":
+				if not await open_vote():
+					return false
+				if params.choice == "civilization" and not await pick_vote(params.civId):
+					return false
+				if not await click_control(app.vote_abstain if params.choice == "abstain" else app.vote_submit):
+					return false
+				app.vote_confirmation.get_ok_button().grab_focus()
+				await diplomacy_key(KEY_ENTER)
+				await settle()
+				if not check(app.client.revision == revision + 1 and app.vote_submit.disabled and app.vote_abstain.disabled and app.vote_data.get("results") == null, "明确投票／弃权一次提交，未公布前无票数"):
+					return false
+			"diplomaticVoteAcknowledge":
+				if not await open_vote():
+					return false
+				if not await click_control(find_by_name(app, "DiplomaticVoteBack")) or not check(app.turn_button.disabled, "返回地图保留结果待决") or not await open_vote():
+					return false
+				if not await click_control(app.vote_continue):
+					return false
+				if not check(app.client.revision == revision + 1 and app.vote_data.results.acknowledged and app.vote_continue.disabled, "结果确认仅提交一次、保留可读结果"):
+					return false
+			"nextTurn":
+				if not await click_control(app.turn_button):
+					return false
+			"diplomacyTradeDecision":
+				var response: Dictionary = await app.execute("diplomacyOptions")
+				params = params.duplicate(true)
+				params.tradeToken = response.data.incomingTrade.tradeToken
+				if not await perform(step.action, params):
+					return false
+			_:
+				if not await perform(step.action, params):
+					return false
+		if not await vote_matches(scenario.name, step.step):
+			return false
+	return true
+
+func verify_vote_sizes() -> bool:
+	var original := get_window().size
+	for target_size in [Vector2i(1024, 720), Vector2i(1280, 800), Vector2i(1600, 900)]:
+		get_window().size = target_size
+		await settle()
+		var size_name := "%dx%d" % [target_size.x, target_size.y]
+		if not await load_vote("choices") or not await pick_vote("Greece"):
+			return false
+		await screenshot("smoke-vote-" + size_name + "-candidates.png")
+		for choice in ["civilization", "abstain"]:
+			if not await click_control(app.vote_submit if choice == "civilization" else app.vote_abstain):
+				return false
+			await screenshot("smoke-vote-" + size_name + "-confirm-" + choice + ".png")
+			if not await click_vote_dialog(false):
+				return false
+		if not await load_vote("results-edge-hidden"):
+			return false
+		scroll_into_view(app.vote_results.get_parent())
+		await settle()
+		await screenshot("smoke-vote-" + size_name + "-results.png")
+		var layout: Dictionary = app.vote_data.duplicate(true)
+		layout.results.rows[0].name = "长名称布局样例·联合国外交投票公开明细·中文与换行"
+		layout.results.winnerText = "仅布局注入：本轮不可改票；结果表按原生返回。".repeat(12)
+		if not check(app._apply_vote_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": layout}, app.vote_stamp), "外交结果长文本本地布局注入"):
+			return false
+		await settle()
+		await screenshot("smoke-vote-" + size_name + "-long-injected.png")
+		var scroll: ScrollContainer = app.vote_results.get_parent()
+		scroll.scroll_vertical = int(scroll.get_v_scroll_bar().max_value)
+		await settle()
+		await screenshot("smoke-vote-" + size_name + "-long-scrolled.png")
+		if not check(app.vote_results.size.x <= app.tabs.size.x and scroll.get_v_scroll_bar().max_value > scroll.size.y, "投票长名称换行、结果可滚动且不横向溢出"):
+			return false
+		window_sizes_checked.append("diplomatic-vote-" + size_name)
+	get_window().size = original
+	await settle()
+	return true
+
+func verify_vote_flow() -> bool:
+	vote_expected = JSON.parse_string(FileAccess.get_file_as_string("res://.local/tests/diplomatic-vote-expected.json"))
+	if not check(vote_expected.setFields == great_person_expected.setFields and vote_expected.mapOfSetFields == great_person_expected.mapOfSetFields, "外交投票沿用完整比较器、未增加归一化字段"):
+		return false
+	app.client.busy_changed.connect(observe_vote_lock)
+	if not await verify_vote_stamps() or not await verify_vote_transport():
+		return false
+	for scenario in vote_expected.scenarios:
+		if not await verify_vote_sequence(scenario):
+			return false
+	if not check(vote_lock_valid and vote_pan_checked and vote_lock_handoffs >= 16, "投票 HTTP 至详情全程事务锁与地图拖拽缩放"):
+		return false
+	if not await verify_vote_sizes():
+		return false
+	steps.append("外交投票：自然联合国双周期、投票／明确弃权、AI原生计票、结果确认、本人／AI胜利及每步完整存档差分，断线与旧状态防护")
+	return true
 
 func verify_promise_dialog() -> bool:
 	var fixture := ProjectSettings.globalize_path("res://.local/tests/settlement-promise.json")
@@ -614,6 +1420,273 @@ func verify_diplomacy_sizes() -> bool:
 		if not await click_diplomacy_dialog(false):
 			return false
 	get_window().size = original
+	await settle()
+	return true
+
+# —— 宗教：两步流程（使用预言家→选择信条）只由真实控件及模态窗口输入触发，逐步比较独立原生期望 ——
+func observe_religion_lock(busy: bool) -> void:
+	if not app.religion_transaction:
+		return
+	for control in app.buttons:
+		religion_lock_valid = religion_lock_valid and control.disabled
+	religion_lock_valid = religion_lock_valid and app.tabs.get_tab_bar().mouse_filter == Control.MOUSE_FILTER_IGNORE
+	if not busy:
+		religion_lock_handoffs += 1
+	# HTTP 完成回调中投递输入，验证事务期间地图仍可中键拖动与滚轮缩放。
+	if not busy and not religion_pan_checked:
+		religion_pan_checked = true
+		var pos: Vector2 = app.map_area.get_global_rect().get_center()
+		var before: Vector2 = app.map.position
+		var zoom: Vector2 = app.map.scale
+		push_window_input(get_viewport(), InputEventMouseMotion.new(), pos)
+		var press := InputEventMouseButton.new()
+		press.button_index = MOUSE_BUTTON_MIDDLE
+		press.pressed = true
+		push_window_input(get_viewport(), press, pos)
+		var motion := InputEventMouseMotion.new()
+		motion.button_mask = MOUSE_BUTTON_MASK_MIDDLE
+		push_window_input(get_viewport(), motion, pos + Vector2(24, 12))
+		var dragged: Vector2 = app.map.position
+		var release := InputEventMouseButton.new()
+		release.button_index = MOUSE_BUTTON_MIDDLE
+		push_window_input(get_viewport(), release, pos + Vector2(24, 12))
+		var wheel := InputEventMouseButton.new()
+		wheel.button_index = MOUSE_BUTTON_WHEEL_UP
+		wheel.pressed = true
+		push_window_input(get_viewport(), wheel, pos)
+		var wheel_release := InputEventMouseButton.new()
+		wheel_release.button_index = MOUSE_BUTTON_WHEEL_UP
+		wheel_release.pressed = false
+		push_window_input(get_viewport(), wheel_release, pos)
+		religion_pan_result = {"locked": app._input_locked(), "transaction": app.religion_transaction,
+			"before": str(before), "dragged": str(dragged), "after": str(app.map.position), "zoomBefore": str(zoom), "zoomAfter": str(app.map.scale)}
+		religion_lock_valid = religion_lock_valid and dragged != before and app.map.scale != zoom
+
+func load_religion(name: String, via_matters := false) -> bool:
+	if not await perform("load", {"path": ProjectSettings.globalize_path("res://.local/tests/religion-" + name + ".json")}):
+		return false
+	if via_matters:
+		if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.religion_open_button):
+			return false
+	elif not await click_tab(app.tabs, app.TAB_RELIGION):
+		return false
+	return check(not app.religion_data.is_empty(), "宗教详情已取得新版本")
+
+func religion_control(target_name: String):
+	return find_by_name(app.religion_decision_box, target_name)
+
+func religion_prophet_button(mode: String):
+	for child in app.religion_prophets_box.get_children():
+		if child is Button and str(child.name).ends_with("_" + mode) and not child.disabled:
+			return child
+	return null
+
+func click_religion_dialog(confirm: bool, twice := false) -> bool:
+	var dialog: ConfirmationDialog = app.religion_confirmation
+	if not check(dialog.visible, "宗教确认可见"):
+		return false
+	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
+	await get_tree().process_frame
+	var pos := control.get_global_rect().get_center()
+	if not check(dialog.get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34, "宗教确认按钮完整可见且高度至少34"):
+		return false
+	await window_motion(dialog, pos)
+	if not check(dialog.gui_get_hovered_control() == control, "宗教确认实际鼠标悬停命中"):
+		return false
+	var viewport: Viewport = dialog
+	while viewport is Window and viewport.is_embedded():
+		pos = Vector2(viewport.position) + viewport.get_final_transform() * pos
+		viewport = viewport.get_parent().get_viewport()
+	await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false)
+	if twice:
+		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
+	await settle()
+	return check(not dialog.visible and app.religion_payload.is_empty(), "宗教确认关闭且载荷清空")
+
+# 真实键盘输入宗教名称（含中文／重音）：聚焦命名框后逐字符投递带 unicode 的按键事件。
+func enter_religion_name(text: String) -> bool:
+	var edit: LineEdit = app.religion_name_edit
+	if not check(edit != null and is_instance_valid(edit), "宗教命名框存在"):
+		return false
+	if not await click_control(edit):
+		return false
+	await diplomacy_key(KEY_A, 0, true)
+	for ch in text:
+		await diplomacy_key(KEY_NONE, ch.unicode_at(0))
+	await diplomacy_key(KEY_ENTER)
+	await settle()
+	return check(edit.text == text, "真实键盘输入宗教名称（含中文／重音）：" + text)
+
+func normalize_religion(value, key := ""):
+	if value is Dictionary:
+		var result := {}
+		for field in value:
+			result[field] = normalize_religion(value[field], str(field))
+			if key in religion_expected.mapOfSetFields and result[field] is Array:
+				result[field].sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	if value is Array:
+		var result: Array = value.map(func(item): return normalize_religion(item))
+		if key in religion_expected.setFields:
+			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	return value
+
+func religion_matches(step: String) -> bool:
+	if not check(not app.religion_transaction and not app.client.busy, "宗教事务完整解锁：" + step):
+		return false
+	if not await perform("save", {"name": run_id + "-rel-" + step}):
+		return false
+	var zipped := Marshalls.base64_to_raw(FileAccess.get_file_as_string(app.last_saved_path).strip_edges())
+	var state: Dictionary = JSON.parse_string(zipped.decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_GZIP).get_string_from_utf8())
+	state.erase("currentTurnStartTime")
+	state.erase("checksum")
+	for civ in state.civilizations:
+		civ.erase("totalTurnTimeSeconds")
+	var actual = normalize_religion(state)
+	var expected = normalize_religion(religion_expected.states[step])
+	for side in [["actual", actual], ["expected", expected]]:
+		var evidence := FileAccess.open("res://.local/" + run_id + "-" + step + "-" + side[0] + ".json", FileAccess.WRITE)
+		evidence.store_string(JSON.stringify(side[1]))
+	if not equal_persisted(actual, expected, "宗教完整原生存档 " + step):
+		return false
+	religion_steps += 1
+	return check(true, "宗教完整持久化状态一致：" + step)
+
+func verify_religion_flow() -> bool:
+	religion_expected = JSON.parse_string(FileAccess.get_file_as_string("res://.local/tests/religion-expected.json"))
+	app.client.busy_changed.connect(observe_religion_lock)
+	# 场景1：万神殿单步采用（事项页入口 → religionChooseBeliefs）
+	if not await load_religion("pantheon", true) or not await religion_matches("pantheon-initial"):
+		return false
+	var pantheon_decision = app.religion_data.get("decision")
+	if not check(pantheon_decision is Dictionary and str(pantheon_decision.get("mode")) == "pantheon", "万神殿待决出现在宗教页"):
+		return false
+	if not check(app.religion_slot_pickers.size() == 1, "万神殿单信条槽") or not await click_option(app.religion_slot_pickers[0], 0):
+		return false
+	await screenshot("smoke-religion-pantheon.png")
+	if not await click_control(religion_control("ReligionSubmit")) or not await click_religion_dialog(true):
+		return false
+	if not await religion_matches("pantheon-chosen"):
+		return false
+	# 场景2：两步创立（使用预言家 → religionFound，自定义中文／重音名称）
+	if not await load_religion("found") or not await religion_matches("found-initial"):
+		return false
+	if not check(app.religion_data.get("decision") == null, "创立前无待决，仅显示预言家"):
+		return false
+	var use_button = religion_prophet_button("found")
+	if not check(use_button != null, "预言家创立动作可点击"):
+		return false
+	var revision: int = app.client.revision
+	if not await click_control(use_button):
+		return false
+	await screenshot("smoke-religion-use-prophet.png")
+	if not await click_religion_dialog(true, true) or not check(app.client.revision == revision + 1, "宗教双击最多一次写入"):
+		return false
+	var found_decision = app.religion_data.get("decision")
+	if not check(found_decision is Dictionary and str(found_decision.get("mode")) == "foundReligion", "使用预言家后进入创立待决"):
+		return false
+	if not check(app.religion_symbol_picker != null and app.religion_symbol_picker.item_count > 0, "创立显示可用符号下拉"):
+		return false
+	if not await click_option(app.religion_symbol_picker, 0):
+		return false
+	if not await enter_religion_name(str(religion_expected.smokeName)):
+		return false
+	var used := {}
+	for i in range(app.religion_slot_pickers.size()):
+		var picker: OptionButton = app.religion_slot_pickers[i]
+		var chosen := -1
+		for j in range(picker.item_count):
+			var cid := str(picker.get_item_metadata(j))
+			if not used.has(cid):
+				used[cid] = true
+				chosen = j
+				break
+		if not check(chosen >= 0, "创立槽位有可选信条") or not await click_option(picker, chosen):
+			return false
+	await screenshot("smoke-religion-found-confirm.png")
+	if not await click_control(religion_control("ReligionSubmit")) or not await click_religion_dialog(true):
+		return false
+	if not check(app.message.text.contains("宗教已创立"), "创立完成提示不被详情刷新覆盖") or not await religion_matches("found-done"):
+		return false
+	if not await verify_religion_stamps():
+		return false
+	if not check(religion_lock_handoffs >= 3 and religion_lock_valid and religion_pan_checked,
+			"宗教写HTTP至详情刷新持续互斥且真实中键拖动／滚轮缩放有效：%s 次交接，%s" % [religion_lock_handoffs, religion_pan_result]):
+		return false
+	if not await verify_religion_sizes():
+		return false
+	steps.append("宗教：真实窗口万神殿单步采用、两步创立（使用预言家→中文／重音命名→逐槽信条）与逐步完整原生差分")
+	return true
+
+func verify_religion_stamps() -> bool:
+	if not await load_religion("pantheon"):
+		return false
+	var revision: int = app.client.revision
+	if not await click_option(app.religion_slot_pickers[0], 0) or not await click_control(religion_control("ReligionSubmit")):
+		return false
+	await diplomacy_key(KEY_ESCAPE)
+	if not check(not app.religion_confirmation.visible and app.religion_payload.is_empty(), "宗教Esc清空确认载荷"):
+		return false
+	if not await click_control(religion_control("ReligionSubmit")):
+		return false
+	var dialog: ConfirmationDialog = app.religion_confirmation
+	var close_pos := Vector2(dialog.position) + Vector2(dialog.size.x - dialog.get_theme_constant("close_h_offset", "Window"),
+		-dialog.get_theme_constant("close_v_offset", "Window")) + dialog.get_theme_icon("close", "Window").get_size() / 2
+	await push_mouse(MOUSE_BUTTON_LEFT, close_pos)
+	await settle()
+	if not check(not dialog.visible and app.religion_payload.is_empty() and app.client.revision == revision, "宗教关闭窗口零写入"):
+		return false
+	for key in ["revision", "loadEpoch", "selectionGeneration", "religionGeneration", "session", "gameId", "ticket"]:
+		if not await click_control(religion_control("ReligionSubmit")):
+			return false
+		var old = app.religion_payload.stamp[key]
+		app.religion_payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		if not await click_religion_dialog(true) or not check(app.client.revision == revision and app.message.text.contains("失效"), "注入旧宗教确认拒绝提交：" + key):
+			return false
+	var fresh: Dictionary = app.religion_stamp.duplicate(true)
+	var data: Dictionary = app.religion_data.duplicate(true)
+	for key in ["revision", "loadEpoch", "selectionGeneration", "religionGeneration", "session", "gameId"]:
+		var stale := fresh.duplicate(true)
+		var old = stale[key]
+		stale[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		if not check(not app._apply_religion_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale)
+				and app.religion_data == data, "注入旧宗教响应不回填：" + key):
+			return false
+	if not await click_control(religion_control("ReligionSubmit")) or not await load_religion("pantheon"):
+		return false
+	return check(not app._religion_stamp_valid(fresh) and not dialog.visible and app.religion_payload.is_empty(), "同存档重载关闭宗教确认且旧stamp失效")
+
+func verify_religion_sizes() -> bool:
+	var original := get_window().size
+	for target_size in [Vector2i(1024, 720), Vector2i(1280, 800), Vector2i(1600, 900)]:
+		get_window().size = target_size
+		await get_tree().process_frame
+		await get_tree().process_frame
+		var label := "%dx%d" % [target_size.x, target_size.y]
+		if not await load_religion("pantheon") or not await click_option(app.religion_slot_pickers[0], 0):
+			return false
+		if not await click_control(religion_control("ReligionSubmit")):
+			return false
+		await screenshot("smoke-religion-" + label + "-pantheon.png")
+		if not await click_religion_dialog(false) or not await load_religion("found"):
+			return false
+		var use_button = religion_prophet_button("found")
+		if not check(use_button != null, label + " 预言家创立按钮存在"):
+			return false
+		scroll_into_view(use_button)
+		await get_tree().process_frame
+		await get_tree().process_frame
+		if not check(get_viewport().get_visible_rect().encloses(use_button.get_global_rect()) and use_button.size.y >= 34, label + " 宗教按钮可见可点"):
+			return false
+		if not await click_control(use_button):
+			return false
+		await screenshot("smoke-religion-" + label + "-prophet.png")
+		if not await click_religion_dialog(false):
+			return false
+		window_sizes_checked.append("religion-" + label)
+	get_window().size = original
+	await settle()
 	return true
 
 # —— 城市经济：写操作只由真实控件及模态窗口输入触发，逐步比较独立原生期望 ——
@@ -996,7 +2069,9 @@ func _fail(message: String) -> void:
 		report.store_string(JSON.stringify({"ok": false, "runId": run_id, "startedAt": started_at,
 			"finishedAt": Time.get_datetime_string_from_system(true), "error": message,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
-			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps}, "\t"))
+			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
+			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
+			"diplomaticVoteSteps": vote_steps, "diplomaticVoteEvidence": vote_evidence}, "\t"))
 		report.close()
 	archive_smoke_result()
 	push_error("闭环验证失败：" + message)
@@ -1766,7 +2841,7 @@ func settle() -> void:
 	var guard := 0
 	while idle < 3 and guard < 900:
 		guard += 1
-		if app.client.busy or app.economy_transaction or app.diplomacy_transaction:
+		if app.client.busy or app.economy_transaction or app.diplomacy_transaction or app.religion_transaction or app.great_person_transaction or app.vote_transaction:
 			idle = 0
 		else:
 			idle += 1
@@ -1791,26 +2866,29 @@ func push_window_input(viewport: Viewport, event: InputEventMouse, pos: Vector2)
 		pos = Vector2(viewport.position) + viewport.get_final_transform() * pos
 		viewport = viewport.get_parent().get_viewport()
 	if event is InputEventMouseMotion:
-		event.relative = pos - viewport.get_mouse_position()
+		if event.relative == Vector2.ZERO:
+			event.relative = pos - viewport.get_mouse_position()
 		event.velocity = event.relative * 60.0
 	event.position = pos
 	event.global_position = pos
 	# PopupMenu 从 Input 读取开窗时的按键掩码；仅 push_input 不更新它，会将开窗释放误作选项点击。
 	event.window_id = viewport.get_window_id()
-	Input.parse_input_event(event)
-	Input.flush_buffered_events()
+	if event is InputEventMouseMotion:
+		# 鼠标按钮仍更新 Input 掩码；悬停直接投递到根视口的嵌入窗口路由，避免 OS warp 的同位置事件覆盖。
+		viewport.push_input(event, true)
+	else:
+		Input.parse_input_event(event)
+		Input.flush_buffered_events()
 
 func window_motion(viewport: Viewport, pos: Vector2) -> void:
 	while viewport is Window and viewport.is_embedded():
 		pos = Vector2(viewport.position) + viewport.get_final_transform() * pos
 		viewport = viewport.get_parent().get_viewport()
-	if DisplayServer.get_name() != "headless":
-		viewport.warp_mouse(pos)
-		# 系统移动事件异步到达；先排空它们，再分发最终移动，避免旧悬停覆盖本次点击。
-		await get_tree().process_frame
-		await get_tree().process_frame
-	push_window_input(viewport, InputEventMouseMotion.new(), pos)
+	# 等布局和系统事件处理完成后同步投递最终悬停；不再 warp 系统光标引入异步移出事件。
 	await get_tree().process_frame
+	var motion := InputEventMouseMotion.new()
+	motion.relative = pos - viewport.get_mouse_position()
+	push_window_input(viewport, motion, pos)
 
 func window_mouse(viewport: Viewport, button_index: int, viewport_pos: Vector2, with_motion := true, double_click := false) -> void:
 	if with_motion:
@@ -1821,7 +2899,8 @@ func window_mouse(viewport: Viewport, button_index: int, viewport_pos: Vector2, 
 		event.pressed = is_pressed
 		event.double_click = double_click and is_pressed
 		push_window_input(viewport, event, viewport_pos)
-		await get_tree().process_frame
+	# 按下/释放各用独立事件，并在同一次同步分发中完成，避免帧间系统悬停事件取消按钮按压。
+	await get_tree().process_frame
 
 func scroll_into_view(control: Control) -> void:
 	var node := control.get_parent()
@@ -1849,7 +2928,9 @@ func click_control(control) -> bool:
 	var trace := {"control": str(control.name), "center": str(center), "events": [], "signals": 0}
 	var on_input := func(event: InputEvent):
 		if event is InputEventMouseButton:
-			trace.events.append({"pressed": event.pressed, "position": str(event.position)})
+			trace.events.append({"pressed": event.pressed, "position": str(event.position),
+							"disabled": control.disabled if control is BaseButton else false,
+							"hovered": str(get_viewport().gui_get_hovered_control()), "rect": str(control.get_global_rect())})
 	var on_pressed := func(): trace.signals += 1
 	control.gui_input.connect(on_input)
 	if control is BaseButton:
@@ -1862,6 +2943,7 @@ func click_control(control) -> bool:
 		if control is BaseButton:
 			control.pressed.disconnect(on_pressed)
 		input_trace.append(trace)
+		await screenshot("smoke-control-hit-failure.png")
 		return check(false, "实际窗口悬停未命中目标：" + str(control.name))
 	await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, center, false)
 	await settle()
@@ -1926,13 +3008,20 @@ func click_option(ob: OptionButton, index: int) -> bool:
 	popup.scroll_to_item(index)
 	await get_tree().process_frame
 	# PopupMenu 未公开条目矩形，逐点真实悬停并读取命中索引；滚动只负责使条目进入视口。
+	var focused_samples: Array = []
 	for y in range(4, popup.size.y - 4, 4):
 		var pos := Vector2(popup.size.x / 2.0, y)
 		await window_motion(popup, pos)
+		if focused_samples.is_empty() or focused_samples.back().focused != popup.get_focused_item():
+			focused_samples.append({"y": y, "focused": popup.get_focused_item(), "mouse": str(popup.get_mouse_position()), "rootMouse": str(get_viewport().get_mouse_position())})
 		if popup.get_focused_item() == index:
 			await window_mouse(popup, MOUSE_BUTTON_LEFT, pos)
 			await settle()
 			return check(ob.selected == index and not popup.visible, "真实鼠标选中经济下拉项目")
+	input_trace.append({"picker": str(ob.name), "target": index, "text": ob.get_item_text(index),
+		"disabled": ob.is_item_disabled(index), "popupPosition": str(popup.position), "popupSize": str(popup.size),
+		"embedded": popup.is_embedded(), "focusedSamples": focused_samples})
+	await screenshot("smoke-option-hit-failure.png")
 	return check(false, "经济下拉条目未命中：" + str(index))
 
 func click_economy_dialog(confirm: bool, twice := false) -> bool:

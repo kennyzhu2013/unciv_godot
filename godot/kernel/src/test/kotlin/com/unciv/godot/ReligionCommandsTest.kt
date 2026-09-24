@@ -424,6 +424,8 @@ internal class ReligionCommandsTest {
         assertFalse("非主宗教状态不可强化", rel["enhance"]!!.jsonObject.boolean("enabled"))
     }
 
+    @Test fun emitIndependentReligionSmokeFixtures() { ReligionFixtures.emit() }
+
     @Test fun twoStepFoundingSurvivesSaveReload() {
         val (session, expected) = scenario("rel-reload") { ReligionFixtures.pantheonProphetGame() }
         val (unitId, actionToken) = prophetAction(session, "found")

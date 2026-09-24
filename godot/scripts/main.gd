@@ -64,6 +64,7 @@ const TAB_UNIT := 0
 const TAB_CITY := 1
 const TAB_MATTERS := 2
 const TAB_DIPLOMACY := 3
+const TAB_RELIGION := 4
 const CTAB_OVERVIEW := 0
 const CTAB_POPULATION := 1
 const CTAB_QUEUE := 2
@@ -119,6 +120,56 @@ var diplomacy_our_gold := SpinBox.new()
 var diplomacy_their_gold := SpinBox.new()
 var diplomacy_gold_box := VBoxContainer.new()
 var diplomacy_open_button: Button
+# 宗教上下文独立于单位／城市／外交选择；两步流程（使用预言家→选择信条）共享同一事务锁与 stamp。
+var religion_generation := 0
+var religion_data: Dictionary = {}
+var religion_stamp: Dictionary = {}
+var religion_payload: Dictionary = {}
+var religion_transaction := false
+var religion_confirmation := ConfirmationDialog.new()
+var religion_scroll: ScrollContainer
+var religion_summary_box := VBoxContainer.new()
+var religion_decision_box := VBoxContainer.new()
+var religion_prophets_box := VBoxContainer.new()
+var religion_open_button: Button
+# 第二步动态输入控件（每次 populate 重建）：符号下拉、命名框与逐槽候选下拉。
+var religion_symbol_picker: OptionButton = null
+var religion_name_edit: LineEdit = null
+var religion_slot_pickers: Array = []
+# 免费伟人详情与确认独立绑定；事务锁覆盖写入、快照应用和详情刷新。
+var great_person_generation := 0
+var great_person_data: Dictionary = {}
+var great_person_stamp: Dictionary = {}
+var great_person_payload: Dictionary = {}
+var great_person_transaction := false
+var great_person_uncertain := false
+var great_person_confirmation := ConfirmationDialog.new()
+var great_person_panel := VBoxContainer.new()
+var great_person_summary := Label.new()
+var great_person_picker := OptionButton.new()
+var great_person_description := Label.new()
+var great_person_result := Label.new()
+var great_person_unit_id := -1
+var great_person_open: Button
+var great_person_submit: Button
+var great_person_locate: Button
+# 外交投票单独维护票据、确认与恢复状态，不与双边外交共用上下文。
+var vote_generation := 0
+var vote_data: Dictionary = {}
+var vote_stamp: Dictionary = {}
+var vote_payload: Dictionary = {}
+var vote_transaction := false
+var vote_uncertain := false
+var vote_confirmation := ConfirmationDialog.new()
+var vote_panel := VBoxContainer.new()
+var vote_summary := Label.new()
+var vote_picker := OptionButton.new()
+var vote_description := Label.new()
+var vote_results := VBoxContainer.new()
+var vote_open: Button
+var vote_submit: Button
+var vote_abstain: Button
+var vote_continue: Button
 
 const ACTION_NAMES := {"skip": "跳过／取消跳过本回合", "fortify": "驻防", "fortifyUntilHealed": "驻防至恢复",
 	"sleep": "休眠", "sleepUntilHealed": "休眠至恢复", "setUp": "架设"}
@@ -140,6 +191,9 @@ func _ready() -> void:
 	client.state_invalidated.connect(_clear_combat)
 	client.state_invalidated.connect(_cancel_economy)
 	client.state_invalidated.connect(_invalidate_diplomacy)
+	client.state_invalidated.connect(_invalidate_religion)
+	client.state_invalidated.connect(_invalidate_great_person)
+	client.state_invalidated.connect(_invalidate_vote)
 	map.tile_selected.connect(_select_tile)
 	map.move_requested.connect(_preview_target)
 	var hello: Dictionary = await execute("hello")
@@ -249,6 +303,7 @@ func _build_right_panel(parent: Node) -> void:
 	_build_city_tab()
 	_build_matters_tab()
 	_build_diplomacy_tab()
+	_build_religion_tab()
 
 func _page_scroll(name: String) -> VBoxContainer:
 	var scroll: ScrollContainer
@@ -656,7 +711,7 @@ func _open_diplomacy_confirmation(payload: Dictionary) -> void:
 func _confirm_diplomacy() -> void:
 	var payload := diplomacy_payload.duplicate(true)
 	_cancel_diplomacy()
-	if client.busy or economy_transaction or diplomacy_transaction or payload.is_empty():
+	if client.busy or economy_transaction or diplomacy_transaction or great_person_transaction or great_person_confirmation.visible or vote_transaction or vote_confirmation.visible or payload.is_empty():
 		return
 	if not _diplomacy_stamp_valid(payload.get("stamp", {})):
 		await _refresh_diplomacy()
@@ -671,6 +726,345 @@ func _confirm_diplomacy() -> void:
 		message.text = "提案已发送，当前仍在战争中，等待对方回合。" if payload.action == "diplomacyProposePeace" else "外交操作完成 · 状态版本 %s" % client.revision
 	else:
 		message.text = str(result.get("error", {}).get("message", "外交操作失败"))
+
+func _build_religion_tab() -> void:
+	var page := VBoxContainer.new()
+	page.name = "宗教"
+	page.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	page.add_theme_constant_override("separation", 8)
+	tabs.add_child(page)
+	religion_scroll = ScrollContainer.new()
+	religion_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	religion_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	page.add_child(religion_scroll)
+	var content := VBoxContainer.new()
+	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	content.add_theme_constant_override("separation", 8)
+	religion_scroll.add_child(content)
+	content.add_child(religion_summary_box)
+	content.add_child(religion_decision_box)
+	content.add_child(religion_prophets_box)
+	religion_confirmation.name = "ReligionConfirmation"
+	religion_confirmation.title = "确认宗教操作"
+	religion_confirmation.get_ok_button().text = "确认"
+	religion_confirmation.get_cancel_button().text = "取消"
+	religion_confirmation.dialog_autowrap = true
+	var dialog_theme := Theme.new()
+	dialog_theme.set_constant("buttons_min_height", "AcceptDialog", 34)
+	religion_confirmation.theme = dialog_theme
+	religion_confirmation.confirmed.connect(_confirm_religion)
+	religion_confirmation.canceled.connect(_cancel_religion)
+	religion_confirmation.close_requested.connect(_cancel_religion)
+	add_child(religion_confirmation)
+
+func _religion_text(parent: Node, text: String) -> void:
+	var line := Label.new()
+	line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	line.text = text
+	parent.add_child(line)
+
+func _religion_mode_label(mode: String) -> String:
+	match mode:
+		"pantheon": return "选择万神殿"
+		"expandPantheon": return "扩展万神殿"
+		"foundReligion": return "创立宗教"
+		"enhanceReligion": return "强化宗教"
+		"freeBeliefs": return "选择免费信条"
+		_: return "宗教选择"
+
+func _religion_belief_type(type: String) -> String:
+	match type:
+		"Pantheon": return "万神殿"
+		"Founder": return "创立者"
+		"Follower": return "信众"
+		"Enhancer": return "强化"
+		"Any": return "任意"
+		_: return type
+
+func _religion_state_name(state: String) -> String:
+	match state:
+		"None": return "无"
+		"Pantheon": return "已有万神殿"
+		"FoundingReligion": return "创立宗教中"
+		"Religion": return "已创立宗教"
+		"EnhancingReligion": return "强化宗教中"
+		"EnhancedReligion": return "已强化宗教"
+		_: return state
+
+func _open_religion() -> void:
+	if _input_locked():
+		return
+	if tabs.current_tab == TAB_RELIGION:
+		await _refresh_religion()
+	else:
+		tabs.current_tab = TAB_RELIGION
+
+func _cancel_religion() -> void:
+	religion_payload = {}
+	religion_confirmation.hide()
+	_on_busy(client.busy)
+
+func _invalidate_religion() -> void:
+	religion_generation += 1
+	religion_stamp = {}
+	religion_data = {}
+	religion_symbol_picker = null
+	religion_name_edit = null
+	religion_slot_pickers = []
+	_cancel_religion()
+
+func _religion_state_stamp(ticket := "") -> Dictionary:
+	return {"session": client.session, "gameId": current_game, "revision": client.revision,
+		"loadEpoch": load_epoch, "selectionGeneration": selection_generation, "religionGeneration": religion_generation,
+		"ticket": ticket}
+
+func _religion_stamp_valid(stamp: Dictionary) -> bool:
+	if stamp.is_empty() or stamp != _religion_state_stamp(str(stamp.get("ticket", ""))):
+		return false
+	var ticket := str(stamp.get("ticket", ""))
+	if ticket.is_empty():
+		return true
+	var decision = religion_data.get("decision")
+	if decision is Dictionary and ticket == str(decision.get("token", "")):
+		return true
+	for prophet in religion_data.get("prophets", []):
+		for action in prophet.get("actions", []):
+			if ticket == str(action.get("actionToken", "")):
+				return true
+	return false
+
+func _refresh_religion() -> void:
+	if client.busy or client.snapshot.is_empty():
+		return
+	var stamp := _religion_state_stamp()
+	var result: Dictionary = await client.command("religionOptions")
+	_apply_religion_response(result, stamp)
+
+# 旧响应注入测试也调用本入口；不将注入声称为网络乱序。
+func _apply_religion_response(result: Dictionary, stamp: Dictionary) -> bool:
+	if not _religion_stamp_valid(stamp):
+		return false
+	if not result.get("ok", false):
+		religion_stamp = {}
+		religion_data = {}
+		_populate_religion()
+		message.text = str(result.get("error", {}).get("message", "宗教查询失败"))
+		return false
+	if str(result.get("session", "")) != str(stamp.session) or int(result.get("revision", -1)) != int(stamp.revision):
+		return false
+	religion_data = result.get("data", {})
+	religion_stamp = _religion_state_stamp()
+	_populate_religion()
+	return true
+
+func _religion_belief_map() -> Dictionary:
+	var result := {}
+	for belief in religion_data.get("beliefs", []):
+		result[str(belief.get("id"))] = belief
+	return result
+
+func _populate_religion() -> void:
+	_clear_dynamic(religion_summary_box)
+	_clear_dynamic(religion_decision_box)
+	_clear_dynamic(religion_prophets_box)
+	religion_symbol_picker = null
+	religion_name_edit = null
+	religion_slot_pickers = []
+	if not religion_data.get("enabled", false):
+		_religion_text(religion_summary_box, "本局未启用宗教。")
+		religion_decision_box.hide()
+		religion_prophets_box.hide()
+		_on_busy(client.busy)
+		return
+	_religion_text(religion_summary_box, "宗教状态：%s\n信仰储备：%s／万神殿所需：%s／下一位大预言家：%s" % [
+		_religion_state_name(str(religion_data.get("state", ""))), _num(religion_data.get("storedFaith"), true),
+		_num(religion_data.get("faithForPantheon"), true), _num(religion_data.get("faithForNextGreatProphet"), true)])
+	if religion_data.get("canGenerateProphet", false):
+		_religion_text(religion_summary_box, "可生成大预言家。" + str(religion_data.get("generateProphetNote", "")))
+	var free: Array = religion_data.get("freeBeliefs", [])
+	if not free.is_empty():
+		var parts := PackedStringArray()
+		for item in free:
+			if item.get("error") != null:
+				parts.append(str(item.error))
+			else:
+				parts.append("%s×%s" % [_religion_belief_type(str(item.get("type", ""))), _num(item.get("count"), true)])
+		_religion_text(religion_summary_box, "免费信条额度：" + "、".join(parts))
+	var current = religion_data.get("currentReligion")
+	if current is Dictionary:
+		_religion_text(religion_summary_box, "我方宗教：%s（%s）" % [current.get("displayName"), current.get("id")])
+		for belief in current.get("beliefs", []):
+			_religion_text(religion_summary_box, "  · [%s] %s" % [_religion_belief_type(str(belief.get("type", ""))), belief.get("id")])
+	else:
+		_religion_text(religion_summary_box, "我方尚未创立宗教。")
+	var cities: Array = religion_data.get("cities", [])
+	if not cities.is_empty():
+		var lines := PackedStringArray()
+		for city in cities:
+			lines.append("%s：信众 %s%s" % [city.get("name"), _num(city.get("followers"), true), "（圣城）" if city.get("holyCity", false) else ""])
+		_religion_text(religion_summary_box, "城市信仰：\n" + "\n".join(lines))
+	var decision = religion_data.get("decision")
+	if decision is Dictionary:
+		religion_decision_box.show()
+		_populate_religion_decision(decision)
+	else:
+		religion_decision_box.hide()
+	religion_prophets_box.show()
+	_populate_religion_prophets()
+	_on_busy(client.busy)
+
+func _populate_religion_decision(decision: Dictionary) -> void:
+	var mode := str(decision.get("mode", ""))
+	_religion_text(religion_decision_box, "待决（第二步）：%s" % _religion_mode_label(mode))
+	if not decision.get("supported", false):
+		_religion_text(religion_decision_box, "此项暂不支持在 Godot 前端完成：%s\n请保存副本后用原客户端处理。" % str(decision.get("reason", "")))
+		return
+	for warning in decision.get("warnings", []):
+		_religion_text(religion_decision_box, "※ " + str(warning))
+	if int(decision.get("faithCost", 0)) > 0:
+		_religion_text(religion_decision_box, "本次将消耗信仰：%s" % _num(decision.get("faithCost"), true))
+	var belief_info := _religion_belief_map()
+	if mode == "foundReligion":
+		_religion_text(religion_decision_box, "选择宗教符号：")
+		religion_symbol_picker = OptionButton.new()
+		religion_symbol_picker.name = "ReligionSymbol"
+		religion_symbol_picker.fit_to_longest_item = false
+		religion_symbol_picker.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+		religion_symbol_picker.custom_minimum_size.y = 34
+		for symbol in religion_data.get("symbols", []):
+			if symbol.get("available", false):
+				religion_symbol_picker.add_item(str(symbol.get("id")))
+				religion_symbol_picker.set_item_metadata(religion_symbol_picker.item_count - 1, str(symbol.get("id")))
+		religion_decision_box.add_child(religion_symbol_picker)
+		if religion_symbol_picker.item_count > 0:
+			religion_symbol_picker.select(0)
+		_religion_text(religion_decision_box, "自定义名称（留空则用符号名，可输入中文／重音）：")
+		religion_name_edit = LineEdit.new()
+		religion_name_edit.name = "ReligionName"
+		religion_name_edit.custom_minimum_size.y = 34
+		religion_name_edit.max_length = 32
+		religion_name_edit.placeholder_text = "留空则使用所选符号名"
+		religion_decision_box.add_child(religion_name_edit)
+	for slot in decision.get("slots", []):
+		_religion_text(religion_decision_box, "选择%s信条：" % _religion_belief_type(str(slot.get("type", ""))))
+		var picker := OptionButton.new()
+		picker.name = "ReligionSlot%d" % int(slot.get("index", religion_slot_pickers.size()))
+		picker.fit_to_longest_item = false
+		picker.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+		picker.custom_minimum_size.y = 34
+		picker.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		for cid in slot.get("candidateIds", []):
+			var info: Dictionary = belief_info.get(str(cid), {})
+			picker.add_item(str(cid))
+			picker.set_item_metadata(picker.item_count - 1, str(cid))
+			picker.set_item_tooltip(picker.item_count - 1, "\n".join(info.get("effects", [])))
+		religion_decision_box.add_child(picker)
+		if picker.item_count > 0:
+			picker.select(0)
+		religion_slot_pickers.append(picker)
+	var submit := button(religion_decision_box, "确认并提交选择", _submit_religion_decision)
+	submit.name = "ReligionSubmit"
+	submit.set_meta("allowed", decision.get("enabled", false) and _religion_stamp_valid(religion_stamp))
+	submit.tooltip_text = str(decision.get("reason", ""))
+	if not decision.get("enabled", false):
+		_religion_text(religion_decision_box, str(decision.get("reason", "")))
+
+func _populate_religion_prophets() -> void:
+	var prophets: Array = religion_data.get("prophets", [])
+	if prophets.is_empty():
+		_religion_text(religion_prophets_box, "当前没有可用的大预言家。积累信仰可在后续回合概率生成。")
+		return
+	_religion_text(religion_prophets_box, "大预言家（第一步：使用预言家以进入信条选择）：")
+	for prophet in prophets:
+		var head := "预言家 #%s ·（%s, %s）" % [_num(prophet.get("unitId"), true), _num(prophet.get("x"), true), _num(prophet.get("y"), true)]
+		var enabled_actions: Array = prophet.get("actions", []).filter(func(a): return a.get("enabled", false))
+		if enabled_actions.is_empty():
+			var reasons: Array = prophet.get("actions", []).map(func(a): return str(a.get("reason", ""))).filter(func(r): return not r.is_empty())
+			_religion_text(religion_prophets_box, head + "（暂不可操作）" + ("：" + str(reasons[0]) if not reasons.is_empty() else ""))
+			continue
+		_religion_text(religion_prophets_box, head)
+		for action in enabled_actions:
+			var payload := {"action": "religionUseProphet",
+				"params": {"unitId": int(prophet.get("unitId")), "mode": str(action.get("mode")), "actionToken": str(action.get("actionToken"))},
+				"stamp": _religion_state_stamp(str(action.get("actionToken"))),
+				"description": "%s\n%s" % [head, str(action.get("label"))],
+				"success": "已使用预言家，请在上方完成信条选择。"}
+			var control := button(religion_prophets_box, str(action.get("label")), _open_religion_confirmation.bind(payload))
+			control.name = "ReligionProphet_%s_%s" % [prophet.get("unitId"), action.get("mode")]
+			control.set_meta("allowed", _religion_stamp_valid(religion_stamp))
+
+func _submit_religion_decision() -> void:
+	var decision = religion_data.get("decision")
+	if not decision is Dictionary or not _religion_stamp_valid(religion_stamp):
+		await _refresh_religion()
+		message.text = "宗教待决已过期，请重新确认。"
+		return
+	if not decision.get("enabled", false):
+		return
+	var beliefs: Array = []
+	var seen := {}
+	for picker in religion_slot_pickers:
+		var slot_picker: OptionButton = picker
+		if slot_picker.selected < 0:
+			message.text = "仍有信条槽位未选择。"
+			return
+		var chosen := str(slot_picker.get_item_metadata(slot_picker.selected))
+		if seen.has(chosen):
+			message.text = "信条不可重复：%s" % chosen
+			return
+		seen[chosen] = true
+		beliefs.append(chosen)
+	var mode := str(decision.get("mode", ""))
+	var token := str(decision.get("token", ""))
+	if mode == "foundReligion":
+		if religion_symbol_picker == null or religion_symbol_picker.selected < 0:
+			message.text = "请选择一个宗教符号。"
+			return
+		var symbol := str(religion_symbol_picker.get_item_metadata(religion_symbol_picker.selected))
+		var custom := religion_name_edit.text.strip_edges() if religion_name_edit != null else ""
+		var display := custom if not custom.is_empty() else symbol
+		await _open_religion_confirmation({"action": "religionFound",
+			"params": {"decisionToken": token, "religionId": symbol, "displayName": display, "beliefs": beliefs},
+			"stamp": _religion_state_stamp(token),
+			"description": "创立宗教：%s（符号 %s）\n信条：%s" % [display, symbol, "、".join(beliefs)],
+			"success": "宗教已创立 · 状态版本 %s" % client.revision})
+	else:
+		await _open_religion_confirmation({"action": "religionChooseBeliefs",
+			"params": {"decisionToken": token, "beliefs": beliefs},
+			"stamp": _religion_state_stamp(token),
+			"description": "%s\n信条：%s" % [_religion_mode_label(mode), "、".join(beliefs)],
+			"success": "信条选择已提交 · 状态版本 %s" % client.revision})
+
+func _open_religion_confirmation(payload: Dictionary) -> void:
+	if _input_locked():
+		return
+	if not _religion_stamp_valid(religion_stamp) or not _religion_stamp_valid(payload.get("stamp", {})):
+		await _refresh_religion()
+		message.text = "宗教详情已过期，请重新确认。"
+		return
+	religion_payload = payload.duplicate(true)
+	religion_confirmation.dialog_text = str(payload.get("description", ""))
+	religion_confirmation.popup_centered(Vector2i(mini(480, int(size.x) - 48), mini(400, int(size.y) - 80)))
+	_on_busy(false)
+
+func _confirm_religion() -> void:
+	var payload := religion_payload.duplicate(true)
+	_cancel_religion()
+	if client.busy or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or great_person_confirmation.visible or vote_transaction or vote_confirmation.visible or payload.is_empty():
+		return
+	if not _religion_stamp_valid(payload.get("stamp", {})):
+		await _refresh_religion()
+		message.text = "宗教选择已失效，未提交。请重新确认。"
+		return
+	religion_transaction = true
+	_on_busy(true)
+	var result := await execute(str(payload.action), payload.params, false, false, true)
+	religion_transaction = false
+	_on_busy(client.busy)
+	if result.get("ok", false):
+		message.text = str(payload.get("success", "宗教操作完成 · 状态版本 %s" % client.revision))
+	else:
+		message.text = str(result.get("error", {}).get("message", "宗教操作失败"))
 
 func _city_sub_page(sub_name: String) -> VBoxContainer:
 	var scroll := ScrollContainer.new()
@@ -694,6 +1088,10 @@ func _build_matters_tab() -> void:
 	button(page, "消息已阅", func(): await execute("acknowledge"))
 	diplomacy_open_button = button(page, "打开外交处理", _open_diplomacy)
 	diplomacy_open_button.name = "OpenDiplomacy"
+	religion_open_button = button(page, "打开宗教处理", _open_religion)
+	religion_open_button.name = "OpenReligion"
+	_build_great_person(page)
+	_build_vote(page)
 	label(page, "科研")
 	page.add_child(research_picker)
 	button(page, "选择科技", func():
@@ -705,6 +1103,459 @@ func _build_matters_tab() -> void:
 		if policy_picker.selected >= 0:
 			await execute("policy", {"name": policy_picker.get_item_text(policy_picker.selected)}))
 	button(page, "暂缓政策", func(): await execute("deferPolicy"))
+
+func _build_vote(page: Node) -> void:
+	vote_summary.name = "DiplomaticVoteSummary"
+	vote_summary.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	page.add_child(vote_summary)
+	vote_open = button(page, "打开外交投票／结果", _open_vote)
+	vote_open.name = "OpenDiplomaticVote"
+	vote_open.set_meta("allowed", false)
+	page.add_child(vote_panel)
+	vote_panel.hide()
+	vote_picker.name = "DiplomaticVotePicker"
+	vote_picker.fit_to_longest_item = false
+	vote_picker.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	vote_picker.custom_minimum_size.y = 34
+	vote_picker.item_selected.connect(_select_vote)
+	vote_panel.add_child(vote_picker)
+	vote_description.name = "DiplomaticVoteDescription"
+	vote_description.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	vote_panel.add_child(vote_description)
+	vote_submit = button(vote_panel, "投给所选文明……", _submit_vote.bind("civilization"))
+	vote_submit.name = "DiplomaticVoteSubmit"
+	vote_abstain = button(vote_panel, "明确弃权……", _submit_vote.bind("abstain"))
+	vote_abstain.name = "DiplomaticVoteAbstain"
+	var result_scroll := ScrollContainer.new()
+	result_scroll.name = "DiplomaticVoteResults"
+	result_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	result_scroll.custom_minimum_size.y = 210
+	vote_results.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	result_scroll.add_child(vote_results)
+	vote_panel.add_child(result_scroll)
+	vote_continue = button(vote_panel, "确认结果并继续", _continue_vote)
+	vote_continue.name = "DiplomaticVoteContinue"
+	for control in [vote_submit, vote_abstain, vote_continue]:
+		control.set_meta("allowed", false)
+	button(vote_panel, "返回地图（保留待决）", _back_vote).name = "DiplomaticVoteBack"
+	vote_confirmation.name = "DiplomaticVoteConfirmation"
+	vote_confirmation.title = "确认本轮外交投票"
+	vote_confirmation.dialog_autowrap = true
+	vote_confirmation.get_ok_button().text = "确认提交"
+	vote_confirmation.get_cancel_button().text = "取消"
+	var dialog_theme := Theme.new()
+	dialog_theme.set_constant("buttons_min_height", "AcceptDialog", 34)
+	vote_confirmation.theme = dialog_theme
+	vote_confirmation.confirmed.connect(_confirm_vote)
+	vote_confirmation.canceled.connect(_cancel_vote)
+	vote_confirmation.close_requested.connect(_cancel_vote)
+	add_child(vote_confirmation)
+
+func _vote_state_stamp(mode := "", choice := "", civ_id := "", ticket := "") -> Dictionary:
+	return {"session": client.session, "revision": client.revision, "gameId": current_game,
+		"player": client.snapshot.get("player", ""), "loadEpoch": load_epoch,
+		"selectionGeneration": selection_generation, "voteGeneration": vote_generation,
+		"mode": mode, "choice": choice, "civId": civ_id, "ticket": ticket}
+
+func _vote_stamp_valid(stamp: Dictionary) -> bool:
+	if stamp.is_empty() or stamp != _vote_state_stamp(str(stamp.get("mode", "")), str(stamp.get("choice", "")), str(stamp.get("civId", "")), str(stamp.get("ticket", ""))):
+		return false
+	if str(stamp.get("ticket", "")).is_empty():
+		return true
+	var decision = vote_data.get("decision")
+	return decision is Dictionary and decision.get("mode") == stamp.mode and decision.get("token") == stamp.ticket and (stamp.choice != "civilization" or stamp.civId == _vote_target())
+
+func _cancel_vote() -> void:
+	vote_payload = {}
+	vote_confirmation.hide()
+	_on_busy(client.busy)
+
+func _invalidate_vote() -> void:
+	vote_generation += 1
+	vote_stamp = {}
+	vote_data = {}
+	vote_payload = {}
+	vote_confirmation.hide()
+	if vote_submit:
+		_populate_vote()
+
+func _open_vote() -> void:
+	if _input_locked():
+		return
+	vote_panel.show()
+	await _refresh_vote()
+	matters_scroll.ensure_control_visible(vote_description)
+
+func _refresh_vote() -> void:
+	if client.busy or client.snapshot.is_empty():
+		return
+	var own_lock := not vote_transaction
+	vote_transaction = true
+	_on_busy(true)
+	await _query_vote()
+	if own_lock:
+		vote_transaction = false
+	_on_busy(client.busy)
+
+func _query_vote() -> void:
+	_invalidate_vote()
+	if vote_uncertain:
+		var recovered: Dictionary = await client.command("snapshot")
+		if not recovered.get("ok", false) or not recovered.get("snapshot") is Dictionary:
+			_populate_vote()
+			return
+	var stamp := _vote_state_stamp()
+	var result: Dictionary = await client.command("diplomaticVoteOptions")
+	if not _apply_vote_response(result, stamp):
+		vote_uncertain = true
+		_invalidate_vote()
+
+# 旧响应注入只验证本地代际防护，不作为网络乱序证据。
+func _apply_vote_response(result: Dictionary, stamp: Dictionary) -> bool:
+	if not _vote_stamp_valid(stamp):
+		return false
+	if not result.get("ok", false) or not result.get("data") is Dictionary:
+		return false
+	if str(result.get("session", "")) != str(stamp.session) or int(result.get("revision", -1)) != int(stamp.revision):
+		return false
+	vote_data = result.data
+	vote_stamp = _vote_state_stamp()
+	vote_uncertain = false
+	_populate_vote()
+	return true
+
+func _vote_summary_text(data: Dictionary) -> String:
+	if vote_uncertain:
+		return "外交投票：状态未确认，两种写操作已禁用。请恢复连接后刷新。"
+	var text := "外交投票："
+	var my_vote: Dictionary = data.get("myVote", {})
+	match str(data.get("phase", "idle")):
+		"vote": text += "请投票或明确弃权（本轮不可改票）。"
+		"results": text += "本轮结果待确认。"
+		"waitingResults": text += "已弃权，等待公布。" if my_vote.get("choice") == "abstain" else "已投给 %s，等待公布。" % my_vote.get("civId", "")
+		"countdown": text += "距离下次投票 %s 回合。" % _num(data.get("turnsUntilVote"), true)
+		_: text += "尚未启动投票。"
+	if data.get("resultsReadable", false):
+		text += " 可查看本轮结果。"
+	var victory = data.get("victory")
+	if victory is Dictionary:
+		text += "\n原生已记录胜利：%s · %s · 第 %s 回合" % [victory.get("name", victory.get("civId", "")), victory.get("type", ""), _num(victory.get("turn"), true)]
+	return text
+
+func _update_vote_summary() -> void:
+	var summary: Dictionary = client.snapshot.get("diplomaticVote", {})
+	vote_summary.text = _vote_summary_text(summary)
+	vote_open.set_meta("allowed", vote_uncertain or summary.get("phase", "idle") != "idle" or summary.get("resultsReadable", false))
+	vote_open.tooltip_text = vote_summary.text
+
+func _populate_vote() -> void:
+	_update_vote_summary()
+	vote_picker.clear()
+	for candidate in vote_data.get("candidates", []):
+		vote_picker.add_item(str(candidate.name))
+		vote_picker.set_item_metadata(vote_picker.item_count - 1, candidate)
+		vote_picker.set_item_tooltip(vote_picker.item_count - 1, str(candidate.name))
+	vote_picker.select(-1)
+	var decision = vote_data.get("decision")
+	var enabled: bool = decision is Dictionary and decision.get("enabled", false) and _vote_stamp_valid(vote_stamp) and not vote_uncertain
+	vote_submit.set_meta("allowed", false)
+	vote_abstain.set_meta("allowed", enabled and decision.get("mode") == "cast" and vote_data.get("canAbstain", false))
+	vote_continue.set_meta("allowed", enabled and decision.get("mode") == "acknowledge")
+	vote_description.text = "选择候选后投票，或使用独立按钮明确弃权。结果在后续原生回合公布。"
+	if vote_data.get("phase") != "vote":
+		vote_description.text = _vote_summary_text(client.snapshot.get("diplomaticVote", {}))
+	elif vote_picker.item_count == 0:
+		vote_description.text = "尚无已接触的可选文明；仍可明确弃权。"
+	if decision is Dictionary and not str(decision.get("reason", "")).is_empty():
+		vote_description.text += "\n" + str(decision.reason)
+	if vote_uncertain:
+		vote_description.text = "状态未确认，请刷新；不会自动再投票或再次确认结果。"
+	_clear_dynamic(vote_results)
+	var result = vote_data.get("results")
+	vote_results.get_parent().visible = result is Dictionary
+	if result is Dictionary:
+		_religion_text(vote_results, ("已确认，可重开查看。" if result.get("acknowledged", false) else "本轮公开结果") + "\n" + str(result.get("winnerText", "")))
+		_religion_text(vote_results, "联合国：%s · 所有者：%s" % [_dash(result.get("unBuilding")), _dash(result.get("unOwnerCivId"))])
+		for row in result.get("rows", []):
+			# 每行按可用宽度换行，避免长文明名称挤掉所得票数。
+			_religion_text(vote_results, "%s（%s）\n投向：%s · 票权 %s%s" % [row.name, "主要文明" if row.type == "major" else "城邦", str(row.get("votedForName", "")) if row.choice == "civilization" else "弃权", _num(row.voteWeight, true), " · 所得 %s 票" % _num(row.votesReceived, true) if row.get("votesReceived") != null else ""])
+	_on_busy(client.busy)
+
+func _vote_target() -> String:
+	return str(vote_picker.get_item_metadata(vote_picker.selected).get("civId", "")) if vote_picker.selected >= 0 else ""
+
+func _select_vote(index: int) -> void:
+	if _input_locked() or not _vote_stamp_valid(vote_stamp) or index < 0:
+		return
+	vote_payload = {}
+	vote_generation += 1
+	vote_stamp = _vote_state_stamp()
+	vote_description.text = "将投给 %s。本轮不可改票；结果在后续原生回合公布。" % vote_picker.get_item_text(index)
+	var decision = vote_data.get("decision")
+	vote_submit.set_meta("allowed", decision is Dictionary and decision.get("mode") == "cast" and decision.get("enabled", false) and not vote_uncertain)
+	_on_busy(client.busy)
+
+func _submit_vote(choice: String) -> void:
+	if _input_locked() or vote_uncertain:
+		return
+	var decision = vote_data.get("decision")
+	if not _vote_stamp_valid(vote_stamp) or not decision is Dictionary:
+		await _refresh_vote()
+		return
+	if decision.get("mode") != "cast" or not decision.get("enabled", false):
+		return
+	var id := _vote_target() if choice == "civilization" else ""
+	if choice == "civilization" and id.is_empty():
+		return
+	var params := {"choice": choice, "decisionToken": decision.token}
+	if choice == "civilization":
+		params.civId = id
+	vote_payload = {"action": "diplomaticVoteCast", "params": params, "stamp": _vote_state_stamp("cast", choice, id, str(decision.token))}
+	vote_confirmation.dialog_text = "%s\n本轮不可改票；结果在后续原生回合公布。取消不会提交任何选票。" % ("投给 " + vote_picker.get_item_text(vote_picker.selected) if choice == "civilization" else "明确弃权")
+	vote_confirmation.popup_centered(Vector2i(mini(480, int(size.x) - 48), mini(320, int(size.y) - 80)))
+	_on_busy(false)
+
+func _confirm_vote() -> void:
+	var payload := vote_payload.duplicate(true)
+	vote_payload = {}
+	vote_confirmation.hide()
+	await _commit_vote(payload)
+
+func _continue_vote() -> void:
+	if _input_locked() or vote_uncertain:
+		return
+	var decision = vote_data.get("decision")
+	if decision is Dictionary and decision.get("mode") == "acknowledge" and decision.get("enabled", false):
+		await _commit_vote({"action": "diplomaticVoteAcknowledge", "params": {"resultToken": decision.token}, "stamp": _vote_state_stamp("acknowledge", "", "", str(decision.token))})
+
+func _commit_vote(payload: Dictionary) -> void:
+	if _input_locked() or payload.is_empty() or vote_uncertain:
+		return
+	if not _vote_stamp_valid(vote_stamp) or not _vote_stamp_valid(payload.get("stamp", {})):
+		await _refresh_vote()
+		message.text = "外交投票选择已失效，未提交；请重新读取并确认。"
+		return
+	vote_transaction = true
+	_on_busy(true)
+	var result := await execute(str(payload.action), payload.params, false, false, false, false, true)
+	vote_transaction = false
+	_on_busy(client.busy)
+	message.text = _vote_summary_text(client.snapshot.get("diplomaticVote", {})) if result.get("ok", false) or vote_uncertain else str(result.get("error", {}).get("message", "操作未完成，请查看最新状态。"))
+
+func _back_vote() -> void:
+	if _input_locked():
+		return
+	_invalidate_vote()
+	vote_panel.hide()
+	tabs.current_tab = TAB_UNIT
+	message.text = "已返回地图，投票或结果待决保留。"
+
+func _build_great_person(page: Node) -> void:
+	great_person_open = button(page, "选择免费伟人", _open_great_person)
+	great_person_open.name = "OpenGreatPerson"
+	page.add_child(great_person_panel)
+	great_person_panel.hide()
+	for line in [great_person_summary, great_person_description, great_person_result]:
+		line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	great_person_panel.add_child(great_person_summary)
+	great_person_picker.name = "GreatPersonPicker"
+	great_person_picker.fit_to_longest_item = false
+	great_person_picker.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	great_person_panel.add_child(great_person_picker)
+	great_person_picker.item_selected.connect(_select_great_person)
+	great_person_description.name = "GreatPersonDescription"
+	great_person_panel.add_child(great_person_description)
+	great_person_submit = button(great_person_panel, "领取一位……", _submit_great_person)
+	great_person_submit.name = "GreatPersonSubmit"
+	great_person_submit.set_meta("allowed", false)
+	great_person_panel.add_child(great_person_result)
+	great_person_locate = button(great_person_panel, "定位新单位", _locate_great_person)
+	great_person_locate.name = "GreatPersonLocate"
+	great_person_locate.hide()
+	button(great_person_panel, "返回地图（保留额度）", _back_great_person).name = "GreatPersonBack"
+	great_person_confirmation.name = "GreatPersonConfirmation"
+	great_person_confirmation.title = "确认免费伟人选择"
+	great_person_confirmation.dialog_autowrap = true
+	great_person_confirmation.get_ok_button().text = "领取一位"
+	great_person_confirmation.get_cancel_button().text = "取消"
+	var dialog_theme := Theme.new()
+	dialog_theme.set_constant("buttons_min_height", "AcceptDialog", 34)
+	great_person_confirmation.theme = dialog_theme
+	great_person_confirmation.confirmed.connect(_confirm_great_person)
+	great_person_confirmation.canceled.connect(_cancel_great_person)
+	great_person_confirmation.close_requested.connect(_cancel_great_person)
+	add_child(great_person_confirmation)
+
+func _open_great_person() -> void:
+	if _input_locked():
+		return
+	great_person_panel.show()
+	await _refresh_great_person()
+	matters_scroll.ensure_control_visible(great_person_summary)
+
+func _cancel_great_person() -> void:
+	great_person_payload = {}
+	great_person_confirmation.hide()
+	great_person_picker.select(-1)
+	if great_person_submit:
+		great_person_submit.set_meta("allowed", false)
+	_on_busy(client.busy)
+
+func _invalidate_great_person() -> void:
+	great_person_generation += 1
+	great_person_stamp = {}
+	great_person_data = {}
+	_cancel_great_person()
+
+func _great_person_state_stamp(unit_name := "", ticket := "") -> Dictionary:
+	return {"session": client.session, "revision": client.revision, "gameId": current_game,
+		"player": client.snapshot.get("player", ""), "loadEpoch": load_epoch,
+		"selectionGeneration": selection_generation, "greatPersonGeneration": great_person_generation,
+		"unitName": unit_name, "ticket": ticket}
+
+func _great_person_stamp_valid(stamp: Dictionary) -> bool:
+	if stamp.is_empty() or stamp != _great_person_state_stamp(str(stamp.get("unitName", "")), str(stamp.get("ticket", ""))):
+		return false
+	if str(stamp.get("ticket", "")).is_empty():
+		return true
+	var decision = great_person_data.get("decision")
+	return decision is Dictionary and decision.get("token") == stamp.ticket and _great_person_name() == stamp.unitName
+
+func _refresh_great_person() -> void:
+	if client.busy or client.snapshot.is_empty():
+		return
+	_invalidate_great_person()
+	# 传输结果不确定时，必须先恢复快照，再获取新票据；不能凭旧额度重新提交。
+	if great_person_uncertain:
+		var recovered: Dictionary = await client.command("snapshot")
+		if not recovered.get("ok", false) or not recovered.get("snapshot") is Dictionary:
+			great_person_result.text = "状态未确认，领取已禁用。请恢复连接后刷新。"
+			return
+	var stamp := _great_person_state_stamp()
+	var result: Dictionary = await client.command("greatPersonOptions")
+	_apply_great_person_response(result, stamp)
+
+# 此入口可注入旧响应以验证本地防护，不代表真实网络乱序。
+func _apply_great_person_response(result: Dictionary, stamp: Dictionary) -> bool:
+	if not _great_person_stamp_valid(stamp):
+		return false
+	if not result.get("ok", false):
+		great_person_stamp = {}
+		great_person_data = {}
+		great_person_result.text = "详情未确认，领取已禁用：" + str(result.get("error", {}).get("message", "查询失败"))
+		_populate_great_person()
+		return false
+	if str(result.get("session", "")) != str(stamp.session) or int(result.get("revision", -1)) != int(stamp.revision):
+		return false
+	great_person_uncertain = false
+	great_person_data = result.get("data", {})
+	great_person_stamp = _great_person_state_stamp()
+	_populate_great_person()
+	return true
+
+func _populate_great_person() -> void:
+	great_person_picker.clear()
+	great_person_summary.text = "免费额度：%s（玛雅受限 %s；普通 %s）" % [
+		_num(great_person_data.get("freeGreatPeople"), true), _num(great_person_data.get("mayaLimitedFreeGP"), true),
+		_num(great_person_data.get("ordinaryFreeGreatPeople"), true)]
+	var decision = great_person_data.get("decision")
+	if decision is Dictionary:
+		great_person_summary.text += "\n" + ("玛雅受限额度优先。" if decision.get("mode") == "maya" else "一次领取一位。") + str(decision.get("reason", ""))
+	else:
+		great_person_summary.text += "\n当前没有免费伟人待决。"
+	for candidate in great_person_data.get("candidates", []):
+		var index := great_person_picker.item_count
+		var reason := str(candidate.get("reason", ""))
+		great_person_picker.add_item(str(candidate.unitName) + ("（不可选）" if not candidate.enabled else ""))
+		great_person_picker.set_item_metadata(index, candidate)
+		great_person_picker.set_item_disabled(index, not candidate.enabled)
+		great_person_picker.get_popup().set_item_tooltip(index, str(candidate.unitName) + "\n" + reason)
+	great_person_picker.select(-1)
+	great_person_description.text = str(great_person_data.get("placementNote", "请选择候选查看说明。"))
+	# 禁用项的解释也放在可滚动正文中，不仅依赖悬停提示。
+	for candidate in great_person_data.get("candidates", []):
+		if not candidate.get("enabled", false):
+			great_person_description.text += "\n%s：%s" % [candidate.unitName, candidate.reason]
+	great_person_submit.set_meta("allowed", false)
+	great_person_locate.visible = _own_unit_exists(great_person_unit_id)
+	_on_busy(client.busy)
+
+func _great_person_name() -> String:
+	if great_person_picker.selected < 0:
+		return ""
+	return str(great_person_picker.get_item_metadata(great_person_picker.selected).get("unitName", ""))
+
+func _select_great_person(index: int) -> void:
+	if _input_locked() or not _great_person_stamp_valid(great_person_stamp):
+		return
+	great_person_payload = {}
+	great_person_confirmation.hide()
+	var candidate: Dictionary = great_person_picker.get_item_metadata(index)
+	great_person_description.text = "%s · %s\n移动 %s · 战斗力 %s · 远程 %s\n晋升：%s\n%s\n%s\n%s" % [
+		candidate.unitName, candidate.unitType, _num(candidate.movement), _num(candidate.strength), _num(candidate.rangedStrength),
+		"、".join(candidate.get("promotions", [])), "\n".join(candidate.get("effects", [])), candidate.reason,
+		great_person_data.get("placementNote", "")]
+	great_person_picker.tooltip_text = str(candidate.unitName)
+	great_person_submit.set_meta("allowed", candidate.get("enabled", false) and not great_person_uncertain)
+	_on_busy(client.busy)
+
+func _submit_great_person() -> void:
+	if _input_locked():
+		return
+	var decision = great_person_data.get("decision")
+	if not _great_person_stamp_valid(great_person_stamp) or not decision is Dictionary:
+		await _refresh_great_person()
+		return
+	var name := _great_person_name()
+	if name.is_empty() or not decision.get("enabled", false) or great_person_uncertain:
+		return
+	var candidate: Dictionary = great_person_picker.get_item_metadata(great_person_picker.selected)
+	if not candidate.get("enabled", false):
+		return
+	great_person_payload = {"params": {"unitName": name, "decisionToken": decision.token},
+		"stamp": _great_person_state_stamp(name, str(decision.token))}
+	great_person_confirmation.dialog_text = "领取 %s\n一次领取一位。%s\n生成位置由原生决定，可能无法落位；未生成时额度保留。" % [name,
+		"本次优先使用玛雅受限额度。" if decision.mode == "maya" else "本次使用普通免费额度。"]
+	great_person_confirmation.popup_centered(Vector2i(mini(480, int(size.x) - 48), mini(320, int(size.y) - 80)))
+	_on_busy(false)
+
+func _confirm_great_person() -> void:
+	var payload := great_person_payload.duplicate(true)
+	great_person_payload = {}
+	great_person_confirmation.hide()
+	if client.busy or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or vote_transaction or vote_confirmation.visible or payload.is_empty():
+		return
+	if not _great_person_stamp_valid(payload.get("stamp", {})):
+		await _refresh_great_person()
+		message.text = "免费伟人选择已失效，未提交；请重新选择。"
+		return
+	great_person_transaction = true
+	_on_busy(true)
+	var result := await execute("greatPersonChoose", payload.params, false, false, false, true)
+	if result.get("ok", false):
+		var business: Dictionary = result.get("greatPersonResult", {})
+		great_person_result.text = str(business.get("message", "结果未确认"))
+		great_person_unit_id = int(business.unitId) if business.get("unitId") != null else -1
+	else:
+		great_person_result.text = "状态未确认，领取已禁用。请刷新恢复。" if great_person_uncertain else str(result.get("error", {}).get("message", "领取失败"))
+	great_person_locate.visible = _own_unit_exists(great_person_unit_id)
+	great_person_transaction = false
+	_on_busy(client.busy)
+	message.text = great_person_result.text
+
+func _back_great_person() -> void:
+	if _input_locked():
+		return
+	_invalidate_great_person()
+	great_person_panel.hide()
+	tabs.current_tab = TAB_UNIT
+	message.text = "已返回地图，免费额度保留。处理位置后可重新选择。"
+
+func _locate_great_person() -> void:
+	if _input_locked() or not _own_unit_exists(great_person_unit_id):
+		return
+	await _activate_unit(great_person_unit_id)
+	_locate()
 
 # 右栏宽度按视口伸缩：低于 1280 用 340，其余 400；地图占剩余空间。
 func _apply_right_width() -> void:
@@ -721,6 +1572,16 @@ func _on_tab_selected(index: int) -> void:
 		target.clear()
 		_clear_combat()
 		await _refresh_diplomacy()
+	if index == TAB_RELIGION:
+		target.clear()
+		_clear_combat()
+		await _refresh_religion()
+
+	if index == TAB_MATTERS:
+		if great_person_panel.visible:
+			await _refresh_great_person()
+		if vote_panel.visible:
+			await _refresh_vote()
 
 func _on_city_tab_selected(index: int) -> void:
 	# 切离人口子页即退出城市地块管理；返回时由用户显式重新进入。
@@ -793,7 +1654,9 @@ func label(parent: Node, text: String) -> void:
 	parent.add_child(result)
 
 func _on_busy(is_busy: bool) -> void:
-	is_busy = is_busy or economy_transaction or diplomacy_transaction or diplomacy_confirmation.visible or economy_confirmation.visible
+	is_busy = is_busy or vote_transaction or vote_confirmation.visible or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or diplomacy_confirmation.visible or economy_confirmation.visible or religion_confirmation.visible or great_person_confirmation.visible
+	vote_picker.disabled = is_busy or vote_uncertain or vote_picker.item_count == 0 or not _vote_stamp_valid(vote_stamp)
+	great_person_picker.disabled = is_busy or great_person_picker.item_count == 0 or not _great_person_stamp_valid(great_person_stamp)
 	diplomacy_picker.disabled = is_busy or diplomacy_picker.item_count == 0
 	for spin in [diplomacy_our_gold, diplomacy_their_gold]:
 		spin.editable = not is_busy and diplomacy_gold_box.visible
@@ -818,6 +1681,13 @@ func _on_busy(is_busy: bool) -> void:
 	if is_instance_valid(focus_option):
 		# 焦点控件同时受 editable 限制，状态更新不能无条件重新启用规则禁用项。
 		focus_option.disabled = is_busy or focus_option.item_count == 0 or not city_data.get("editable", false)
+	if religion_symbol_picker != null and is_instance_valid(religion_symbol_picker):
+		religion_symbol_picker.disabled = is_busy or religion_symbol_picker.item_count == 0
+	if religion_name_edit != null and is_instance_valid(religion_name_edit):
+		religion_name_edit.editable = not is_busy
+	for slot_picker in religion_slot_pickers:
+		if is_instance_valid(slot_picker):
+			slot_picker.disabled = is_busy or slot_picker.item_count == 0
 	production_filter.editable = not is_busy
 	if not is_busy:
 		move_button.disabled = target.is_empty() or unit_id < 0 or not capture_id.is_empty()
@@ -827,14 +1697,23 @@ func _on_busy(is_busy: bool) -> void:
 	else:
 		message.text = "内核处理中……界面仍可拖动和缩放"
 
-func execute(action: String, params: Dictionary = {}, economic_commit := false, diplomatic_commit := false) -> Dictionary:
-	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "snapshot"]
-	if (economy_transaction and not economic_commit or diplomacy_transaction and not diplomatic_commit) and not query:
+func execute(action: String, params: Dictionary = {}, economic_commit := false, diplomatic_commit := false, religious_commit := false, great_person_commit := false, vote_commit := false) -> Dictionary:
+	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "snapshot"]
+	if (economy_transaction and not economic_commit or diplomacy_transaction and not diplomatic_commit or religion_transaction and not religious_commit or great_person_transaction and not great_person_commit or vote_transaction and not vote_commit) and not query:
 		return {"ok": false, "error": {"code": "BUSY", "message": "当前事务尚未完成"}}
 	if diplomacy_confirmation.visible and not query and action not in ["load", "demo"]:
 		return {"ok": false, "error": {"code": "BUSY", "message": "请先确认或取消外交选择"}}
+	if religion_confirmation.visible and not query and action not in ["load", "demo"]:
+		return {"ok": false, "error": {"code": "BUSY", "message": "请先确认或取消宗教选择"}}
+	if great_person_confirmation.visible and not query and action not in ["load", "demo"]:
+		return {"ok": false, "error": {"code": "BUSY", "message": "请先确认或取消免费伟人选择"}}
+	if vote_confirmation.visible and not query and action not in ["load", "demo"]:
+		return {"ok": false, "error": {"code": "BUSY", "message": "请先确认或取消外交投票"}}
 	if action == "snapshot":
+		_invalidate_vote()
+		_invalidate_great_person()
 		_invalidate_diplomacy()
+		_invalidate_religion()
 	if action in ["load", "demo"]:
 		load_epoch += 1
 		_reset_selection()
@@ -848,12 +1727,21 @@ func execute(action: String, params: Dictionary = {}, economic_commit := false, 
 			if confirmation.confirmed.is_connected(_confirm_founding):
 				confirmation.confirmed.disconnect(_confirm_founding)
 			confirmation.confirmed.connect(_confirm_founding, CONNECT_ONE_SHOT)
-		if failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST"]:
+		if vote_commit and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
+			vote_uncertain = true
+			await _refresh_vote()
+		elif great_person_commit and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
+			great_person_uncertain = true
+			await _refresh_great_person()
+		elif failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST", "GREAT_PERSON_DECISION", "DIPLOMATIC_VOTE_DECISION", "DIPLOMATIC_VOTE_RESULT"]:
+			_invalidate_vote()
+			_invalidate_great_person()
 			_cancel_economy()
 			_invalidate_diplomacy()
+			_invalidate_religion()
 			await client.command("snapshot")
 			await _refresh_active_context()
-		elif economic_commit or diplomatic_commit:
+		elif economic_commit or diplomatic_commit or religious_commit or great_person_commit or vote_commit:
 			await _refresh_active_context()
 		message.text = str(failure.get("message", "请求失败"))
 	else:
@@ -871,6 +1759,7 @@ func _confirm_founding() -> void:
 	await execute("foundCity", {"unitId": unit_id, "confirmPromise": true})
 
 func _apply_snapshot(data: Dictionary) -> void:
+	_invalidate_vote()
 	# gameId 改变（不同存档）视为重载：自增纪元并清空本地选择与确认状态；
 	# 同一局的写命令快照不清空选择，改由 _refresh_active_context 保留并重解析活动面板。
 	var changed: bool = current_game != data.gameId
@@ -947,13 +1836,25 @@ func _rebuild_pending(data: Dictionary) -> void:
 	pending.text = "\n".join(lines) if not lines.is_empty() else "无强制选择；可以结束回合。"
 	bottom_pending.text = ("待办 %d 项（其中 %d 项已接入，详见「事项」页）" % [data.pending.size(), actionable]) if not data.pending.is_empty() else "无强制选择；可以结束回合。"
 	diplomacy_open_button.set_meta("allowed", data.pending.any(func(item): return item.get("diplomacy", false)))
+	religion_open_button.set_meta("allowed", data.pending.any(func(item): return item.get("kind", "") == "religion"))
+	great_person_open.set_meta("allowed", data.pending.any(func(item): return item.get("kind", "") == "greatPerson") or great_person_uncertain)
+	_update_vote_summary()
 	# 待决占城优先显示处置区。
 	if not capture_id.is_empty():
 		tabs.current_tab = TAB_UNIT
 
 # 本地选择状态：用户切换选择或重载时自增代际；异步详情回填前比对，任一不符即丢弃。
 func _reset_selection() -> void:
+	vote_panel.hide()
+	vote_uncertain = false
+	_invalidate_vote()
+	great_person_panel.hide()
+	great_person_result.text = ""
+	great_person_unit_id = -1
+	great_person_uncertain = false
+	great_person_locate.hide()
 	_invalidate_diplomacy()
+	_invalidate_religion()
 	diplomacy_civ_id = ""
 	_set_buy_tile_mode(false)
 	city_stamp = {}
@@ -964,6 +1865,8 @@ func _reset_selection() -> void:
 	citizen_tile = {}
 	city_data = {}
 	selection_generation += 1
+	_invalidate_vote()
+	_invalidate_great_person()
 	_set_city_mode(false)
 	_clear_combat()
 	_clear_dynamic(unit_actions)
@@ -994,8 +1897,15 @@ func _own_city_exists(id: String) -> bool:
 
 # 写命令后统一按仍存在且仍己方的 ID 重新解析活动面板；对象消失或失去所有权则清空对应上下文。
 func _refresh_active_context() -> void:
+	if vote_transaction or (tabs and tabs.current_tab == TAB_MATTERS and vote_panel.visible):
+		await _refresh_vote()
+	if great_person_transaction or (tabs and tabs.current_tab == TAB_MATTERS and great_person_panel.visible):
+		await _refresh_great_person()
 	if tabs and (tabs.current_tab == TAB_DIPLOMACY or diplomacy_transaction):
 		await _refresh_diplomacy()
+		return
+	if tabs and (tabs.current_tab == TAB_RELIGION or religion_transaction):
+		await _refresh_religion()
 		return
 	if active_context == "unit":
 		if _own_unit_exists(unit_id):
@@ -1048,6 +1958,8 @@ func _select_tile(tile: Dictionary) -> void:
 	tile_context = tile
 	unit_id = -1
 	selection_generation += 1
+	_invalidate_vote()
+	_invalidate_great_person()
 	target.clear()
 	_clear_combat()
 	_clear_dynamic(unit_actions)
@@ -1124,6 +2036,8 @@ func _activate_unit(id: int) -> void:
 	active_context = "unit"
 	unit_id = id
 	selection_generation += 1
+	_invalidate_vote()
+	_invalidate_great_person()
 	tabs.current_tab = TAB_UNIT
 	await _resolve_unit(id, selection_generation)
 
@@ -1176,6 +2090,8 @@ func _activate_city(id: String) -> void:
 	active_context = "city"
 	city_id = id
 	selection_generation += 1
+	_invalidate_vote()
+	_invalidate_great_person()
 	tabs.current_tab = TAB_CITY
 	await _resolve_city(id, selection_generation)
 
@@ -1224,7 +2140,7 @@ func _stamp_valid(stamp: Dictionary) -> bool:
 	return not stamp.is_empty() and stamp == _state_stamp() and _own_city_exists(city_id)
 
 func _input_locked() -> bool:
-	return client.busy or economy_transaction or diplomacy_transaction or economy_confirmation.visible or diplomacy_confirmation.visible
+	return client.busy or vote_transaction or vote_confirmation.visible or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or economy_confirmation.visible or diplomacy_confirmation.visible or religion_confirmation.visible or great_person_confirmation.visible
 
 func _economy() -> Dictionary:
 	return city_data.get("economy", {})
@@ -1390,7 +2306,7 @@ func _open_economy(payload: Dictionary) -> void:
 func _confirm_economy() -> void:
 	var payload := economy_payload.duplicate(true)
 	_cancel_economy()
-	if client.busy or economy_transaction or diplomacy_transaction or payload.is_empty():
+	if client.busy or economy_transaction or diplomacy_transaction or great_person_transaction or great_person_confirmation.visible or vote_transaction or vote_confirmation.visible or payload.is_empty():
 		return
 	if not _stamp_valid(payload.get("stamp", {})):
 		await _refresh_active_context()

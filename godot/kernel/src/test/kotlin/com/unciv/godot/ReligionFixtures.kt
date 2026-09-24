@@ -256,4 +256,49 @@ internal object ReligionFixtures {
         }
         return game to taken
     }
+
+    /** 真实窗口 smoke 用的自定义宗教名称：含中文与重音，验证前端命名输入与网关名称校验。 */
+    const val smokeName = "光明Église"
+
+    /**
+     * 为真实窗口 smoke 生成持久 fixture 与独立原生期望（不经网关 DTO／ReligionCommands）：
+     * religion-pantheon（单步采用万神殿）、religion-found（两步：使用预言家→最终创立，自定义名称）。
+     * 期望状态用与 UI 完全相同的原生序列在导出副本上重放，逐步写盘供逐字段差分。
+     */
+    fun emit() {
+        val states = linkedMapOf<String, Any?>()
+        fun record(name: String, game: GameInfo) {
+            check(game.unitNamesTaken.isEmpty())
+            states[name] = GameplayAssertions.gameplay(game)
+        }
+        // 场景1：万神殿（decision=pantheon，单 Pantheon 槽 → religionChooseBeliefs）
+        val pantheon = game()
+        export(pantheon, "religion-pantheon")
+        record("pantheon-initial", pantheon)
+        val pantheonBelief = firstPantheon(pantheon)
+        native(pantheon) { chooseBeliefs(pantheon, listOf(pantheonBelief), religion(pantheon).usingFreeBeliefs()) }
+        record("pantheon-chosen", pantheon)
+        // 场景2：两步创立（先建万神殿再放置预言家 → prophet found → religionFound，自定义名称）
+        val prophetGame = game()
+        native(prophetGame) {
+            choosePantheon(prophetGame)
+            placeProphet(prophetGame)
+        }
+        val foundFile = export(prophetGame, "religion-found")
+        record("found-initial", prophetGame)
+        val foundExpected = UncivFiles.gameInfoFromString(foundFile.readText())
+        native(foundExpected) {
+            useProphet(foundExpected, prophet(foundExpected), true)
+            val manager = religion(foundExpected)
+            val picks = pickBeliefs(foundExpected, manager.getBeliefsToChooseAtFounding())
+            foundReligion(foundExpected, smokeName, firstSymbol(foundExpected), picks)
+        }
+        record("found-done", foundExpected)
+        File(root, "godot/.local/tests/religion-expected.json").writeText(dto(
+            "smokeName" to smokeName,
+            "pantheonBelief" to pantheonBelief,
+            "states" to dto(*states.toList().toTypedArray()),
+            "setFields" to GameplayAssertions.setFields.toList(),
+            "mapOfSetFields" to GameplayAssertions.mapOfSetFields.toList()).toString())
+    }
 }

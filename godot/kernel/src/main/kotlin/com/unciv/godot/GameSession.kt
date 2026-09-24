@@ -46,6 +46,8 @@ internal class GameSession(private val root: File) {
             ensure(request.integer("revision") == revision, "STALE_STATE", "状态已变化，请刷新后重试")
             if (action == "diplomacyOptions") return reply("data" to DiplomacyCommands(requireGame(), sessionId, revision).options())
             if (action == "religionOptions") return reply("data" to ReligionCommands(requireGame(), sessionId, revision).options())
+            if (action == "greatPersonOptions") return reply("data" to GreatPersonCommands(requireGame(), sessionId, revision).options(request))
+            if (action == "diplomaticVoteOptions") return reply("data" to DiplomaticVoteCommands(requireGame(), sessionId, revision).options(request))
             if (action == "unitOptions" || action == "cityOptions") {
                 val snapshot = PlayerSnapshot(requireGame())
                 val data = if (action == "unitOptions") snapshot.unitOptions(unit(snapshot, request.integer("unitId")))
@@ -70,7 +72,10 @@ internal class GameSession(private val root: File) {
                 combat.prepareAttack(request.integer("unitId"), HexCoord(request.integer("x"), request.integer("y")))
             } else null
             if (action == "combatPreview") return reply("data" to preparedAttack!!.preview())
+            val preparedGreatPerson = if (action == "greatPersonChoose")
+                GreatPersonCommands(requireGame(), sessionId, revision).prepare(request) else null
             val preparedAction: (() -> Unit)? = when (action) {
+                "diplomaticVoteCast", "diplomaticVoteAcknowledge" -> DiplomaticVoteCommands(requireGame(), sessionId, revision).prepare(request)
                 "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision" ->
                     DiplomacyCommands(requireGame(), sessionId, revision).prepare(request)
                 "cityBuyTile" -> CityEconomyCommands(requireGame()).prepareBuyTile(request)
@@ -122,13 +127,16 @@ internal class GameSession(private val root: File) {
                 val civ = candidate.currentPlayerCiv
                 var savedPath: String? = null
                 var battleResult: JsonObject? = null
+                var greatPersonResult: JsonObject? = null
                 when (action) {
+                    "greatPersonChoose" -> greatPersonResult = preparedGreatPerson!!.invoke()
                     "load", "demo" -> Unit
                     "attack" -> battleResult = preparedAttack!!.execute()
                     "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision",
                     "unitAction", "cityDecision", "workerOrder",
                     "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding",
-                    "religionUseProphet", "religionChooseBeliefs", "religionFound" -> preparedAction!!.invoke()
+                    "religionUseProphet", "religionChooseBeliefs", "religionFound",
+                    "diplomaticVoteCast", "diplomaticVoteAcknowledge" -> preparedAction!!.invoke()
                     "move" -> {
                         val unit = unit(snapshot, request.integer("unitId"))
                         val tile = destination(snapshot, request)
@@ -208,7 +216,8 @@ internal class GameSession(private val root: File) {
                 if (savedPath != null) atomicSave(candidate, File(savedPath))
                 game = candidate
                 revision++
-                result = reply("snapshot" to playerSnapshot, "savedPath" to savedPath, "battleResult" to battleResult)
+                val response = reply("snapshot" to playerSnapshot, "savedPath" to savedPath, "battleResult" to battleResult)
+                result = if (greatPersonResult == null) response else JsonObject(response + ("greatPersonResult" to greatPersonResult))
             } catch (error: Exception) {
                 if (backup != null) {
                     // 当前局可能已被半完成的命令修改，换回备份；与原客户端崩溃后重新读档效果相同。
@@ -288,6 +297,7 @@ internal class GameSession(private val root: File) {
                     "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision",
                     "attack", "unitAction", "cityDecision", "workerOrder",
                     "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding",
-                    "religionUseProphet", "religionChooseBeliefs", "religionFound")
+                    "religionUseProphet", "religionChooseBeliefs", "religionFound", "greatPersonChoose",
+                    "diplomaticVoteCast", "diplomaticVoteAcknowledge")
     }
 }
