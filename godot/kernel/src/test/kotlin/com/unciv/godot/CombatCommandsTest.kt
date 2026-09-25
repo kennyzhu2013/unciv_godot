@@ -237,12 +237,12 @@ class CombatCommandsTest {
         }
     }
 
-    @Test fun recapturedCivilianRemainsAnExplicitUnsupportedDecision() {
+    @Test fun malformedRecapturedCivilianRemainsExplicitlyUnsupported() {
         val session = load(file())
         val game = session.game!!
         game.currentPlayerCiv.popupAlerts.add(com.unciv.logic.civilization.PopupAlert(com.unciv.logic.civilization.AlertType.RecapturedCivilian, "worker"))
         val before = UncivFiles.gameInfoToString(game, false)
-        assertTrue(PlayerSnapshot(game).pending().any { it.text("kind") == "alert" && !it["supported"]!!.jsonPrimitive.boolean })
+        assertTrue(PlayerSnapshot(game).pending().any { it.text("kind") == "assetDecision" && !it["supported"]!!.jsonPrimitive.boolean })
         for (action in listOf("acknowledge", "nextTurn", "attack")) {
             val result = session.handle(request(session, action, "unitId" to unit(game, "Warrior").id, "x" to 1, "y" to 0))
             assertFalse(result["ok"]!!.jsonPrimitive.boolean)

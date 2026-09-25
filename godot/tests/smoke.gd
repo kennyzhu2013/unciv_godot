@@ -11,6 +11,9 @@ var development_steps := 0
 var economy_steps := 0
 var diplomacy_steps := 0
 var diplomacy_expected: Dictionary = {}
+var spy_steps := 0
+var spy_evidence: Array[Dictionary] = []
+const SPY_ALERTS := ["DemandToStopSpyingOnUs", "SpyingOnUsDespiteOurPromise"]
 var diplomacy_lock_handoffs := 0
 var diplomacy_lock_valid := true
 var diplomacy_pan_checked := false
@@ -37,6 +40,42 @@ var vote_evidence: Array[Dictionary] = []
 var vote_lock_valid := true
 var vote_lock_handoffs := 0
 var vote_pan_checked := false
+var asset_steps := 0
+var asset_expected: Dictionary = {}
+var asset_lock_valid := true
+var asset_lock_handoffs := 0
+
+# 客户端边界故障注入：请求仍走真实 HTTP，不作为真实网络故障证据。
+class DiplomacyFaultClient extends "res://scripts/kernel_client.gd":
+	var drop_writes := 0
+	var fail_query := ""
+	var trace: Array[Dictionary] = []
+	func _send(payload: Dictionary) -> Dictionary:
+		if payload.action == fail_query:
+			trace.append({"request": payload.duplicate(true), "injected": true})
+			await get_tree().process_frame
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：外交恢复查询失败"}}
+		var answer: Dictionary = await super._send(payload)
+		trace.append({"request": payload.duplicate(true), "answer": answer.duplicate(true)})
+		if payload.action == "diplomacyAlertDecision" and drop_writes > 0:
+			drop_writes -= 1
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：真实外交写入后丢弃响应"}}
+		return answer
+
+class AssetFaultClient extends "res://scripts/kernel_client.gd":
+	var drop_writes := 0
+	var fail_snapshot := false
+	var trace: Array[Dictionary] = []
+	func _send(payload: Dictionary) -> Dictionary:
+		if payload.action == "snapshot" and fail_snapshot:
+			await get_tree().process_frame
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：资产恢复快照失败"}}
+		var answer: Dictionary = await super._send(payload)
+		trace.append({"request": payload.duplicate(true), "answer": answer.duplicate(true)})
+		if payload.action == "assetDecision" and drop_writes > 0:
+			drop_writes -= 1
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：真实资产写入后丢弃响应"}}
+		return answer
 
 class VoteFaultClient extends "res://scripts/kernel_client.gd":
 	var drop_writes := 0
@@ -86,6 +125,11 @@ class GreatPersonFaultClient extends "res://scripts/kernel_client.gd":
 
 func run(frontend) -> void:
 	app = frontend
+	if DisplayServer.get_name() == "headless":
+		# Godot 4.6 的 headless 窗口固定 64×64，不会应用项目窗口尺寸；
+		# 显式设定根视口，使命中测试与布局和图形模式一致。
+		get_viewport().size = Vector2i(1280, 800)
+		await get_tree().process_frame
 	run_id = "smoke-%d" % int(Time.get_unix_time_from_system() * 1000.0)
 	started_at = Time.get_datetime_string_from_system(true)
 	get_tree().create_timer(900.0).timeout.connect(func(): _fail("端到端验证超时"))
@@ -182,6 +226,8 @@ func run(frontend) -> void:
 		return
 	if not await verify_vote_flow():
 		return
+	if not await verify_asset_flow():
+		return
 	await get_tree().process_frame
 	await get_tree().process_frame
 	var directory := ProjectSettings.globalize_path("res://.local")
@@ -192,7 +238,7 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote"],
+		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "asset-decisions"],
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -201,11 +247,214 @@ func run(frontend) -> void:
 		"developmentSteps": development_steps, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps, "religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
 		"greatPersonEvidence": great_person_evidence,
 		"diplomaticVoteSteps": vote_steps, "diplomaticVoteEvidence": vote_evidence,
+		"spyDecisionSteps": spy_steps, "spyEvidence": spy_evidence,
+		"assetDecisionSteps": asset_steps, "assetLockHandoffs": asset_lock_handoffs,
 		"renderBackend": DisplayServer.get_name()}, "\t"))
 	report.close()
 	archive_smoke_result()
 	print("闭环验证通过：", " → ".join(steps))
 	get_tree().quit(0)
+
+func normalize_asset(value, key := ""):
+	if value is Dictionary:
+		var result := {}
+		for field in value:
+			result[field] = normalize_asset(value[field], str(field))
+			if key in asset_expected.mapOfSetFields and result[field] is Array:
+				result[field].sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	if value is Array:
+		var result: Array = value.map(func(item): return normalize_asset(item))
+		if key in asset_expected.setFields:
+			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	return value
+
+func asset_matches(step: String) -> bool:
+	if not check(not app.asset_transaction and not app.client.busy, "资产事务完整解锁：" + step):
+		return false
+	if not await perform("save", {"name": run_id + "-asset-" + str(asset_steps)}):
+		return false
+	var zipped := Marshalls.base64_to_raw(FileAccess.get_file_as_string(app.last_saved_path).strip_edges())
+	var state: Dictionary = JSON.parse_string(zipped.decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_GZIP).get_string_from_utf8())
+	state.erase("currentTurnStartTime")
+	state.erase("checksum")
+	for civ in state.civilizations:
+		civ.erase("totalTurnTimeSeconds")
+	var actual = normalize_asset(state)
+	var expected = normalize_asset(asset_expected.states[step])
+	for side in [["actual", actual], ["expected", expected]]:
+		var evidence := FileAccess.open("res://.local/" + run_id + "-asset-" + str(asset_steps) + "-" + side[0] + ".json", FileAccess.WRITE)
+		evidence.store_string(JSON.stringify(side[1]))
+		evidence.close()
+	if not equal_persisted(actual, expected, "资产完整原生存档 " + step):
+		return false
+	asset_steps += 1
+	return true
+
+func load_asset(name: String) -> bool:
+	return await perform("load", {"path": ProjectSettings.globalize_path("res://.local/tests/asset-" + name + ".json")})
+
+func asset_button(choice: String):
+	return find_by_name(app.capture_panel, "Asset_" + choice)
+
+func click_asset_dialog(confirm: bool, twice := false) -> bool:
+	var dialog: ConfirmationDialog = app.asset_confirmation
+	if not check(dialog.visible, "资产确认可见"):
+		return false
+	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
+	await get_tree().process_frame
+	var pos := control.get_global_rect().get_center()
+	if not check(dialog.get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34,
+			"资产确认按钮完整可见：窗口 %s，按钮 %s" % [dialog.get_visible_rect(), control.get_global_rect()]):
+		return false
+	await window_motion(dialog, pos)
+	if not check(dialog.gui_get_hovered_control() == control, "资产确认实际鼠标命中"):
+		return false
+	var viewport: Viewport = dialog
+	while viewport is Window and viewport.is_embedded():
+		pos = Vector2(viewport.position) + viewport.get_final_transform() * pos
+		viewport = viewport.get_parent().get_viewport()
+	await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false)
+	if twice:
+		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
+	await settle()
+	return check(not dialog.visible and app.asset_payload.is_empty(), "资产确认载荷清空")
+
+func observe_asset_lock(busy: bool) -> void:
+	if not app.asset_transaction:
+		return
+	asset_lock_valid = asset_lock_valid and app._input_locked()
+	for control in app.buttons:
+		asset_lock_valid = asset_lock_valid and control.disabled
+	if not busy:
+		asset_lock_handoffs += 1
+
+func verify_asset_stamps() -> bool:
+	if not await load_asset("civilian-worker"):
+		return false
+	for field in ["session", "revision", "gameId", "loadEpoch", "selectionGeneration", "generation", "type", "target", "ticket"]:
+		if not await click_control(asset_button("keep")):
+			return false
+		var revision: int = app.client.revision
+		# 仅本地确认票据故障注入，提交仍通过实际鼠标；任一字段变旧都必须零请求。
+		var value = app.asset_payload.stamp[field]
+		app.asset_payload.stamp[field] = int(value) + 1 if value is int else "stale-" + str(value)
+		var requests: int = app.client.request_counter
+		if not await click_asset_dialog(true) or not check(app.client.revision == revision and app.client.request_counter == requests, "资产旧确认零提交：" + field):
+			return false
+	if not await click_control(asset_button("keep")):
+		return false
+	var revision: int = app.client.revision
+	await diplomacy_key(KEY_ESCAPE)
+	await settle()
+	if not check(not app.asset_confirmation.visible and app.asset_payload.is_empty() and app.client.revision == revision, "资产 Escape 取消零写入"):
+		return false
+	if not await click_control(asset_button("keep")) or not await perform("snapshot"):
+		return false
+	if not check(not app.asset_confirmation.visible and app.asset_payload.is_empty() and app.client.revision == revision, "资产刷新作废确认"):
+		return false
+	return await asset_matches("civilian-worker-initial")
+
+func verify_asset_transport() -> bool:
+	for mode in ["retry", "recover", "unconfirmed"]:
+		if not await load_asset("civilian-worker") or not await click_control(asset_button("return")):
+			return false
+		var original = app.client
+		var revision: int = original.revision
+		var fault := AssetFaultClient.new()
+		app.add_child(fault)
+		fault.drop_writes = 1 if mode == "retry" else 2
+		fault.fail_snapshot = mode == "unconfirmed"
+		swap_great_person_test_client(fault)
+		var clicked := await click_asset_dialog(true, true)
+		var writes: Array = fault.trace.filter(func(entry): return entry.request.action == "assetDecision")
+		var guarded: bool = app.asset_uncertain == (mode == "unconfirmed") and not app.asset_transaction and not fault.busy
+		if mode == "unconfirmed":
+			guarded = guarded and asset_button("return").disabled and asset_button("keep").disabled
+		var evidence := FileAccess.open("res://.local/" + run_id + "-asset-transport-" + mode + ".json", FileAccess.WRITE)
+		evidence.store_string(JSON.stringify({"method": "客户端边界丢响应注入，写入仍为真实HTTP", "trace": fault.trace, "guarded": guarded}, "\t"))
+		evidence.close()
+		swap_great_person_test_client(original)
+		fault.queue_free()
+		if not clicked or not check(guarded and writes.size() == 2 and writes[0].request == writes[1].request and writes[0].answer == writes[1].answer and writes[0].answer.ok, "资产丢响应同请求重试且只执行一次：" + mode):
+			return false
+		if mode == "unconfirmed":
+			var requests: int = original.request_counter
+			scroll_into_view(asset_button("return"))
+			await settle()
+			await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, asset_button("return").get_global_rect().get_center())
+			await settle()
+			if not check(original.request_counter == requests and not app.asset_confirmation.visible, "资产结果不确定时点击零请求") or not await perform("snapshot"):
+				return false
+		if not check(original.revision == revision + 1 and not app.asset_uncertain, "资产恢复实际版本、不重复处置：" + mode) or not await asset_matches("civilian-worker-return"):
+			return false
+	return true
+
+func verify_asset_flow() -> bool:
+	asset_expected = JSON.parse_string(FileAccess.get_file_as_string("res://.local/tests/asset-expected.json"))
+	app.client.busy_changed.connect(observe_asset_lock)
+	if not await verify_asset_stamps() or not await verify_asset_transport():
+		return false
+	for name in asset_expected.cases:
+		for choice in asset_expected.cases[name]:
+			if not await load_asset(name) or not await asset_matches(name + "-initial"):
+				return false
+			var pending_path: String = app.last_saved_path
+			if not await click_control(asset_button(choice)):
+				return false
+			var revision: int = app.client.revision
+			var description: String = app._asset_pending().choices.filter(func(item): return item.id == choice)[0].description
+			if not check(app.asset_confirmation.dialog_text.contains(description) and app.turn_button.disabled, "资产确认展示原生后果并阻止回合推进"):
+				return false
+			if not await click_asset_dialog(false) or not check(app.client.revision == revision, "资产取消零写入"):
+				return false
+			if not await click_control(asset_button(choice)):
+				return false
+			var old: Dictionary = app.asset_payload.stamp.duplicate(true)
+			if not await perform("load", {"path": pending_path}):
+				return false
+			if not check(not app._asset_stamp_valid(old) and app.asset_payload.is_empty() and not app.asset_confirmation.visible, "资产未决重载使旧确认失效"):
+				return false
+			if not await click_control(asset_button(choice)):
+				return false
+			revision = app.client.revision
+			if not await click_asset_dialog(true, true) or not check(app.client.revision == revision + 1, "资产双击仅提交一次"):
+				return false
+			if not await asset_matches(name + "-" + choice):
+				return false
+			if not await perform("load", {"path": app.last_saved_path}) or not await asset_matches(name + "-" + choice + "-reload"):
+				return false
+	if not await load_asset("queue") or not await asset_matches("queue-initial"):
+		return false
+	var index := 0
+	for pair in [["RecapturedCivilian", "keep"], ["CityTraded", "keep"], ["DiplomaticMarriage", "puppet"]]:
+		var controls: Array = app.capture_panel.get_children().filter(func(item): return item is Button)
+		if not check(app._asset_pending().type == pair[0] and controls.size() == 2, "混合资产仅显示队首选项：" + pair[0]):
+			return false
+		if not await click_control(asset_button(pair[1])) or not await click_asset_dialog(true):
+			return false
+		index += 1
+		if not await asset_matches("queue-" + str(index)):
+			return false
+	if DisplayServer.get_name() != "headless":
+		var original := get_window().size
+		for target_size in [Vector2i(1024, 720), Vector2i(1280, 800), Vector2i(1600, 900)]:
+			get_window().size = target_size
+			await settle()
+			for pair in [["civilian-worker", "return"], ["traded", "liberate"], ["marriage", "annex"], ["marriage-occ", "destroy"]]:
+				if not await load_asset(pair[0]) or not await click_control(asset_button(pair[1])):
+					return false
+				await screenshot("smoke-asset-%dx%d-%s.png" % [target_size.x, target_size.y, pair[0]])
+				if not await click_asset_dialog(true) or not await asset_matches(pair[0] + "-" + pair[1]):
+					return false
+		get_window().size = original
+		await settle()
+	app.client.busy_changed.disconnect(observe_asset_lock)
+	if not check(asset_lock_valid and asset_lock_handoffs > 0, "资产查询、写入、刷新全过程保持事务锁"):
+		return false
+	steps.append("三类资产处置：12条原生结果、混合队首、取消／双击／旧确认、未决及结果重载、丢响应恢复及完整存档差分")
+	return true
 
 # 免费伟人：原始姓名替换严格镜像未修改的 GameplayAssertions，其他集合沿用其字段表。
 func normalize_great_person(value, key := ""):
@@ -1251,6 +1500,8 @@ func diplomacy_matches(step: String) -> bool:
 	if not equal_persisted(actual, expected, "外交完整原生存档 " + step):
 		return false
 	diplomacy_steps += 1
+	if SPY_ALERTS.any(func(kind): return step.begins_with(kind)):
+		spy_steps += 1
 	return check(true, "外交完整持久化状态一致：" + step)
 
 func verify_diplomacy_flow() -> bool:
@@ -1321,24 +1572,111 @@ func verify_diplomacy_flow() -> bool:
 		await screenshot("smoke-diplomacy-trade-" + choice + ".png")
 		if not await click_diplomacy_dialog(true) or not await diplomacy_matches("trade-" + choice + "-done"):
 			return false
+	var new_alerts := ["DemandToStopSpreadingReligion", "BulliedProtectedMinor", "AttackedProtectedMinor", "AttackedAllyMinor"] + SPY_ALERTS
 	for pair in [["DeclarationOfFriendship", ["accept", "decline"]], ["DemandToStopSettlingCitiesNear", ["agree", "refuse"]],
-			["DemandToNotAttackUs", ["agree", "refuseAndDeclareWar"]], ["Denounced", ["dismiss", "declareWar"]]]:
+			["DemandToNotAttackUs", ["agree", "refuseAndDeclareWar"]], ["Denounced", ["dismiss", "declareWar"]],
+			["DemandToStopSpreadingReligion", ["agree", "refuse"]], ["DemandToStopSpyingOnUs", ["agree", "refuse"]],
+			["SpyingOnUsDespiteOurPromise", ["agree", "refuse"]], ["BulliedProtectedMinor", ["declareWar", "support", "withdrawProtection"]],
+			["AttackedProtectedMinor", ["declareWar", "support", "withdrawProtection"]], ["AttackedAllyMinor", ["declareWar", "support", "withdrawProtection"]]]:
 		for choice in pair[1]:
-			if not await load_diplomacy(pair[0], true) or not await click_control(diplomacy_control(choice, true)):
+			if not await load_diplomacy(pair[0], true):
 				return false
+			if pair[0] in new_alerts:
+				if not await diplomacy_matches(pair[0] + "-initial") or not await click_control(diplomacy_control(choice, true)):
+					return false
+				var stale_confirmation: Dictionary = app.diplomacy_payload.stamp.duplicate(true)
+				if not await perform("load", {"path": app.last_saved_path}):
+					return false
+				if not check(not app.diplomacy_confirmation.visible and app.diplomacy_payload.is_empty()
+						and not app._diplomacy_stamp_valid(stale_confirmation), "新事件未处理重载保留待决并废弃旧确认：" + pair[0]):
+					return false
+				# 重载会回到单位页；从事项入口重新取得当前事件详情后再操作。
+				if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.diplomacy_open_button):
+					return false
+				if not check(app.diplomacy_data.get("pendingAlert", {}).get("type", "") == pair[0], "重载后重新打开同一待决事件：" + pair[0]):
+					return false
+			if not await click_control(diplomacy_control(choice, true)):
+				return false
+			if pair[0] in new_alerts:
+				var option: Dictionary = app.diplomacy_data.pendingAlert.choices.filter(func(item): return item.id == choice)[0]
+				if not check(not str(option.description).is_empty() and app.diplomacy_confirmation.dialog_text.contains(option.description), "新事件确认完整显示后果：" + choice):
+					return false
 			if choice == "refuseAndDeclareWar" and not check(app.diplomacy_confirmation.dialog_text.contains("拒绝并宣战"), "不攻击拒绝明确提示战争"):
 				return false
-			if not await click_diplomacy_dialog(false) or not await click_control(diplomacy_control(choice, true)):
+			revision = app.client.revision
+			if not await click_diplomacy_dialog(false) or not check(app.client.revision == revision, "事件取消零写入：" + pair[0]):
+				return false
+			if not await click_control(diplomacy_control(choice, true)):
 				return false
 			await screenshot("smoke-diplomacy-" + pair[0] + "-" + choice + ".png")
-			if not await click_diplomacy_dialog(true) or not await diplomacy_matches(pair[0] + "-" + choice):
+			if not await click_diplomacy_dialog(true, true) or not check(app.client.revision == revision + 1, "事件双击只提交一次：" + pair[0]):
 				return false
+			if not await diplomacy_matches(pair[0] + "-" + choice):
+				return false
+			if pair[0] in new_alerts:
+				if not await perform("load", {"path": app.last_saved_path}) or not await diplomacy_matches(pair[0] + "-" + choice):
+					return false
 	if not check(diplomacy_lock_handoffs >= 30 and diplomacy_lock_valid and diplomacy_pan_checked,
 			"外交写HTTP至详情刷新持续互斥且真实中键拖动／滚轮缩放有效：%s 次交接，%s" % [diplomacy_lock_handoffs, diplomacy_pan_result]):
 		return false
-	if not await verify_diplomacy_sizes():
+	if not await verify_spy_transport() or not await verify_diplomacy_sizes():
 		return false
-	steps.append("外交：真实窗口宣战、纯和平及金币提案、撤回、AI正常回合、接受／拒绝／清理、四类事件全部选择与逐步完整原生差分")
+	steps.append("外交：真实窗口宣战、和平提案、撤回、AI回合、交易处置、十类事件全部选择；含间谍待决取消／双击／重载、丢响应恢复及完整原生差分")
+	return true
+
+func verify_spy_transport() -> bool:
+	for kind in SPY_ALERTS:
+		for mode in ["retry", "recover", "snapshot", "diplomacyOptions"]:
+			var choice := "agree" if kind == SPY_ALERTS[0] else "refuse"
+			if not await load_diplomacy(kind, true) or not await click_control(diplomacy_control(choice, true)):
+				return false
+			var original = app.client
+			var revision: int = original.revision
+			var stale: Dictionary = app.diplomacy_payload.duplicate(true)
+			var old_data: Dictionary = app.diplomacy_data.duplicate(true)
+			var fault := DiplomacyFaultClient.new()
+			app.add_child(fault)
+			fault.drop_writes = 1 if mode == "retry" else 2
+			fault.fail_query = mode if mode in ["snapshot", "diplomacyOptions"] else ""
+			swap_great_person_test_client(fault)
+			var clicked := await click_diplomacy_dialog(true, true)
+			var writes: Array = fault.trace.filter(func(entry): return entry.request.action == "diplomacyAlertDecision")
+			var order: Array = fault.trace.filter(func(entry): return entry.request.action != "diplomacyAlertDecision").map(func(entry): return entry.request.action)
+			var expected_order: Array = ["diplomacyOptions"] if mode == "retry" else ["snapshot", "diplomacyOptions"]
+			if mode == "snapshot":
+				expected_order = ["snapshot", "snapshot"]
+			elif mode == "diplomacyOptions":
+				expected_order = ["snapshot", "diplomacyOptions", "diplomacyOptions"]
+			var uncertain := not fault.fail_query.is_empty()
+			var guarded: bool = app.diplomacy_uncertain == uncertain and not app.diplomacy_transaction and not fault.busy \
+				and app.diplomacy_payload.is_empty() and not app.diplomacy_confirmation.visible
+			if uncertain:
+				guarded = guarded and app.diplomacy_data.is_empty() and app.diplomacy_stamp.is_empty() and diplomacy_control(choice, true) == null
+			var path: String = "res://.local/" + run_id + "-spy-transport-" + kind + "-" + mode + ".json"
+			var evidence := FileAccess.open(path, FileAccess.WRITE)
+			evidence.store_string(JSON.stringify({"method": "客户端边界丢响应注入，写入仍为真实HTTP", "trace": fault.trace, "guarded": guarded}, "\t"))
+			evidence.close()
+			spy_evidence.append({"event": kind, "mode": mode, "path": ProjectSettings.globalize_path(path)})
+			swap_great_person_test_client(original)
+			fault.queue_free()
+			if not clicked or not check(guarded and order == expected_order and diplomacy_lock_valid, "间谍外交恢复顺序、全程锁与禁用：" + kind + "/" + mode):
+				return false
+			if not check(writes.size() == 2 and writes[0].request == writes[1].request and writes[0].answer == writes[1].answer and writes[0].answer.ok, "间谍外交同请求重试、仅一次写入：" + kind + "/" + mode):
+				return false
+			if not check(not app._apply_diplomacy_response({"ok": true, "session": stale.stamp.session, "revision": stale.stamp.revision, "data": old_data}, stale.stamp), "恢复后拒绝旧外交响应回填"):
+				return false
+			if uncertain:
+				await screenshot("smoke-spy-uncertain-" + kind + "-" + mode + ".png")
+				var refresh: Array = app.buttons.filter(func(control): return control.text == "刷新")
+				if not check(refresh.size() == 1, "外交不确定状态仍有刷新入口") or not await click_control(refresh[0]):
+					return false
+				# 原选择已销毁；显式旧确认注入也只能刷新，不能重交写请求。
+				app.diplomacy_payload = stale
+				await app._confirm_diplomacy()
+				if not check(not app.diplomacy_confirmation.visible and app.diplomacy_payload.is_empty(), "间谍旧确认不可重交"):
+					return false
+			if not check(original.revision == revision + 1 and not app.diplomacy_uncertain, "间谍恢复真实版本、不重复处置") or not await diplomacy_matches(kind + "-" + choice):
+				return false
 	return true
 
 func verify_diplomacy_stamps() -> bool:
@@ -1417,8 +1755,24 @@ func verify_diplomacy_sizes() -> bool:
 				or not await click_control(app.diplomacy_gold_box.get_node("ProposePeace")):
 			return false
 		await screenshot("smoke-diplomacy-" + label + "-gold.png")
-		if not await click_diplomacy_dialog(false):
+		if not await click_diplomacy_dialog(false) or not await load_diplomacy("AttackedProtectedMinor", true):
 			return false
+		for choice in ["declareWar", "support", "withdrawProtection"]:
+			if not await click_control(diplomacy_control(choice, true)):
+				return false
+			await screenshot("smoke-diplomacy-" + label + "-minor-" + choice + ".png")
+			if not await click_diplomacy_dialog(false):
+				return false
+		for kind in SPY_ALERTS:
+			for choice in ["agree", "refuse"]:
+				if not await load_diplomacy(kind, true) or not await click_control(diplomacy_control(choice, true)):
+					return false
+				if not check(app.diplomacy_confirmation.dialog_text.contains("间谍任务") and app.diplomacy_confirmation.dialog_text.contains("违约惩罚"), label + " 间谍确认完整后果"):
+					return false
+				await screenshot("smoke-spy-" + label + "-" + kind + "-" + choice + ".png")
+				var revision: int = app.client.revision
+				if not await click_diplomacy_dialog(true) or not check(app.client.revision == revision + 1, label + " 间谍真实确认一次写入") or not await diplomacy_matches(kind + "-" + choice):
+					return false
 	get_window().size = original
 	await settle()
 	return true
@@ -2068,10 +2422,13 @@ func _fail(message: String) -> void:
 	if report:
 		report.store_string(JSON.stringify({"ok": false, "runId": run_id, "startedAt": started_at,
 			"finishedAt": Time.get_datetime_string_from_system(true), "error": message,
+			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
-			"diplomaticVoteSteps": vote_steps, "diplomaticVoteEvidence": vote_evidence}, "\t"))
+			"diplomaticVoteSteps": vote_steps, "diplomaticVoteEvidence": vote_evidence,
+			"spyDecisionSteps": spy_steps, "spyEvidence": spy_evidence,
+			"assetDecisionSteps": asset_steps, "assetLockHandoffs": asset_lock_handoffs}, "\t"))
 		report.close()
 	archive_smoke_result()
 	push_error("闭环验证失败：" + message)
@@ -2841,7 +3198,7 @@ func settle() -> void:
 	var guard := 0
 	while idle < 3 and guard < 900:
 		guard += 1
-		if app.client.busy or app.economy_transaction or app.diplomacy_transaction or app.religion_transaction or app.great_person_transaction or app.vote_transaction:
+		if app.client.busy or app.economy_transaction or app.diplomacy_transaction or app.religion_transaction or app.great_person_transaction or app.vote_transaction or app.asset_transaction:
 			idle = 0
 		else:
 			idle += 1
@@ -3020,7 +3377,8 @@ func click_option(ob: OptionButton, index: int) -> bool:
 			return check(ob.selected == index and not popup.visible, "真实鼠标选中经济下拉项目")
 	input_trace.append({"picker": str(ob.name), "target": index, "text": ob.get_item_text(index),
 		"disabled": ob.is_item_disabled(index), "popupPosition": str(popup.position), "popupSize": str(popup.size),
-		"embedded": popup.is_embedded(), "focusedSamples": focused_samples})
+		"embedded": popup.is_embedded(), "visible": popup.visible,
+		"rootFocused": get_window().has_focus(), "focusedSamples": focused_samples})
 	await screenshot("smoke-option-hit-failure.png")
 	return check(false, "经济下拉条目未命中：" + str(index))
 

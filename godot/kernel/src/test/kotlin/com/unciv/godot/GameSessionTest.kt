@@ -3,6 +3,7 @@ package com.unciv.godot
 import com.badlogic.gdx.Gdx
 import com.unciv.UncivGame
 import com.unciv.logic.GameInfo
+import com.unciv.logic.civilization.AlertType
 import com.unciv.logic.civilization.NotificationCategory
 import com.unciv.logic.civilization.NotificationIcon
 import com.unciv.logic.civilization.diplomacy.DiplomacyFlags
@@ -182,6 +183,89 @@ class GameSessionTest {
         println("原生／网关差分通过：移动、建城、生产队列、科研、决策、15 回合及独立保存重载")
     }
 
+    @Test fun fiftyMixedTurnsWithNewEventsAndIndependentReloads() {
+        val events = DiplomacyFixtures.spyAlerts + listOf(AlertType.DemandToStopSpreadingReligion) + DiplomacyFixtures.cityStateAlerts
+        val file = DiplomacyFixtures.file("mixed-fifty-turns") { game ->
+            DiplomacyFixtures.protectedCityState(game)
+            game.currentPlayerCiv.cities.first().cityConstructions.constructionQueue.clear()
+            game.currentPlayerCiv.tech.techsToResearch.clear()
+            for (type in events) DiplomacyFixtures.alert(game, type)
+        }
+        val session = loadedSession(file)
+        val native = Native(UncivFiles.gameInfoFromString(file.readText()))
+        val handled = mutableListOf<String>()
+        fun reload(label: String) {
+            val saved = run(session, "save", "name" to "mixed-fifty-turns")
+            native.game = UncivFiles.gameInfoFromString(UncivFiles.gameInfoToString(native.game, true))
+            run(session, "load", "path" to saved.text("savedPath"))
+            assertGameplayEquals(label, native.game, session.game!!)
+        }
+        val start = native.game.turns
+        for (step in 1..50) {
+            if (step > 1 && step % 10 == 1) {
+                // 显式测试注入，用于固定覆盖新事件；不声称这些提示由 AI 自然生成，也不清空已有待决。
+                for (game in listOf(session.game!!, native.game))
+                    DiplomacyFixtures.alert(game, events[(step / 10 - 1) % events.size])
+                assertGameplayEquals("第 $step 步追加事件", native.game, session.game!!)
+                reload("第 $step 步保留未处理事件独立重载")
+            }
+            handled += resolveSupportedDecisions(session, native)
+            pairedCommand(session, native, "nextTurn")
+            assertEquals(start + step, session.game!!.turns)
+            if (step % 5 == 0) reload("第 $step 步独立重载")
+        }
+        handled += resolveSupportedDecisions(session, native)
+        assertTrue("混合序列应处理生产与科研：$handled", handled.containsAll(listOf("production", "research")))
+        for (type in events) assertTrue("确实处理了 $type", handled.contains("diplomacyAlert:$type"))
+        assertTrue(native.game.currentPlayerCiv.tech.techsResearched.size > 1)
+        assertTrue(native.game.civilizations.any { it.isAI() && it.cities.isNotEmpty() })
+        assertNull(Gdx.app)
+        assertNull(Gdx.gl)
+        assertNull(Gdx.audio)
+        for (type in DiplomacyFixtures.spyAlerts) assertTrue("中途再次处理 $type", handled.count { it == "diplomacyAlert:$type" } >= 2)
+        println("混合 50 回合完整差分通过：每 5 回合独立重载，六类事件及中途间谍待决保存；${handled.groupingBy { it }.eachCount()}")
+    }
+
+    @Test fun fiftyTurnsWithMixedAssetsAndIndependentPendingReloads() {
+        val initial = AssetDecisionFixtures.game("civilian-worker")
+        AssetDecisionFixtures.tradeCity(initial)
+        AssetDecisionFixtures.marriage(initial)
+        initial.currentPlayerCiv.cities.first().cityConstructions.constructionQueue.clear()
+        initial.currentPlayerCiv.tech.techsToResearch.clear()
+        val source = AssetDecisionFixtures.export(initial, "mixed-fifty")
+        val session = loadedSession(source)
+        val native = Native(UncivFiles.gameInfoFromString(source.readText()))
+        val alerts = native.game.currentPlayerCiv.popupAlerts.filter { it.type in AssetDecisionCommands.alertTypes }
+        val handled = mutableListOf<String>()
+        fun reload(step: String) {
+            val saved = run(session, "save", "name" to "asset-mixed-fifty")
+            native.game = UncivFiles.gameInfoFromString(UncivFiles.gameInfoToString(native.game, true))
+            run(session, "load", "path" to saved.text("savedPath"))
+            assertGameplayEquals(step, native.game, session.game!!)
+        }
+        reload("三类资产同时待决")
+        for (step in 1..50) {
+            if (step == 11) {
+                // 中途显式注入保留资产的处置提示，验证待决重载；不声称是 AI 自然触发，也不清空已有事项。
+                for (game in listOf(session.game!!, native.game)) for (alert in alerts)
+                    game.currentPlayerCiv.popupAlerts.add(com.unciv.logic.civilization.PopupAlert(alert.type, alert.value))
+                reload("第 11 步三类资产待决重载")
+            }
+            handled += resolveSupportedDecisions(session, native)
+            pairedCommand(session, native, "nextTurn")
+            assertEquals(initial.turns + step, session.game!!.turns)
+            if (step % 5 == 0) reload("第 $step 步独立重载")
+        }
+        handled += resolveSupportedDecisions(session, native)
+        for (type in AssetDecisionCommands.alertTypes)
+            assertEquals("两次处理 $type", 2, handled.count { it == "assetDecision:$type" })
+        assertTrue(handled.containsAll(listOf("research", "production")))
+        assertNull(Gdx.app)
+        assertNull(Gdx.gl)
+        assertNull(Gdx.audio)
+        println("资产混合 50 回合差分通过：三类待决、中途注入、每 5 回合独立重载；${handled.groupingBy { it }.eachCount()}")
+    }
+
     @Test fun realMidGameSaveMatchesNativeCoreForFiveTurns() {
         val native = Native(UncivFiles.gameInfoFromString(screenshotSave.readText(Charsets.UTF_8)))
         val session = loadedSession(screenshotSave)
@@ -247,6 +331,9 @@ class GameSessionTest {
                 "policy" -> civ.policies.adopt(native.game.ruleset.policies[args.text("name")]!!)
                 "acknowledge" -> civ.popupAlerts.removeAt(0)
                 "diplomacyAlertDecision" -> DiplomacyFixtures.alertDecision(native.game, args.text("choice"))
+                "assetDecision" -> AssetDecisionFixtures.decide(native.game, args.text("choice"))
+                "religionChooseBeliefs" -> ReligionFixtures.chooseBeliefs(native.game,
+                    args["beliefs"]!!.jsonArray.map { it.jsonPrimitive.content }, civ.religionManager.usingFreeBeliefs())
                 "declineTrade" -> {
                     // 与 TradePopup 的“Not this time.”按钮逐行一致。
                     val tradeRequest = civ.tradeRequests.first()
@@ -339,7 +426,8 @@ class GameSessionTest {
             val snapshot = run(session, "snapshot")["snapshot"]!!.jsonObject
             val pending = snapshot["pending"]!!.jsonArray.map { it.jsonObject }
             if (pending.isEmpty()) return handled
-            val decision = pending.first()
+            // 阻塞弹窗先于生产或交易；与前端先进入外交／事项页处理强制选择一致。
+            val decision = pending.firstOrNull { it.text("kind") in listOf("diplomacyAlert", "assetDecision", "alert") } ?: pending.first()
             assertTrue("测试遇到尚未接入的决策：$decision", decision["supported"]!!.jsonPrimitive.boolean)
             handled += decision.text("kind")
             when (decision.text("kind")) {
@@ -358,10 +446,27 @@ class GameSessionTest {
                 "diplomacyAlert" -> {
                     val alert = run(session, "diplomacyOptions")["data"]!!.jsonObject["pendingAlert"]!!.jsonObject
                     val choices = alert["choices"]!!.jsonArray.map { it.jsonObject }.filter { it.boolean("enabled") }
-                    val choice = choices.firstOrNull { it.text("id") in listOf("decline", "dismiss", "agree") } ?: choices.first()
+                    handled += "diplomacyAlert:${alert.text("type")}"
+                    val choice = choices.firstOrNull { it.text("id") in listOf("decline", "dismiss", "agree", "support") } ?: choices.first()
                     decide("diplomacyAlertDecision", "alertToken" to alert.text("alertToken"), "choice" to choice.text("id"))
                 }
+                "assetDecision" -> {
+                    val asset = run(session, "assetDecisionOptions")["data"]!!.jsonObject["decision"]!!.jsonObject
+                    val choices = asset["choices"]!!.jsonArray.map { it.jsonObject }.filter { it.boolean("enabled") }
+                    val choice = choices.firstOrNull { it.text("id") in listOf("keep", "puppet", "dismiss") } ?: choices.first()
+                    handled += "assetDecision:${asset.text("type")}"
+                    decide("assetDecision", "decisionToken" to asset.text("token"), "choice" to choice.text("id"))
+                }
                 "trade" -> decide("declineTrade")
+                "religion" -> {
+                    val religion = run(session, "religionOptions")["data"]!!.jsonObject["decision"]!!.jsonObject
+                    assertTrue("此长序列仅驱动普通信条选择：$religion", religion.text("mode") in listOf("pantheon", "expandPantheon", "enhanceReligion", "freeBeliefs"))
+                    val used = hashSetOf<String>()
+                    val beliefs = religion["slots"]!!.jsonArray.map { slot ->
+                        slot.jsonObject["candidateIds"]!!.jsonArray.map { it.jsonPrimitive.content }.first { used.add(it) }
+                    }
+                    decide("religionChooseBeliefs", "decisionToken" to religion.text("token"), "beliefs" to beliefs)
+                }
                 else -> fail("未处理的决策：$decision")
             }
         }

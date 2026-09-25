@@ -37,6 +37,12 @@ var capture_panel := VBoxContainer.new()
 var capture_id := ""
 var raze_confirmation := ConfirmationDialog.new()
 var raze_revision := -1
+# 资产处置沿用占城显示区域，但确认、票据和事务独立，避免复用征服语义。
+var asset_generation := 0
+var asset_payload: Dictionary = {}
+var asset_transaction := false
+var asset_uncertain := false
+var asset_confirmation := ConfirmationDialog.new()
 # 工人与城市发展（dev5）：面板容器按需重建，动态按钮统一走 button() 进入 buttons 以复用 busy 管理。
 var worker_panel := VBoxContainer.new()
 var city_panel := VBoxContainer.new()
@@ -111,6 +117,7 @@ var diplomacy_data: Dictionary = {}
 var diplomacy_stamp: Dictionary = {}
 var diplomacy_payload: Dictionary = {}
 var diplomacy_transaction := false
+var diplomacy_uncertain := false
 var diplomacy_confirmation := ConfirmationDialog.new()
 var diplomacy_picker := OptionButton.new()
 var diplomacy_pending := VBoxContainer.new()
@@ -194,6 +201,7 @@ func _ready() -> void:
 	client.state_invalidated.connect(_invalidate_religion)
 	client.state_invalidated.connect(_invalidate_great_person)
 	client.state_invalidated.connect(_invalidate_vote)
+	client.state_invalidated.connect(_invalidate_asset)
 	map.tile_selected.connect(_select_tile)
 	map.move_requested.connect(_preview_target)
 	var hello: Dictionary = await execute("hello")
@@ -286,6 +294,17 @@ func _build_ui() -> void:
 	raze_confirmation.dialog_text = "焚城会持续减少人口直至城市消失，确定执行？"
 	raze_confirmation.confirmed.connect(_confirm_raze)
 	raze_confirmation.canceled.connect(func(): raze_revision = -1)
+	add_child(asset_confirmation)
+	asset_confirmation.title = "确认资产处置"
+	asset_confirmation.dialog_autowrap = true
+	asset_confirmation.get_ok_button().text = "确认"
+	asset_confirmation.get_cancel_button().text = "取消"
+	var asset_theme := Theme.new()
+	asset_theme.set_constant("buttons_min_height", "AcceptDialog", 34)
+	asset_confirmation.theme = asset_theme
+	asset_confirmation.confirmed.connect(_confirm_asset)
+	asset_confirmation.canceled.connect(_cancel_asset)
+	asset_confirmation.close_requested.connect(_cancel_asset)
 	resized.connect(_apply_right_width)
 	_apply_right_width()
 	_on_busy(false)
@@ -575,15 +594,33 @@ func _diplomacy_stamp_valid(stamp: Dictionary) -> bool:
 func _refresh_diplomacy() -> void:
 	if client.busy or client.snapshot.is_empty():
 		return
+	var own_lock := not diplomacy_transaction
+	diplomacy_transaction = true
+	_on_busy(true)
+	await _query_diplomacy()
+	if own_lock:
+		diplomacy_transaction = false
+	_on_busy(client.busy)
+
+func _query_diplomacy() -> void:
+	_invalidate_diplomacy()
+	if diplomacy_uncertain:
+		var recovery: Dictionary = await client.command("snapshot")
+		if not recovery.get("ok", false) or not recovery.get("snapshot") is Dictionary:
+			_populate_diplomacy()
+			return
 	var stamp := _diplomacy_state_stamp()
 	var result: Dictionary = await client.command("diplomacyOptions")
-	_apply_diplomacy_response(result, stamp)
+	if not _apply_diplomacy_response(result, stamp):
+		diplomacy_uncertain = true
+		_invalidate_diplomacy()
+		_populate_diplomacy()
 
 # 旧响应注入测试也调用本入口；不将注入声称为网络乱序。
 func _apply_diplomacy_response(result: Dictionary, stamp: Dictionary) -> bool:
 	if not _diplomacy_stamp_valid(stamp):
 		return false
-	if not result.get("ok", false):
+	if not result.get("ok", false) or not result.get("data") is Dictionary:
 		diplomacy_stamp = {}
 		diplomacy_data = {}
 		_populate_diplomacy()
@@ -592,6 +629,7 @@ func _apply_diplomacy_response(result: Dictionary, stamp: Dictionary) -> bool:
 	if str(result.get("session", "")) != str(stamp.session) or int(result.get("revision", -1)) != int(stamp.revision):
 		return false
 	diplomacy_data = result.data
+	diplomacy_uncertain = false
 	var civs: Array = diplomacy_data.get("civilizations", [])
 	if not civs.any(func(civ): return str(civ.civId) == diplomacy_civ_id):
 		diplomacy_civ_id = str(civs[0].civId) if not civs.is_empty() else ""
@@ -630,7 +668,7 @@ func _diplomacy_choice(parent: Node, option: Dictionary, action: String, params:
 		"stamp": _diplomacy_state_stamp(str(params.get("tradeToken", params.get("alertToken", ""))))}
 	var control := button(parent, str(option.label), _open_diplomacy_confirmation.bind(payload))
 	control.name = "Diplomacy_" + str(option.id)
-	control.set_meta("allowed", option.get("enabled", false) and _diplomacy_stamp_valid(diplomacy_stamp))
+	control.set_meta("allowed", not diplomacy_uncertain and option.get("enabled", false) and _diplomacy_stamp_valid(diplomacy_stamp))
 	control.tooltip_text = str(option.get("reason", ""))
 	if not option.get("enabled", false):
 		_diplomacy_text(parent, str(option.get("reason", "")))
@@ -640,6 +678,8 @@ func _populate_diplomacy() -> void:
 	_clear_dynamic(diplomacy_pending)
 	_clear_dynamic(diplomacy_details)
 	diplomacy_picker.clear()
+	if diplomacy_uncertain:
+		_diplomacy_text(diplomacy_pending, "外交状态未确认，旧选择已禁用。恢复连接后请刷新；不会自动重新提交。")
 	for civ in diplomacy_data.get("civilizations", []):
 		diplomacy_picker.add_item(str(civ.name))
 		diplomacy_picker.set_item_metadata(diplomacy_picker.item_count - 1, str(civ.civId))
@@ -651,7 +691,10 @@ func _populate_diplomacy() -> void:
 		_diplomacy_text(diplomacy_pending, "当前事件：" + str(alert.message))
 		for choice in alert.get("choices", []):
 			var warning := "\n" + "\n".join(alert.get("warWarnings", [])) if choice.id in ["declareWar", "refuseAndDeclareWar"] else ""
-			_diplomacy_choice(diplomacy_pending, choice, "diplomacyAlertDecision", {"alertToken": str(alert.alertToken), "choice": str(choice.id)}, str(alert.message) + "\n" + str(choice.label) + warning)
+			var effects := str(choice.get("description", ""))
+			_diplomacy_choice(diplomacy_pending, choice, "diplomacyAlertDecision", {"alertToken": str(alert.alertToken), "choice": str(choice.id)}, str(alert.message) + "\n" + str(choice.label) + "\n" + effects + warning)
+			if not effects.is_empty():
+				_diplomacy_text(diplomacy_pending, effects)
 	if trade is Dictionary:
 		_diplomacy_text(diplomacy_pending, "收到 %s 的提案\n%s" % [trade.name, _trade_terms(trade)])
 		if not trade.get("supported", false):
@@ -674,7 +717,7 @@ func _populate_diplomacy() -> void:
 		for modifier in civ.get("modifiers", []):
 			_diplomacy_text(diplomacy_details, "%s评价 · %s：%s" % ["我方" if modifier.observer == "us" else "对方", modifier.name, _num(modifier.value)])
 		for promise in civ.get("promises", []):
-			_diplomacy_text(diplomacy_details, "%s承诺 %s：%s 回合" % ["我方" if promise.giver == "us" else "对方", promise.type, _num(promise.turns, true)])
+			_diplomacy_text(diplomacy_details, "%s承诺 %s：%s 回合" % ["我方" if promise.giver == "us" else "对方", "停止间谍活动" if promise.type == "DontSpyOnUs" else promise.type, _num(promise.turns, true)])
 		_diplomacy_choice(diplomacy_details, civ.actions.declareWar, "diplomacyDeclareWar", {"civId": str(civ.civId)}, "对 %s 宣战\n%s" % [civ.name, "\n".join(civ.get("warWarnings", []))])
 		diplomacy_our_gold.max_value = int(civ.gold.ourAvailable)
 		diplomacy_their_gold.max_value = int(civ.gold.theirAvailable)
@@ -699,7 +742,7 @@ func _request_peace() -> void:
 func _open_diplomacy_confirmation(payload: Dictionary) -> void:
 	if _input_locked():
 		return
-	if not _diplomacy_stamp_valid(diplomacy_stamp) or not _diplomacy_stamp_valid(payload.get("stamp", {})):
+	if diplomacy_uncertain or not _diplomacy_stamp_valid(diplomacy_stamp) or not _diplomacy_stamp_valid(payload.get("stamp", {})):
 		await _refresh_diplomacy()
 		message.text = "外交详情已过期，请重新确认。"
 		return
@@ -711,9 +754,9 @@ func _open_diplomacy_confirmation(payload: Dictionary) -> void:
 func _confirm_diplomacy() -> void:
 	var payload := diplomacy_payload.duplicate(true)
 	_cancel_diplomacy()
-	if client.busy or economy_transaction or diplomacy_transaction or great_person_transaction or great_person_confirmation.visible or vote_transaction or vote_confirmation.visible or payload.is_empty():
+	if _input_locked() or payload.is_empty():
 		return
-	if not _diplomacy_stamp_valid(payload.get("stamp", {})):
+	if diplomacy_uncertain or not _diplomacy_stamp_valid(payload.get("stamp", {})):
 		await _refresh_diplomacy()
 		message.text = "外交选择已失效，未提交。请重新确认。"
 		return
@@ -1158,35 +1201,26 @@ func _vote_state_stamp(mode := "", choice := "", civ_id := "", ticket := "") -> 
 		"mode": mode, "choice": choice, "civId": civ_id, "ticket": ticket}
 
 func _vote_stamp_valid(stamp: Dictionary) -> bool:
-	if stamp.is_empty():
+	# 与 _great_person_stamp_valid 同模式：用 stamp 自身选择字段重算当前基础状态并整体比较，
+	# 会话／版本／代际等任一变化即失效；裸查询 stamp 不依赖 vote_payload（提交前已被清空）。
+	if stamp.is_empty() or stamp != _vote_state_stamp(str(stamp.get("mode", "")), str(stamp.get("choice", "")),
+			str(stamp.get("civId", "")), str(stamp.get("ticket", ""))):
 		return false
-	# 基础字段必须与当前应用状态一致
-	if str(stamp.get("session", "")) != client.session or str(stamp.get("gameId", "")) != current_game:
-		return false
-	if str(stamp.get("player", "")) != str(client.snapshot.get("player", "")):
-		return false
-	if int(stamp.get("loadEpoch", -1)) != load_epoch:
-		return false
-	if int(stamp.get("selectionGeneration", -1)) != selection_generation:
-		return false
-	if int(stamp.get("voteGeneration", -1)) != vote_generation:
-		return false
-	# revision 必须匹配（未提交时）或小于等于当前（已提交后）
-	var stamp_rev = int(stamp.get("revision", -1))
-	if stamp_rev < 0 or stamp_rev > client.revision:
-		return false
-	# mode/choice/civId/ticket 必须与当前 vote_payload 一致
-	var payload = vote_payload.get("stamp") if vote_payload is Dictionary else {}
-	if payload.is_empty():
-		return false
-	for field in ["mode", "choice", "civId", "ticket"]:
-		if str(stamp.get(field, "")) != str(payload.get(field, "")):
-			return false
-	# 有 ticket 时需额外验证 decision token
+	# 裸查询 stamp（无 ticket）：基础状态一致即有效，面板据此加载并启用弃权。
 	if str(stamp.get("ticket", "")).is_empty():
 		return true
+	# 提交 stamp：ticket 必须匹配当前 decision；再按 mode 把 choice/civId 绑定到权威选择，
+	# 使 mode/choice/civId/ticket 任一被篡改都无法自洽通过（对齐 _great_person_stamp_valid）。
 	var decision = vote_data.get("decision")
-	return decision is Dictionary and decision.get("mode") == stamp.mode and decision.get("token") == stamp.ticket and (stamp.choice != "civilization" or stamp.civId == _vote_target())
+	if not decision is Dictionary or decision.get("token") != stamp.ticket or decision.get("mode") != stamp.mode:
+		return false
+	if stamp.mode == "acknowledge":
+		return str(stamp.choice).is_empty() and str(stamp.civId).is_empty()
+	if stamp.mode == "cast" and stamp.choice == "civilization":
+		return not str(stamp.civId).is_empty() and str(stamp.civId) == _vote_target()
+	if stamp.mode == "cast" and stamp.choice == "abstain":
+		return str(stamp.civId).is_empty()
+	return false
 
 func _cancel_vote() -> void:
 	vote_payload = {}
@@ -1677,7 +1711,7 @@ func label(parent: Node, text: String) -> void:
 	parent.add_child(result)
 
 func _on_busy(is_busy: bool) -> void:
-	is_busy = is_busy or vote_transaction or vote_confirmation.visible or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or diplomacy_confirmation.visible or economy_confirmation.visible or religion_confirmation.visible or great_person_confirmation.visible
+	is_busy = is_busy or asset_transaction or asset_confirmation.visible or vote_transaction or vote_confirmation.visible or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or diplomacy_confirmation.visible or economy_confirmation.visible or religion_confirmation.visible or great_person_confirmation.visible
 	vote_picker.disabled = is_busy or vote_uncertain or vote_picker.item_count == 0 or not _vote_stamp_valid(vote_stamp)
 	great_person_picker.disabled = is_busy or great_person_picker.item_count == 0 or not _great_person_stamp_valid(great_person_stamp)
 	diplomacy_picker.disabled = is_busy or diplomacy_picker.item_count == 0
@@ -1720,8 +1754,12 @@ func _on_busy(is_busy: bool) -> void:
 	else:
 		message.text = "内核处理中……界面仍可拖动和缩放"
 
-func execute(action: String, params: Dictionary = {}, economic_commit := false, diplomatic_commit := false, religious_commit := false, great_person_commit := false, vote_commit := false) -> Dictionary:
-	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "snapshot"]
+func execute(action: String, params: Dictionary = {}, economic_commit := false, diplomatic_commit := false, religious_commit := false, great_person_commit := false, vote_commit := false, asset_commit := false) -> Dictionary:
+	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "assetDecisionOptions", "snapshot"]
+	if asset_transaction and not asset_commit and not query:
+		return {"ok": false, "error": {"code": "BUSY", "message": "资产处置事务尚未完成"}}
+	if asset_confirmation.visible and not query and action not in ["load", "demo"]:
+		return {"ok": false, "error": {"code": "BUSY", "message": "请先确认或取消资产处置"}}
 	if (economy_transaction and not economic_commit or diplomacy_transaction and not diplomatic_commit or religion_transaction and not religious_commit or great_person_transaction and not great_person_commit or vote_transaction and not vote_commit) and not query:
 		return {"ok": false, "error": {"code": "BUSY", "message": "当前事务尚未完成"}}
 	if diplomacy_confirmation.visible and not query and action not in ["load", "demo"]:
@@ -1733,6 +1771,7 @@ func execute(action: String, params: Dictionary = {}, economic_commit := false, 
 	if vote_confirmation.visible and not query and action not in ["load", "demo"]:
 		return {"ok": false, "error": {"code": "BUSY", "message": "请先确认或取消外交投票"}}
 	if action == "snapshot":
+		_invalidate_asset()
 		_invalidate_vote()
 		_invalidate_great_person()
 		_invalidate_diplomacy()
@@ -1750,13 +1789,25 @@ func execute(action: String, params: Dictionary = {}, economic_commit := false, 
 			if confirmation.confirmed.is_connected(_confirm_founding):
 				confirmation.confirmed.disconnect(_confirm_founding)
 			confirmation.confirmed.connect(_confirm_founding, CONNECT_ONE_SHOT)
-		if vote_commit and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
+		if asset_commit and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
+			asset_uncertain = true
+			_invalidate_asset()
+			var recovery: Dictionary = await client.command("snapshot")
+			if recovery.get("ok", false):
+				await _refresh_active_context()
+			else:
+				_rebuild_pending(client.snapshot)
+		elif diplomatic_commit and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
+			diplomacy_uncertain = true
+			await _refresh_diplomacy()
+		elif vote_commit and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
 			vote_uncertain = true
 			await _refresh_vote()
 		elif great_person_commit and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
 			great_person_uncertain = true
 			await _refresh_great_person()
-		elif failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST", "GREAT_PERSON_DECISION", "DIPLOMATIC_VOTE_DECISION", "DIPLOMATIC_VOTE_RESULT"]:
+		elif failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST", "GREAT_PERSON_DECISION", "DIPLOMATIC_VOTE_DECISION", "DIPLOMATIC_VOTE_RESULT", "ASSET_DECISION"]:
+			_invalidate_asset()
 			_invalidate_vote()
 			_invalidate_great_person()
 			_cancel_economy()
@@ -1782,6 +1833,8 @@ func _confirm_founding() -> void:
 	await execute("foundCity", {"unitId": unit_id, "confirmPromise": true})
 
 func _apply_snapshot(data: Dictionary) -> void:
+	asset_uncertain = false
+	_invalidate_asset()
 	_invalidate_vote()
 	# gameId 改变（不同存档）视为重载：自增纪元并清空本地选择与确认状态；
 	# 同一局的写命令快照不清空选择，改由 _refresh_active_context 保留并重解析活动面板。
@@ -1856,6 +1909,18 @@ func _rebuild_pending(data: Dictionary) -> void:
 				var control := button(capture_panel, CAPTURE_NAMES.get(option_id, option_id), _choose_capture.bind(option_id))
 				control.set_meta("allowed", option.enabled)
 				control.tooltip_text = option.reason
+		if choice.kind == "assetDecision" and choice.get("queueHead", false):
+			capture_id = "asset:" + str(choice.get("target", ""))
+			capture_panel.show()
+			_diplomacy_text(capture_panel, str(choice.message))
+			if asset_uncertain:
+				_diplomacy_text(capture_panel, "处置结果尚未确认，请先刷新恢复。")
+			for option in choice.get("choices", []):
+				var control := button(capture_panel, str(option.label), _choose_asset.bind(str(option.id)))
+				control.name = "Asset_" + str(option.id)
+				control.set_meta("allowed", option.enabled and not asset_uncertain)
+				control.tooltip_text = str(option.reason)
+				_diplomacy_text(capture_panel, str(option.description))
 	pending.text = "\n".join(lines) if not lines.is_empty() else "无强制选择；可以结束回合。"
 	bottom_pending.text = ("待办 %d 项（其中 %d 项已接入，详见「事项」页）" % [data.pending.size(), actionable]) if not data.pending.is_empty() else "无强制选择；可以结束回合。"
 	diplomacy_open_button.set_meta("allowed", data.pending.any(func(item): return item.get("diplomacy", false)))
@@ -1868,6 +1933,7 @@ func _rebuild_pending(data: Dictionary) -> void:
 
 # 本地选择状态：用户切换选择或重载时自增代际；异步详情回填前比对，任一不符即丢弃。
 func _reset_selection() -> void:
+	_invalidate_asset()
 	vote_panel.hide()
 	vote_uncertain = false
 	_invalidate_vote()
@@ -1876,6 +1942,7 @@ func _reset_selection() -> void:
 	great_person_unit_id = -1
 	great_person_uncertain = false
 	great_person_locate.hide()
+	diplomacy_uncertain = false
 	_invalidate_diplomacy()
 	_invalidate_religion()
 	diplomacy_civ_id = ""
@@ -2163,7 +2230,7 @@ func _stamp_valid(stamp: Dictionary) -> bool:
 	return not stamp.is_empty() and stamp == _state_stamp() and _own_city_exists(city_id)
 
 func _input_locked() -> bool:
-	return client.busy or vote_transaction or vote_confirmation.visible or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or economy_confirmation.visible or diplomacy_confirmation.visible or religion_confirmation.visible or great_person_confirmation.visible
+	return client.busy or asset_transaction or asset_confirmation.visible or vote_transaction or vote_confirmation.visible or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or economy_confirmation.visible or diplomacy_confirmation.visible or religion_confirmation.visible or great_person_confirmation.visible
 
 func _economy() -> Dictionary:
 	return city_data.get("economy", {})
@@ -2903,6 +2970,68 @@ func _commit_attack() -> void:
 			for previous in before:
 				if not int(previous.id) in after_ids:
 					message.text += " %s 离场（阵亡或离开视野）。" % previous.name
+
+func _asset_pending() -> Dictionary:
+	for item in client.snapshot.get("pending", []):
+		if item.get("kind", "") == "assetDecision" and item.get("queueHead", false):
+			return item
+	return {}
+
+func _asset_state_stamp(ticket := "") -> Dictionary:
+	var decision := _asset_pending()
+	return {"session": client.session, "revision": client.revision, "gameId": current_game,
+		"loadEpoch": load_epoch, "selectionGeneration": selection_generation, "generation": asset_generation,
+		"type": str(decision.get("type", "")), "target": str(decision.get("target", "")), "ticket": ticket}
+
+func _asset_stamp_valid(stamp: Dictionary) -> bool:
+	return not stamp.is_empty() and not _asset_pending().is_empty() and stamp == _asset_state_stamp(str(stamp.get("ticket", "")))
+
+func _cancel_asset() -> void:
+	asset_payload = {}
+	asset_confirmation.hide()
+	_on_busy(client.busy)
+
+func _invalidate_asset() -> void:
+	asset_generation += 1
+	_cancel_asset()
+
+func _choose_asset(choice: String) -> void:
+	if _input_locked() or asset_uncertain or _asset_pending().is_empty():
+		return
+	var stamp := _asset_state_stamp()
+	asset_transaction = true
+	_on_busy(true)
+	var result := await execute("assetDecisionOptions")
+	asset_transaction = false
+	if not result.get("ok", false) or not _asset_stamp_valid(stamp):
+		_on_busy(client.busy)
+		return
+	var decision: Dictionary = result.get("data", {}).get("decision", {}) if result.get("data", {}).get("decision") != null else {}
+	var choices: Array = decision.get("choices", []).filter(func(item): return item.id == choice and item.enabled)
+	if choices.is_empty() or str(decision.get("type", "")) != stamp.type or str(decision.get("target", "")) != stamp.target:
+		_on_busy(client.busy)
+		return
+	asset_payload = {"params": {"decisionToken": str(decision.token), "choice": choice}, "stamp": _asset_state_stamp(str(decision.token))}
+	asset_confirmation.dialog_text = str(decision.message) + "\n" + str(choices[0].label) + "\n" + str(choices[0].description)
+	asset_confirmation.popup_centered(Vector2i(mini(500, int(size.x) - 48), mini(400, int(size.y) - 80)))
+	_on_busy(false)
+
+func _confirm_asset() -> void:
+	var payload := asset_payload.duplicate(true)
+	asset_payload = {}
+	asset_confirmation.hide()
+	if _input_locked() or asset_uncertain or payload.is_empty():
+		_on_busy(client.busy)
+		return
+	if not _asset_stamp_valid(payload.get("stamp", {})) or str(payload.params.decisionToken) != str(payload.stamp.ticket):
+		_on_busy(client.busy)
+		message.text = "资产处置确认已失效，未提交；请重新选择。"
+		return
+	asset_transaction = true
+	_on_busy(true)
+	await execute("assetDecision", payload.params, false, false, false, false, false, true)
+	asset_transaction = false
+	_on_busy(client.busy)
 
 func _choose_capture(choice: String) -> void:
 	if _input_locked() or capture_id.is_empty():

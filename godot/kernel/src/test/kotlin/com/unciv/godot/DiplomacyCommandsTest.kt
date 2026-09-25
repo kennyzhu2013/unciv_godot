@@ -11,6 +11,9 @@ import com.unciv.logic.civilization.AlertType
 import com.unciv.logic.civilization.PopupAlert
 import com.unciv.logic.trade.Trade
 import com.unciv.logic.trade.TradeRequest
+import com.unciv.logic.civilization.diplomacy.Demand
+import com.unciv.logic.civilization.diplomacy.DiplomaticModifiers
+import com.unciv.logic.civilization.diplomacy.DiplomaticStatus
 import com.unciv.logic.civilization.diplomacy.DiplomacyFlags
 import com.unciv.logic.files.UncivFiles
 import com.unciv.logic.trade.TradeOffer
@@ -20,6 +23,7 @@ import com.unciv.view.TradeView
 import kotlinx.serialization.json.*
 import org.junit.Assert.*
 import org.junit.Test
+import kotlin.math.roundToInt
 
 class DiplomacyCommandsTest {
     private fun scenario(name: String, war: Boolean = false, configure: (GameInfo) -> Unit = {}): Pair<GameSession, GameInfo> {
@@ -125,19 +129,320 @@ class DiplomacyCommandsTest {
         }
     }
 
-    @Test fun allFourAlertsUseNativeChoices() {
-        val choices = listOf(
-            AlertType.DeclarationOfFriendship to listOf("accept", "decline"),
-            AlertType.DemandToStopSettlingCitiesNear to listOf("agree", "refuse"),
-            AlertType.DemandToNotAttackUs to listOf("agree", "refuseAndDeclareWar"),
-            AlertType.Denounced to listOf("dismiss", "declareWar"))
-        for ((type, options) in choices) for (choice in options) {
+    @Test fun allTenAlertsUseNativeChoices() {
+        assertEquals(DiplomacyCommands.alertTypes, DiplomacyFixtures.alertChoices.map { it.first }.toSet())
+        for ((type, options) in DiplomacyFixtures.alertChoices) for (choice in options) {
             val (session, expected) = scenario("$type-$choice") { DiplomacyFixtures.alert(it, type) }
             apply(session, expected, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to choice) {
                 DiplomacyFixtures.alertDecision(expected, choice)
             }
             assertTrue(session.game!!.currentPlayerCiv.popupAlerts.isEmpty())
+            val saved = run(session, "save", "name" to "dip-choice-$type-$choice")
+            run(session, "load", "path" to saved.text("savedPath"))
+            assertGameplayEquals("处置后独立重载 $type/$choice",
+                UncivFiles.gameInfoFromString(UncivFiles.gameInfoToString(expected, true)), session.game!!)
         }
+    }
+
+    @Test fun spyChoicesKeepNativeEffectsSpeedAndExistingAssignments() {
+        for (type in DiplomacyFixtures.spyAlerts) for (choice in listOf("agree", "refuse"))
+            for (speed in listOf("Standard", "Quick", "Epic")) {
+                val (session, expected) = scenario("spy-$type-$choice-$speed") {
+                    it.gameParameters.speed = speed
+                    DiplomacyFixtures.alert(it, type)
+                    val player = it.currentPlayerCiv
+                    val ours = player.getDiplomacyManager(DiplomacyFixtures.enemy(it))!!
+                    val theirs = ours.otherCivDiplomacy()
+                    ours.setModifier(DiplomaticModifiers.UnacceptableDemands, -3f)
+                    theirs.setModifier(DiplomaticModifiers.RefusedToNotSendingSpiesToUs, -4f)
+                    // 对方收件箱已存在同类型回应，原生只按类型和来源去重弹窗。
+                    DiplomacyFixtures.enemy(it).popupAlerts.add(PopupAlert(
+                        if (choice == "agree") AlertType.AcceptingDemand else AlertType.RejectingDemand, player.civID))
+                }
+                val game = session.game!!
+                val player = game.currentPlayerCiv
+                val ours = player.getDiplomacyManager(other(session))!!
+                val theirs = ours.otherCivDiplomacy()
+                val spy = player.espionageManager.spyList.single()
+                val city = spy.getCity().id
+                val action = spy.action
+                val turns = spy.turnsRemainingForAction
+                val betrayal = theirs.diplomaticModifiers[DiplomaticModifiers.BetrayedPromiseToNotSendingSpiesToUs.name]
+                val notifications = other(session).notifications.size
+                apply(session, expected, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to choice) {
+                    DiplomacyFixtures.alertDecision(expected, choice)
+                }
+                assertSame(spy, player.espionageManager.spyList.single())
+                assertEquals(city, spy.getCity().id)
+                assertEquals(action, spy.action)
+                assertEquals(turns, spy.turnsRemainingForAction)
+                assertFalse(player.isAtWarWith(other(session)))
+                assertFalse(ours.hasFlag(Demand.DontSpyOnUs.agreedToDemand))
+                assertEquals(betrayal, theirs.diplomaticModifiers[DiplomaticModifiers.BetrayedPromiseToNotSendingSpiesToUs.name])
+                assertEquals(if (choice == "agree") -13f else -23f, ours.diplomaticModifiers[DiplomaticModifiers.UnacceptableDemands.name]!!, 0f)
+                assertEquals(if (choice == "agree") -4f else -19f, theirs.diplomaticModifiers[DiplomaticModifiers.RefusedToNotSendingSpiesToUs.name]!!, 0f)
+                val duration = (100 * game.speed.modifier).roundToInt()
+                if (choice == "agree") {
+                    assertEquals(duration, theirs.getFlag(Demand.DontSpyOnUs.agreedToDemand))
+                    assertEquals(dto("type" to "DontSpyOnUs", "giver" to "us", "turns" to duration), row(session)["promises"]!!.jsonArray.single())
+                } else assertEquals(duration, theirs.getFlag(Demand.DontSpyOnUs.willIgnoreViolation))
+                if (type == AlertType.SpyingOnUsDespiteOurPromise) assertTrue(theirs.hasFlag(Demand.DontSpyOnUs.willIgnoreViolation))
+                assertEquals(1, other(session).popupAlerts.size)
+                // 原生 addNotification 对 AI 不保存通知，但外交回应弹窗仍保留。
+                assertEquals(notifications, other(session).notifications.size)
+            }
+    }
+
+    @Test fun discoveredSpyFlagsGenerateBothAlertsThroughNativeAiTurns() {
+        for (broken in listOf(false, true)) for (choice in listOf("agree", "refuse")) {
+            val (session, initial) = scenario("spy-ai-$broken-$choice") { game ->
+                val player = game.currentPlayerCiv
+                val other = DiplomacyFixtures.enemy(game)
+                // 仅注入发现标志和先前承诺；事件与违约惩罚由完整原生回合产生，不模拟偷科技。
+                other.getDiplomacyManager(player)!!.setFlag(DiplomacyFlags.DiscoveredSpiesInOurCities, 30)
+                if (broken) other.getDiplomacyManager(player)!!.setFlag(DiplomacyFlags.AgreedToNotSendSpies, 50)
+                player.units.getCivUnits().filter { it.name == "Archer" }.toList().forEach { it.destroy() }
+                com.unciv.logic.trade.TradeLogic(player, other).apply { currentTrade.set(DiplomacyFixtures.peace(game)) }.acceptTrade()
+            }
+            val expected = DiplomacyFixtures.nextTurn(initial)
+            run(session, "nextTurn")
+            assertGameplayEquals("原生发现标志触发 AI 间谍要求", expected, session.game!!)
+            val type = if (broken) AlertType.SpyingOnUsDespiteOurPromise else AlertType.DemandToStopSpyingOnUs
+            assertEquals(type, session.game!!.currentPlayerCiv.popupAlerts.first().type)
+            val manager = other(session).getDiplomacyManager(session.game!!.currentPlayerCiv)!!
+            assertFalse(manager.hasFlag(DiplomacyFlags.DiscoveredSpiesInOurCities))
+            if (broken) {
+                assertFalse(manager.hasFlag(DiplomacyFlags.AgreedToNotSendSpies))
+                assertTrue(manager.hasFlag(DiplomacyFlags.IgnoreThemSendingSpies))
+                // 完整 AI 回合在生成 -20 后按原生规则衰减 1/8。
+                assertEquals(-20f + 1 / 8f, manager.diplomaticModifiers[DiplomaticModifiers.BetrayedPromiseToNotSendingSpiesToUs.name]!!, 0f)
+            }
+            apply(session, expected, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to choice) {
+                DiplomacyFixtures.alertDecision(expected, choice)
+            }
+        }
+    }
+
+    @Test fun spyTokensBindTypeSourceQueueSessionAndRevision() {
+        val file = DiplomacyFixtures.file("spy-token") {
+            DiplomacyFixtures.alert(it, AlertType.DemandToStopSpyingOnUs)
+            DiplomacyFixtures.alert(it, AlertType.SpyingOnUsDespiteOurPromise)
+        }
+        val a = load(file)
+        val b = load(file)
+        val old = token(a, true)
+        reject(b, "DIPLOMACY_REQUEST", request(b, "diplomacyAlertDecision", "alertToken" to old, "choice" to "agree"))
+        val queue = a.game!!.currentPlayerCiv.popupAlerts
+        queue.reverse()
+        reject(a, "DIPLOMACY_REQUEST", request(a, "diplomacyAlertDecision", "alertToken" to old, "choice" to "agree"))
+        queue.reverse()
+        queue[0] = PopupAlert(AlertType.DemandToStopSpyingOnUs, "unknown-source")
+        reject(a, "DIPLOMACY_REQUEST", request(a, "diplomacyAlertDecision", "alertToken" to old, "choice" to "agree"))
+        queue[0] = PopupAlert(AlertType.DemandToStopSpyingOnUs, other(a).civID)
+        run(a, "save", "name" to "spy-old-revision")
+        reject(a, "DIPLOMACY_REQUEST", request(a, "diplomacyAlertDecision", "alertToken" to old, "choice" to "agree"))
+    }
+
+    @Test fun invalidSpySourcesAndStrictArgumentsNeverWriteOrLeak() {
+        val (session, _) = scenario("spy-invalid") {
+            DiplomacyFixtures.addCiv(it, "China", 6, 6, false)
+            DiplomacyFixtures.addCiv(it, "Geneva", -2, 5)
+            it.currentPlayerCiv.popupAlerts.clear()
+        }
+        val player = session.game!!.currentPlayerCiv
+        for (type in DiplomacyFixtures.spyAlerts) {
+            for (source in listOf("China", "missing-secret", player.civID, "Geneva", "Greece@secret", "")) {
+                player.popupAlerts.add(PopupAlert(type, source))
+                val data = options(session)
+                for (hidden in listOf("China", "missing-secret", "@secret")) assertFalse(data.toString().contains(hidden))
+                assertTrue(data["pendingAlert"]!!.jsonObject["choices"]!!.jsonArray.none { it.jsonObject.boolean("enabled") })
+                for (choice in listOf("agree", "refuse")) reject(session, if (source == "Geneva") "UNSUPPORTED" else "DIPLOMACY_TARGET",
+                    request(session, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to choice))
+                player.popupAlerts.removeAt(0)
+            }
+            player.popupAlerts.add(PopupAlert(type, other(session).civID))
+            val valid = request(session, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to "agree")
+            for (key in listOf("alertToken", "choice")) {
+                reject(session, "INVALID_ARGUMENT", JsonObject(valid - key))
+                for (value in listOf(JsonNull, JsonPrimitive(""), JsonPrimitive(" \t"), JsonPrimitive(1), JsonPrimitive(false), dto(), JsonArray(emptyList())))
+                    reject(session, "INVALID_ARGUMENT", JsonObject(valid + (key to value)))
+            }
+            for (choice in listOf("dismiss", "declareWar", "acknowledge"))
+                reject(session, "INVALID_ARGUMENT", JsonObject(valid + ("choice" to JsonPrimitive(choice))))
+            reject(session, "INVALID_ARGUMENT", JsonObject(valid + ("civId" to JsonPrimitive("Greece"))))
+            reject(session, "INVALID_ARGUMENT", request(session, "diplomacyOptions", "alertToken" to "forged"))
+            reject(session, "PENDING_DECISION", request(session, "nextTurn"))
+            reject(session, "UNSUPPORTED", request(session, "acknowledge"))
+            player.popupAlerts.removeAt(0)
+        }
+    }
+
+    @Test fun religionPromiseAndRefusalKeepNativeDirection() {
+        for (choice in listOf("agree", "refuse")) {
+            val (session, expected) = scenario("religion-$choice") { DiplomacyFixtures.alert(it, AlertType.DemandToStopSpreadingReligion) }
+            apply(session, expected, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to choice) {
+                DiplomacyFixtures.alertDecision(expected, choice)
+            }
+            val player = session.game!!.currentPlayerCiv
+            val ours = player.getDiplomacyManager(other(session))!!
+            val theirs = other(session).getDiplomacyManager(player)!!
+            assertFalse(player.isAtWarWith(other(session)))
+            assertFalse(ours.hasFlag(Demand.DoNotSpreadReligion.agreedToDemand))
+            val duration = (100 * session.game!!.speed.modifier).roundToInt()
+            if (choice == "agree") {
+                assertEquals(duration, theirs.getFlag(Demand.DoNotSpreadReligion.agreedToDemand))
+                assertEquals(dto("type" to "DoNotSpreadReligion", "giver" to "us", "turns" to duration),
+                    row(session)["promises"]!!.jsonArray.single())
+            } else {
+                assertEquals(duration, theirs.getFlag(Demand.DoNotSpreadReligion.willIgnoreViolation))
+                assertEquals(-15f, theirs.diplomaticModifiers[DiplomaticModifiers.RefusedToNotSpreadReligionToUs.name]!!, 0f)
+            }
+        }
+    }
+
+    @Test fun cityStateChoicesPreserveInfluenceProtectionAndWarReason() {
+        for (type in DiplomacyFixtures.cityStateAlerts) for (choice in listOf("declareWar", "support", "withdrawProtection")) {
+            val (session, expected) = scenario("minor-$type-$choice") { DiplomacyFixtures.alert(it, type) }
+            val player = session.game!!.currentPlayerCiv
+            val cs = session.game!!.getCivilization("Geneva")
+            val diplo = cs.getDiplomacyManager(player)!!
+            val influence = NativeDiplomacyBridge.rawInfluence(diplo)
+            val status = diplo.diplomaticStatus
+            val event = options(session)["pendingAlert"]!!.jsonObject
+            assertEquals("Greece", event.text("civId"))
+            assertEquals("Geneva", event["cityState"]!!.jsonObject.text("civId"))
+            assertTrue(event.text("message").contains("Geneva"))
+            val pending = run(session, "snapshot")["snapshot"]!!.jsonObject["pending"]!!.jsonArray
+                .single { it.jsonObject.text("kind") == "diplomacyAlert" }.jsonObject
+            assertTrue(pending.boolean("supported"))
+            assertEquals("Greece", pending.text("target"))
+            apply(session, expected, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to choice) {
+                DiplomacyFixtures.alertDecision(expected, choice)
+            }
+            // 原生宣战的共同敌人奖励 +10，再叠加 AlertPopup 的 +20。
+            assertEquals(influence + when (choice) { "declareWar" -> 30f; "withdrawProtection" -> -20f; else -> 0f }, NativeDiplomacyBridge.rawInfluence(diplo), 0f)
+            assertEquals(choice == "declareWar", player.isAtWarWith(other(session)))
+            if (choice == "withdrawProtection") {
+                assertEquals(DiplomaticStatus.Peace, diplo.diplomaticStatus)
+                assertEquals(20, diplo.getFlag(DiplomacyFlags.RecentlyWithdrewProtection))
+                assertTrue(player.notifications.any { it.text == "You have broken your Pledge to Protect [Geneva]!" })
+            } else {
+                assertEquals(status, diplo.diplomaticStatus)
+                val theirs = other(session).getDiplomacyManager(player)!!
+                assertEquals(25, theirs.getFlag(DiplomacyFlags.RememberSidedWithProtectedMinor))
+                assertEquals(-5f, theirs.diplomaticModifiers[DiplomaticModifiers.SidedWithProtectedMinor.name]!!, 0f)
+                if (choice == "declareWar") assertTrue(player.notifications.any { it.text == "We have joined [Geneva] in the war against [Greece]!" })
+            }
+        }
+    }
+
+    @Test fun cityStateWarChoicesRespectWarTreatiesAndFixedRules() {
+        for (type in DiplomacyFixtures.cityStateAlerts) for (mode in listOf("war", "treaty", "fixed")) {
+            val (session, expected) = scenario("minor-$mode-$type", mode == "war") { DiplomacyFixtures.alert(it, type) }
+            for (g in listOf(session.game!!, expected)) {
+                if (mode == "treaty") {
+                    val p = g.currentPlayerCiv
+                    val o = DiplomacyFixtures.enemy(g)
+                    p.getDiplomacyManager(o)!!.trades.add(DiplomacyFixtures.peace(g))
+                    o.getDiplomacyManager(p)!!.trades.add(DiplomacyFixtures.peace(g))
+                } else if (mode == "fixed") {
+                    g.ruleset = g.ruleset.clone()
+                    g.ruleset.modOptions = com.unciv.models.ruleset.ModOptions().apply { uniques.add("Diplomatic relationships cannot change") }
+                }
+            }
+            val choices = options(session)["pendingAlert"]!!.jsonObject["choices"]!!.jsonArray.map { it.jsonObject }
+            if (mode == "war") assertFalse(choices.any { it.text("id") == "declareWar" })
+            else assertFalse(choices.single { it.text("id") == "declareWar" }.boolean("enabled"))
+            reject(session, if (mode == "war") "INVALID_ARGUMENT" else "CANNOT_DECLARE_WAR",
+                request(session, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to "declareWar"))
+            assertTrue(choices.filter { it.text("id") != "declareWar" }.all { it.boolean("enabled") })
+            apply(session, expected, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to "support") {
+                DiplomacyFixtures.alertDecision(expected, "support")
+            }
+        }
+    }
+
+    @Test fun malformedOrHiddenCompositeReferencesAreReadOnlyAndNeverLeak() {
+        val (session, _) = scenario("minor-hidden") {
+            DiplomacyFixtures.protectedCityState(it)
+            DiplomacyFixtures.addCiv(it, "China", 6, 6, false)
+            DiplomacyFixtures.addCiv(it, "Sidon", 2, -5, false)
+        }
+        for (value in listOf("Greece", "@Geneva", "Greece@", "Greece@Geneva@secret", "China@Geneva", "Greece@Sidon", "Greece@China", "Greece@Greece", "no-source@Geneva")) {
+            session.game!!.currentPlayerCiv.popupAlerts.add(PopupAlert(AlertType.AttackedProtectedMinor, value))
+            val data = options(session)
+            for (secret in listOf("China", "Sidon", "secret", "no-source")) assertFalse(data.toString(), data.toString().contains(secret))
+            val event = data["pendingAlert"]!!.jsonObject
+            assertTrue(event["choices"]!!.jsonArray.none { it.jsonObject.boolean("enabled") })
+            for (choice in listOf("declareWar", "support", "withdrawProtection")) reject(session, "DIPLOMACY_TARGET",
+                request(session, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to choice))
+            val pending = run(session, "snapshot")["snapshot"]!!.jsonObject["pending"]!!.jsonArray
+                .single { it.jsonObject.text("kind") == "diplomacyAlert" }.jsonObject
+            assertFalse(pending.boolean("supported"))
+            for (secret in listOf("China", "Sidon", "secret", "no-source")) assertFalse(pending.toString().contains(secret))
+            session.game!!.currentPlayerCiv.popupAlerts.removeAt(0)
+        }
+    }
+
+    @Test fun newPendingEventsSurviveReloadAndOnlyConsumeQueueHead() {
+        for (type in listOf(AlertType.DemandToStopSpreadingReligion) + DiplomacyFixtures.cityStateAlerts + DiplomacyFixtures.spyAlerts) {
+            val (session, initial) = scenario("pending-reload-$type") {
+                DiplomacyFixtures.alert(it, type)
+                DiplomacyFixtures.alert(it, AlertType.Denounced)
+            }
+            val old = token(session, true)
+            reject(session, "PENDING_DECISION", request(session, "nextTurn"))
+            reject(session, "UNSUPPORTED", request(session, "acknowledge"))
+            val saved = run(session, "save", "name" to "dip-pending-$type")
+            run(session, "load", "path" to saved.text("savedPath"))
+            val expected = UncivFiles.gameInfoFromString(UncivFiles.gameInfoToString(initial, true))
+            assertGameplayEquals("未处理事件独立重载 $type", expected, session.game!!)
+            val choice = if (type in DiplomacyFixtures.cityStateAlerts) "support" else "agree"
+            assertNotEquals(old, token(session, true))
+            reject(session, "DIPLOMACY_REQUEST", request(session, "diplomacyAlertDecision", "alertToken" to old, "choice" to choice))
+            val fresh = token(session, true)
+            apply(session, expected, "diplomacyAlertDecision", "alertToken" to fresh, "choice" to choice) {
+                DiplomacyFixtures.alertDecision(expected, choice)
+            }
+            assertEquals(AlertType.Denounced, session.game!!.currentPlayerCiv.popupAlerts.single().type)
+            reject(session, "DIPLOMACY_REQUEST", request(session, "diplomacyAlertDecision", "alertToken" to fresh, "choice" to choice))
+        }
+    }
+
+    @Test fun naturallyGeneratedCityStateAlertsUseTheSameChoices() {
+        for (type in DiplomacyFixtures.cityStateAlerts) {
+            val (session, expected) = scenario("native-event-$type") { g ->
+                val cs = DiplomacyFixtures.protectedCityState(g, type == AlertType.AttackedAllyMinor)
+                val aggressor = DiplomacyFixtures.enemy(g)
+                if (type == AlertType.BulliedProtectedMinor) cs.cityStateFunctions.tributeGold(aggressor)
+                else aggressor.getDiplomacyManager(cs)!!.declareWar()
+                assertEquals(type, g.currentPlayerCiv.popupAlerts.first().type)
+            }
+            apply(session, expected, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to "support") {
+                DiplomacyFixtures.alertDecision(expected, "support")
+            }
+        }
+    }
+
+    @Test fun rawWarRewardDoesNotPrematurelyRecalculateAlliance() {
+        val (session, expected) = scenario("raw-reward") {
+            DiplomacyFixtures.alert(it, AlertType.AttackedProtectedMinor)
+            it.getCivilization("Geneva").getDiplomacyManager(it.currentPlayerCiv)!!.setInfluence(35f)
+        }
+        apply(session, expected, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to "declareWar") {
+            DiplomacyFixtures.alertDecision(expected, "declareWar")
+        }
+        val cs = session.game!!.getCivilization("Geneva")
+        assertEquals(65f, NativeDiplomacyBridge.rawInfluence(cs.getDiplomacyManager(session.game!!.currentPlayerCiv)!!), 0f)
+        assertNull("原 UI 直接写字段，额外奖励跨过 60 也不立即重算盟友", cs.allyCiv)
+    }
+
+    @Test fun compositeTokenBindsBothParties() {
+        val (session, _) = scenario("composite-token") { DiplomacyFixtures.alert(it, AlertType.AttackedProtectedMinor) }
+        val old = token(session, true)
+        session.game!!.currentPlayerCiv.popupAlerts[0] = PopupAlert(AlertType.AttackedProtectedMinor, "Greece@unavailable-city-state")
+        assertNotEquals(old, token(session, true))
+        reject(session, "DIPLOMACY_REQUEST", request(session, "diplomacyAlertDecision", "alertToken" to old, "choice" to "support"))
     }
 
     @Test fun malformedAmountsAndTargetsAreRejectedBeforeBackup() {
@@ -438,12 +743,9 @@ class DiplomacyCommandsTest {
     }
 
     @Test fun defeatedSourcesOnlyAllowExplicitCleanup() {
-        for (type in listOf(AlertType.DeclarationOfFriendship, AlertType.DemandToStopSettlingCitiesNear, AlertType.DemandToNotAttackUs, AlertType.Denounced)) {
-            val (session, expected) = scenario("defeated-$type")
-            for (g in listOf(session.game!!, expected)) {
-                DiplomacyFixtures.enemy(g).cities = emptyList()
-                DiplomacyFixtures.alert(g, type)
-            }
+        for (type in DiplomacyFixtures.alertChoices.map { it.first }) {
+            val (session, expected) = scenario("defeated-$type") { DiplomacyFixtures.alert(it, type) }
+            for (g in listOf(session.game!!, expected)) DiplomacyFixtures.enemy(g).cities = emptyList()
             assertTrue(other(session).isDefeated())
             assertTrue(options(session)["civilizations"]!!.jsonArray.none { it.jsonObject.text("civId") == other(session).civID })
             apply(session, expected, "diplomacyAlertDecision", "alertToken" to token(session, true), "choice" to "dismiss") { DiplomacyFixtures.alertDecision(expected, "dismiss") }

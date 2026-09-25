@@ -44,7 +44,8 @@ internal class GameSession(private val root: File) {
                 return response
             }
             ensure(request.integer("revision") == revision, "STALE_STATE", "状态已变化，请刷新后重试")
-            if (action == "diplomacyOptions") return reply("data" to DiplomacyCommands(requireGame(), sessionId, revision).options())
+            if (action == "assetDecisionOptions") return reply("data" to AssetDecisionCommands(requireGame(), sessionId, revision).options(request))
+            if (action == "diplomacyOptions") return reply("data" to DiplomacyCommands(requireGame(), sessionId, revision).options(request))
             if (action == "religionOptions") return reply("data" to ReligionCommands(requireGame(), sessionId, revision).options())
             if (action == "greatPersonOptions") return reply("data" to GreatPersonCommands(requireGame(), sessionId, revision).options(request))
             if (action == "diplomaticVoteOptions") return reply("data" to DiplomaticVoteCommands(requireGame(), sessionId, revision).options(request))
@@ -75,6 +76,7 @@ internal class GameSession(private val root: File) {
             val preparedGreatPerson = if (action == "greatPersonChoose")
                 GreatPersonCommands(requireGame(), sessionId, revision).prepare(request) else null
             val preparedAction: (() -> Unit)? = when (action) {
+                "assetDecision" -> AssetDecisionCommands(requireGame(), sessionId, revision).prepare(request)
                 "diplomaticVoteCast", "diplomaticVoteAcknowledge" -> DiplomaticVoteCommands(requireGame(), sessionId, revision).prepare(request)
                 "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision" ->
                     DiplomacyCommands(requireGame(), sessionId, revision).prepare(request)
@@ -133,7 +135,7 @@ internal class GameSession(private val root: File) {
                     "load", "demo" -> Unit
                     "attack" -> battleResult = preparedAttack!!.execute()
                     "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision",
-                    "unitAction", "cityDecision", "workerOrder",
+                    "unitAction", "cityDecision", "assetDecision", "workerOrder",
                     "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding",
                     "religionUseProphet", "religionChooseBeliefs", "religionFound",
                     "diplomaticVoteCast", "diplomaticVoteAcknowledge" -> preparedAction!!.invoke()
@@ -295,7 +297,7 @@ internal class GameSession(private val root: File) {
         /** 原客户端直接作用于当前局、会修改状态的玩家命令；save 只读不改，nextTurn 在副本上执行。 */
         val inPlaceCommands = setOf("move", "foundCity", "production", "research", "policy", "deferPolicy", "acknowledge", "declineTrade",
                     "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision",
-                    "attack", "unitAction", "cityDecision", "workerOrder",
+                    "attack", "unitAction", "cityDecision", "assetDecision", "workerOrder",
                     "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding",
                     "religionUseProphet", "religionChooseBeliefs", "religionFound", "greatPersonChoose",
                     "diplomaticVoteCast", "diplomaticVoteAcknowledge")
