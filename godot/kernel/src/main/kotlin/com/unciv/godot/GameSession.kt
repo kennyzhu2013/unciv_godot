@@ -80,6 +80,9 @@ internal class GameSession(private val root: File) {
                 "diplomaticVoteCast", "diplomaticVoteAcknowledge" -> DiplomaticVoteCommands(requireGame(), sessionId, revision).prepare(request)
                 "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision" ->
                     DiplomacyCommands(requireGame(), sessionId, revision).prepare(request)
+                "cityStateGiftGold", "cityStatePledgeProtection", "cityStateRevokeProtection", "cityStateDemandTribute",
+                "cityStateDeclareWar", "cityStateNegotiatePeace", "cityStateMarriage" ->
+                    CityStateCommands(requireGame(), sessionId, revision).prepare(request)
                 "cityBuyTile" -> CityEconomyCommands(requireGame()).prepareBuyTile(request)
                 "cityPurchase" -> CityEconomyCommands(requireGame()).preparePurchase(request)
                 "citySellBuilding" -> CityEconomyCommands(requireGame()).prepareSellBuilding(request)
@@ -135,6 +138,8 @@ internal class GameSession(private val root: File) {
                     "load", "demo" -> Unit
                     "attack" -> battleResult = preparedAttack!!.execute()
                     "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision",
+                    "cityStateGiftGold", "cityStatePledgeProtection", "cityStateRevokeProtection", "cityStateDemandTribute",
+                    "cityStateDeclareWar", "cityStateNegotiatePeace", "cityStateMarriage",
                     "unitAction", "cityDecision", "assetDecision", "workerOrder",
                     "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding",
                     "religionUseProphet", "religionChooseBeliefs", "religionFound",
@@ -297,6 +302,8 @@ internal class GameSession(private val root: File) {
         /** 原客户端直接作用于当前局、会修改状态的玩家命令；save 只读不改，nextTurn 在副本上执行。 */
         val inPlaceCommands = setOf("move", "foundCity", "production", "research", "policy", "deferPolicy", "acknowledge", "declineTrade",
                     "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision",
+                    "cityStateGiftGold", "cityStatePledgeProtection", "cityStateRevokeProtection", "cityStateDemandTribute",
+                    "cityStateDeclareWar", "cityStateNegotiatePeace", "cityStateMarriage",
                     "attack", "unitAction", "cityDecision", "assetDecision", "workerOrder",
                     "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding",
                     "religionUseProphet", "religionChooseBeliefs", "religionFound", "greatPersonChoose",

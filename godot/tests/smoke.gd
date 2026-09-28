@@ -44,6 +44,8 @@ var asset_steps := 0
 var asset_expected: Dictionary = {}
 var asset_lock_valid := true
 var asset_lock_handoffs := 0
+var citystate_steps := 0
+var citystate_expected: Dictionary = {}
 
 # 客户端边界故障注入：请求仍走真实 HTTP，不作为真实网络故障证据。
 class DiplomacyFaultClient extends "res://scripts/kernel_client.gd":
@@ -228,6 +230,8 @@ func run(frontend) -> void:
 		return
 	if not await verify_asset_flow():
 		return
+	if not await verify_city_state_flow():
+		return
 	await get_tree().process_frame
 	await get_tree().process_frame
 	var directory := ProjectSettings.globalize_path("res://.local")
@@ -238,7 +242,7 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "asset-decisions"],
+		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "asset-decisions", "city-state"],
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -249,6 +253,7 @@ func run(frontend) -> void:
 		"diplomaticVoteSteps": vote_steps, "diplomaticVoteEvidence": vote_evidence,
 		"spyDecisionSteps": spy_steps, "spyEvidence": spy_evidence,
 		"assetDecisionSteps": asset_steps, "assetLockHandoffs": asset_lock_handoffs,
+		"cityStateSteps": citystate_steps,
 		"renderBackend": DisplayServer.get_name()}, "\t"))
 	report.close()
 	archive_smoke_result()
@@ -454,6 +459,116 @@ func verify_asset_flow() -> bool:
 	if not check(asset_lock_valid and asset_lock_handoffs > 0, "资产查询、写入、刷新全过程保持事务锁"):
 		return false
 	steps.append("三类资产处置：12条原生结果、混合队首、取消／双击／旧确认、未决及结果重载、丢响应恢复及完整存档差分")
+	return true
+
+func normalize_city_state(value, key := ""):
+	if value is Dictionary:
+		var result := {}
+		for field in value:
+			result[field] = normalize_city_state(value[field], str(field))
+			if key in citystate_expected.mapOfSetFields and result[field] is Array:
+				result[field].sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	if value is Array:
+		var result: Array = value.map(func(item): return normalize_city_state(item))
+		if key in citystate_expected.setFields:
+			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	return value
+
+func citystate_matches(step: String) -> bool:
+	if not check(not app.diplomacy_transaction and not app.client.busy, "城邦事务完整解锁：" + step):
+		return false
+	if not await perform("save", {"name": run_id + "-citystate-" + step}):
+		return false
+	var zipped := Marshalls.base64_to_raw(FileAccess.get_file_as_string(app.last_saved_path).strip_edges())
+	var state: Dictionary = JSON.parse_string(zipped.decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_GZIP).get_string_from_utf8())
+	state.erase("currentTurnStartTime")
+	state.erase("checksum")
+	for civ in state.civilizations:
+		civ.erase("totalTurnTimeSeconds")
+	var actual = normalize_city_state(state)
+	var expected = normalize_city_state(citystate_expected.states[step])
+	for side in [["actual", actual], ["expected", expected]]:
+		var evidence := FileAccess.open("res://.local/" + run_id + "-citystate-" + step + "-" + side[0] + ".json", FileAccess.WRITE)
+		evidence.store_string(JSON.stringify(side[1]))
+	if not equal_persisted(actual, expected, "城邦完整原生存档 " + step):
+		return false
+	citystate_steps += 1
+	return check(true, "城邦完整持久化状态一致：" + step)
+
+func load_city_state(name: String) -> bool:
+	if not check(FileAccess.file_exists(ProjectSettings.globalize_path("res://.local/tests/citystate-" + name + ".json")),
+			"缺少城邦场景存档，请先运行 :godot-kernel:test：" + name):
+		return false
+	if not await perform("load", {"path": ProjectSettings.globalize_path("res://.local/tests/citystate-" + name + ".json")}):
+		return false
+	if not await click_tab(app.tabs, app.TAB_DIPLOMACY):
+		return false
+	for i in range(app.diplomacy_picker.item_count):
+		if app.diplomacy_picker.get_item_text(i) == "Geneva":
+			if app.diplomacy_picker.selected != i and not await click_option(app.diplomacy_picker, i):
+				return false
+	if not check(not app.diplomacy_data.is_empty(), "城邦详情已取得新版本：" + name):
+		return false
+	var civ: Dictionary = app._diplomacy_civ()
+	return check(str(civ.get("type", "")) == "cityState" and not civ.get("cityState", {}).is_empty(), "选中目标为城邦且详情节点非空：" + name)
+
+func verify_city_state_flow() -> bool:
+	citystate_expected = JSON.parse_string(FileAccess.get_file_as_string("res://.local/tests/citystate-expected.json"))
+	# 场景名 → 外交详情区动作按钮 id（Diplomacy_<id>）。
+	var cases := [["gift250", "gift250"], ["gift500", "gift500"], ["gift1000", "gift1000"],
+		["pledge", "pledge"], ["revoke", "revoke"], ["tribute-gold", "tributeGold"], ["tribute-worker", "tributeWorker"],
+		["war", "cityStateDeclareWar"], ["peace", "negotiatePeace"]]
+	for pair in cases:
+		var name := str(pair[0])
+		var choice := str(pair[1])
+		if not await load_city_state(name) or not await citystate_matches(name + "-initial"):
+			return false
+		var revision: int = app.client.revision
+		if not await click_control(diplomacy_control(choice)) or not await click_diplomacy_dialog(false):
+			return false
+		if not check(app.client.revision == revision, "城邦取消零写入：" + name):
+			return false
+		if not await click_control(diplomacy_control(choice)):
+			return false
+		if not check(app.diplomacy_confirmation.dialog_text.length() > 0, "城邦确认展示后果文案：" + name):
+			return false
+		await screenshot("smoke-citystate-" + name + ".png")
+		revision = app.client.revision
+		if not await click_diplomacy_dialog(true, true) or not check(app.client.revision == revision + 1, "城邦双击单次提交：" + name):
+			return false
+		if not await citystate_matches(name + "-done"):
+			return false
+	# 票据过期注入：内核拒绝后仅刷新、不自动重交、零写入。
+	if not await load_city_state("gift250"):
+		return false
+	var stale_revision: int = app.client.revision
+	if not await click_control(diplomacy_control("gift250")):
+		return false
+	app.diplomacy_payload.params.cityStateToken = "expired-citystate-token"
+	if not await click_diplomacy_dialog(true):
+		return false
+	if not check(app.client.revision == stale_revision and app.message.text.contains("刷新"), "城邦票据过期仅刷新且零写入，保留内核原因"):
+		return false
+	# 联姻链：提交后逐城弹出资产处置，吞并接管城市。
+	if not await load_city_state("marriage") or not await citystate_matches("marriage-initial"):
+		return false
+	var marriage_revision: int = app.client.revision
+	if not await click_control(diplomacy_control("marriage")):
+		return false
+	await screenshot("smoke-citystate-marriage-confirm.png")
+	if not await click_diplomacy_dialog(true) or not check(app.client.revision == marriage_revision + 1, "联姻提交一次"):
+		return false
+	if not await citystate_matches("marriage-done"):
+		return false
+	if not check(app._asset_pending().type == "DiplomaticMarriage", "联姻后弹出资产处置待决"):
+		return false
+	if not await click_control(asset_button("annex")) or not await click_asset_dialog(true):
+		return false
+	if not await citystate_matches("marriage-annex"):
+		return false
+	steps.append("城邦：赠金三档、承诺／撤销、贡品金币／工人、宣战／议和真实点击；取消／双击／票据过期零写入；联姻衔接资产吞并；全程完整原生差分")
 	return true
 
 # 免费伟人：原始姓名替换严格镜像未修改的 GameplayAssertions，其他集合沿用其字段表。
@@ -3272,6 +3387,14 @@ func click_control(control) -> bool:
 		return false
 	if control is BaseButton and control.disabled:
 		return check(false, "目标控件被禁用：" + str(control.name))
+	# 详情区（如城邦）可能在点击前刚被重新填充，控件首帧矩形为初值（宽度=文本宽、纵向堆叠未展开），
+	# 据此滚动会误判为“已可见”而不滚动；故先等布局稳定再滚动，滚动改变布局后再二次校正。
+	await get_tree().process_frame
+	await get_tree().process_frame
+	await get_tree().process_frame
+	scroll_into_view(control)
+	await get_tree().process_frame
+	await get_tree().process_frame
 	scroll_into_view(control)
 	await get_tree().process_frame
 	await get_tree().process_frame

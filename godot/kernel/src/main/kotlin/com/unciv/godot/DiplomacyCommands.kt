@@ -44,7 +44,7 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
     }
     private fun major(id: String): Civilization {
         val other = known(id) ?: throw problem("DIPLOMACY_TARGET", "外交对象不可用或尚未接触")
-        ensure(other.isMajorCiv() && other.isAI(), "UNSUPPORTED", "本阶段仅支持主要 AI 文明操作；城邦只读")
+        ensure(other.isMajorCiv() && other.isAI(), "UNSUPPORTED", "此命令仅面向主要文明；城邦请使用城邦命令")
         return other
     }
     private fun ordinary() { GameSession.validateGame(game); CombatCommands(game).ensureNoBlockingBattleDecision() }
@@ -309,7 +309,11 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
                 "type" to if (other.isCityState) "cityState" else "major", "status" to ours.diplomaticStatus.name,
                 "relationship" to theirs.relationshipLevel().name, "peaceTreatyTurns" to ours.turnsToPeaceTreaty(),
                 "peaceNegotiationBlockedTurns" to theirs.getFlag(DiplomacyFlags.DeclaredWar))
-            if (!major) fields["influence"] = if (other.isCityState) theirs.getInfluence() else null
+            if (!major) {
+                fields["influence"] = if (other.isCityState) theirs.getInfluence() else null
+                // 多命令域节点拼接：城邦只读信息与报价由城邦域生成，挂接在同一外交条目上。
+                if (other.isCityState) fields["cityState"] = CityStateCommands(game, session, revision).cityStateDto(other)
+            }
             else {
                 fields["opinion"] = theirs.opinionOfOtherCiv()
                 fields["modifiers"] = listOf("us" to ours, "them" to theirs).flatMap { (observer, manager) ->

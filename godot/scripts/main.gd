@@ -589,7 +589,25 @@ func _diplomacy_stamp_valid(stamp: Dictionary) -> bool:
 	for pending_item in [diplomacy_data.get("incomingTrade"), diplomacy_data.get("pendingAlert")]:
 		if pending_item is Dictionary and ticket == str(pending_item.get("tradeToken", pending_item.get("alertToken", ""))):
 			return true
-	return _diplomacy_civ().get("outgoingTrades", []).any(func(offer): return str(offer.tradeToken) == ticket)
+	if _diplomacy_civ().get("outgoingTrades", []).any(func(offer): return str(offer.tradeToken) == ticket):
+		return true
+	return _city_state_tickets().has(ticket)
+
+func _city_state_tickets() -> Array:
+	var cs = _diplomacy_civ().get("cityState", {})
+	if not cs is Dictionary or cs.is_empty():
+		return []
+	var tickets := []
+	for gift in cs.get("gifts", []):
+		tickets.append(str(gift.get("token", "")))
+	var tribute = cs.get("tribute", {})
+	if tribute is Dictionary:
+		tickets.append(str(tribute.get("goldToken", "")))
+		tickets.append(str(tribute.get("workerToken", "")))
+	var marriage = cs.get("marriage", null)
+	if marriage is Dictionary:
+		tickets.append(str(marriage.get("token", "")))
+	return tickets.filter(func(ticket): return not str(ticket).is_empty())
 
 func _refresh_diplomacy() -> void:
 	if client.busy or client.snapshot.is_empty():
@@ -665,7 +683,7 @@ func _trade_terms(trade: Dictionary) -> String:
 
 func _diplomacy_choice(parent: Node, option: Dictionary, action: String, params: Dictionary, description: String) -> Button:
 	var payload := {"action": action, "params": params.duplicate(true), "description": description,
-		"stamp": _diplomacy_state_stamp(str(params.get("tradeToken", params.get("alertToken", ""))))}
+		"stamp": _diplomacy_state_stamp(str(params.get("tradeToken", params.get("alertToken", params.get("cityStateToken", "")))))}
 	var control := button(parent, str(option.label), _open_diplomacy_confirmation.bind(payload))
 	control.name = "Diplomacy_" + str(option.id)
 	control.set_meta("allowed", not diplomacy_uncertain and option.get("enabled", false) and _diplomacy_stamp_valid(diplomacy_stamp))
@@ -711,7 +729,7 @@ func _populate_diplomacy() -> void:
 		return
 	_diplomacy_text(diplomacy_details, "%s · %s\n关系：%s\n和平条约剩余：%s 回合 · 议和冷却：%s 回合" % [civ.name, civ.status, civ.relationship, _num(civ.get("peaceTreatyTurns"), true), _num(civ.get("peaceNegotiationBlockedTurns"), true)])
 	if civ.get("type") == "cityState":
-		_diplomacy_text(diplomacy_details, "城邦（只读）· 影响力：%s" % _num(civ.get("influence")))
+		_populate_city_state(civ)
 	else:
 		_diplomacy_text(diplomacy_details, "对方对我方评价：%s · 友好剩余：%s 回合" % [_num(civ.get("opinion")), _num(civ.get("friendshipTurns"), true)])
 		for modifier in civ.get("modifiers", []):
@@ -730,6 +748,72 @@ func _populate_diplomacy() -> void:
 			_diplomacy_choice(diplomacy_details, offer.retract, "diplomacyRetractPeace", {"civId": str(civ.civId), "tradeToken": str(offer.tradeToken)}, "%s\n撤回提案\n%s" % [civ.name, _trade_terms(offer)])
 	_on_busy(client.busy)
 
+func _populate_city_state(civ: Dictionary) -> void:
+	var cs = civ.get("cityState", {})
+	if not cs is Dictionary or cs.is_empty():
+		_diplomacy_text(diplomacy_details, "城邦详情不可用，请刷新。")
+		return
+	var civ_id := str(civ.civId)
+	var name := str(civ.name)
+	_diplomacy_text(diplomacy_details, "城邦 · %s · 性格：%s\n影响力：%s · 关系：%s%s" % [cs.get("cityStateType", ""), cs.get("personality", ""), _num(cs.get("influence")), cs.get("relationship", ""),
+		" · 关系变化倒计时：%s 回合" % _num(cs.get("turnsToRelationshipChange"), true) if cs.get("turnsToRelationshipChange") != null else ""])
+	var ally = cs.get("ally", null)
+	if ally is Dictionary:
+		_diplomacy_text(diplomacy_details, "盟友：%s（影响力 %s）" % [ally.get("name", ""), _num(ally.get("influence"))])
+	var protectors: Array = cs.get("protectors", [])
+	if not protectors.is_empty():
+		_diplomacy_text(diplomacy_details, "保护者：" + "、".join(protectors.map(func(item): return str(item))))
+	var friend_bonuses: Array = cs.get("friendBonuses", [])
+	if not friend_bonuses.is_empty():
+		_diplomacy_text(diplomacy_details, "友邦加成：\n" + "\n".join(friend_bonuses.map(func(item): return "· " + str(item))))
+	var ally_bonuses: Array = cs.get("allyBonuses", [])
+	if not ally_bonuses.is_empty():
+		_diplomacy_text(diplomacy_details, "同盟加成：\n" + "\n".join(ally_bonuses.map(func(item): return "· " + str(item))))
+	var resources: Array = cs.get("resources", [])
+	if not resources.is_empty():
+		_diplomacy_text(diplomacy_details, "提供资源：" + "、".join(resources.map(func(item): return "%s ×%s" % [item.get("name", ""), _num(item.get("amount"), true)])))
+	if cs.get("uniqueUnit", null) != null:
+		_diplomacy_text(diplomacy_details, "特色单位：%s" % cs.get("uniqueUnit"))
+	for quest in cs.get("quests", []):
+		_diplomacy_text(diplomacy_details, "任务：%s（+%s 影响力）%s%s\n%s" % [quest.get("name", ""), _num(quest.get("influence"), true),
+			" · 剩余 %s 回合" % _num(quest.get("remainingTurns"), true) if quest.get("remainingTurns") != null else "",
+			" · 进度：%s" % quest.get("score") if quest.get("score") != null else "",
+			str(quest.get("description", ""))])
+	for war in cs.get("wars", []):
+		_diplomacy_text(diplomacy_details, "大战任务 · 目标 %s：需击杀 %s 个单位%s" % [war.get("name", ""), _num(war.get("unitsToKill"), true),
+			"，已击杀 %s" % _num(war.get("killed"), true) if war.get("killed") != null else ""])
+	for gift in cs.get("gifts", []):
+		var choice: Dictionary = gift.get("choice", {})
+		_diplomacy_choice(diplomacy_details, choice, "cityStateGiftGold", {"civId": civ_id, "amount": int(gift.get("amount", 0)), "cityStateToken": str(gift.get("token", ""))},
+			"%s\n%s\n%s" % [name, choice.get("label", ""), choice.get("description", "")])
+	var tribute = cs.get("tribute", {})
+	if tribute is Dictionary and not tribute.is_empty():
+		var tribute_lines := PackedStringArray()
+		for side in [["goldModifiers", "索取金币（意愿 %s）" % _num(tribute.get("goldWillingness"), true)], ["workerModifiers", "索取工人（意愿 %s）" % _num(tribute.get("workerWillingness"), true)]]:
+			tribute_lines.append(str(side[1]) + "：")
+			for modifier in tribute.get(side[0], []):
+				tribute_lines.append("· %s：%s" % [modifier.get("name", ""), _num(modifier.get("value"), true)])
+		_diplomacy_text(diplomacy_details, "贡品意愿：\n" + "\n".join(tribute_lines))
+		_diplomacy_choice(diplomacy_details, tribute.get("gold", {}), "cityStateDemandTribute", {"civId": civ_id, "kind": "gold", "cityStateToken": str(tribute.get("goldToken", ""))},
+			"%s\n%s\n%s" % [name, tribute.get("gold", {}).get("label", ""), tribute.get("gold", {}).get("description", "")])
+		_diplomacy_choice(diplomacy_details, tribute.get("worker", {}), "cityStateDemandTribute", {"civId": civ_id, "kind": "worker", "cityStateToken": str(tribute.get("workerToken", ""))},
+			"%s\n%s\n%s" % [name, tribute.get("worker", {}).get("label", ""), tribute.get("worker", {}).get("description", "")])
+	var actions = cs.get("actions", {})
+	_diplomacy_choice(diplomacy_details, actions.get("pledge", {}), "cityStatePledgeProtection", {"civId": civ_id}, "%s\n承诺保护\n%s" % [name, actions.get("pledge", {}).get("description", "")])
+	_diplomacy_choice(diplomacy_details, actions.get("revoke", {}), "cityStateRevokeProtection", {"civId": civ_id}, "%s\n撤销保护\n%s" % [name, actions.get("revoke", {}).get("description", "")])
+	var warnings: Array = actions.get("warWarnings", [])
+	_diplomacy_choice(diplomacy_details, actions.get("declareWar", {}), "cityStateDeclareWar", {"civId": civ_id},
+		"%s\n宣战\n%s" % [name, "\n".join(warnings.map(func(item): return str(item)))])
+	_diplomacy_choice(diplomacy_details, actions.get("negotiatePeace", {}), "cityStateNegotiatePeace", {"civId": civ_id}, "%s\n议和\n%s" % [name, actions.get("negotiatePeace", {}).get("description", "")])
+	var marriage = cs.get("marriage", null)
+	if marriage is Dictionary:
+		var marriage_choice: Dictionary = marriage.get("choice", {})
+		_diplomacy_choice(diplomacy_details, marriage_choice, "cityStateMarriage", {"civId": civ_id, "cityStateToken": str(marriage.get("token", ""))},
+			"%s\n%s\n%s" % [name, marriage_choice.get("label", ""), marriage_choice.get("description", "")])
+	var improvement = actions.get("giftImprovement", null)
+	if improvement is Dictionary:
+		_diplomacy_choice(diplomacy_details, improvement, "", {}, "%s\n馈赠改良\n%s" % [name, improvement.get("reason", "")])
+
 func _request_peace() -> void:
 	var civ := _diplomacy_civ()
 	if civ.is_empty() or not civ.get("actions", {}).get("proposePeace", {}).get("enabled", false):
@@ -741,6 +825,9 @@ func _request_peace() -> void:
 
 func _open_diplomacy_confirmation(payload: Dictionary) -> void:
 	if _input_locked():
+		return
+	if str(payload.get("action", "")).is_empty():
+		message.text = str(payload.get("description", "")).split("\n")[-1]
 		return
 	if diplomacy_uncertain or not _diplomacy_stamp_valid(diplomacy_stamp) or not _diplomacy_stamp_valid(payload.get("stamp", {})):
 		await _refresh_diplomacy()
