@@ -3002,6 +3002,7 @@ func click_option(ob: OptionButton, index: int) -> bool:
 		return false
 	if not await click_control(ob):
 		return false
+	await get_tree().process_frame
 	var popup := ob.get_popup()
 	if not check(popup.visible, "经济下拉窗口已打开"):
 		return false

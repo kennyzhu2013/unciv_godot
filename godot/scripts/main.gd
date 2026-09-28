@@ -1171,22 +1171,18 @@ func _vote_stamp_valid(stamp: Dictionary) -> bool:
 		return false
 	if int(stamp.get("voteGeneration", -1)) != vote_generation:
 		return false
-	# revision 必须匹配（未提交时）或小于等于当前（已提交后）
 	var stamp_rev = int(stamp.get("revision", -1))
 	if stamp_rev < 0 or stamp_rev > client.revision:
 		return false
-	# mode/choice/civId/ticket 必须与当前 vote_payload 一致
-	var payload = vote_payload.get("stamp") if vote_payload is Dictionary else {}
-	if payload.is_empty():
-		return false
-	for field in ["mode", "choice", "civId", "ticket"]:
-		if str(stamp.get(field, "")) != str(payload.get(field, "")):
-			return false
-	# 有 ticket 时需额外验证 decision token
-	if str(stamp.get("ticket", "")).is_empty():
+	# mode/choice/civId/ticket 来自 stamp 自身，与当前 vote_data.decision 交叉验证
+	var mode = str(stamp.get("mode", ""))
+	var choice = str(stamp.get("choice", ""))
+	var civ_id = str(stamp.get("civId", ""))
+	var ticket = str(stamp.get("ticket", ""))
+	if ticket.is_empty():
 		return true
 	var decision = vote_data.get("decision")
-	return decision is Dictionary and decision.get("mode") == stamp.mode and decision.get("token") == stamp.ticket and (stamp.choice != "civilization" or stamp.civId == _vote_target())
+	return decision is Dictionary and decision.get("mode") == mode and decision.get("token") == ticket and (choice != "civilization" or civ_id == _vote_target())
 
 func _cancel_vote() -> void:
 	vote_payload = {}
@@ -1228,6 +1224,7 @@ func _query_vote() -> void:
 			_populate_vote()
 			return
 	var stamp := _vote_state_stamp()
+	vote_stamp = stamp
 	var result: Dictionary = await client.command("diplomaticVoteOptions")
 	if not _apply_vote_response(result, stamp):
 		vote_uncertain = true
