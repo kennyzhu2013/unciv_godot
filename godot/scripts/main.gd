@@ -1206,7 +1206,6 @@ func _vote_stamp_valid(stamp: Dictionary) -> bool:
 	if stamp.is_empty() or stamp != _vote_state_stamp(str(stamp.get("mode", "")), str(stamp.get("choice", "")),
 			str(stamp.get("civId", "")), str(stamp.get("ticket", ""))):
 		return false
-<<<<<<< HEAD
 	# 基础字段必须与当前应用状态一致
 	if str(stamp.get("session", "")) != client.session or str(stamp.get("gameId", "")) != current_game:
 		return false
