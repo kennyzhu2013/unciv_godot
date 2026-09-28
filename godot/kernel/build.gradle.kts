@@ -41,12 +41,16 @@ tasks.test {
         rootProject.file("godot/.local/tests/religion-pantheon.json"),
         rootProject.file("godot/.local/tests/religion-found.json"))
     outputs.files(listOf("peace", "war", "trade-accept", "trade-decline", "trade-dismiss", "trade-mixed",
-        "DeclarationOfFriendship", "DemandToStopSettlingCitiesNear", "DemandToNotAttackUs", "Denounced")
+        "DeclarationOfFriendship", "DemandToStopSettlingCitiesNear", "DemandToNotAttackUs", "Denounced",
+        "DemandToStopSpreadingReligion", "BulliedProtectedMinor", "AttackedProtectedMinor", "AttackedAllyMinor",
+        "DemandToStopSpyingOnUs", "SpyingOnUsDespiteOurPromise")
         .map { rootProject.file("godot/.local/tests/diplomacy-$it.json") })
     outputs.files(listOf("expected", "liberty", "maya", "mixed", "blocked", "admiral-coastal", "admiral-inland")
         .map { rootProject.file("godot/.local/tests/great-person-$it.json") })
     outputs.files(listOf("expected", "choices", "natural", "abstain", "player-win", "ai-win", "results-edge-tie",
         "results-edge-abstain", "results-edge-empty", "results-edge-dead", "results-edge-hidden")
         .map { rootProject.file("godot/.local/tests/diplomatic-vote-$it.json") })
+    outputs.files(listOf("expected", "civilian-worker", "civilian-settler", "civilian-city-state", "traded", "marriage", "marriage-occ", "expired", "queue")
+        .map { rootProject.file("godot/.local/tests/asset-$it.json") })
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = true }
 }

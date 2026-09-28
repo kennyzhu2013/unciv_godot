@@ -156,23 +156,28 @@ android/assets/SaveFiles/
 android/assets/scenarios/
 
 # When running the desktop app locally using "gradlew desktop:run"
+# 锚定到仓库根：未锚定的 fonts/ 等模式会匹配任意深度同名目录，
+# 曾导致 core/src/com/unciv/ui/components/fonts 源码包在重建时被排除、无法编译。
 lasterror.txt
 GameSettings.json
 ModListCache.json
-fonts/
-maps/
-mods/
-MultiplayerGames/
-music/
-SaveFiles/
-scenarios/
+/fonts/
+/maps/
+/mods/
+/MultiplayerGames/
+/music/
+/SaveFiles/
+/scenarios/
 
 # server artifacts
 server.auth
-MultiplayerFiles/
+/MultiplayerFiles/
 
 /.kotlin/errors/*
 /.kotlin/sessions/*
+
+# 开发期本地数据（上游参照克隆、临时清单等），不入库
+/.local/
 
 # Visual Studio Code
 .vscode/

@@ -208,6 +208,47 @@ class GatewayHttpTest {
         assertEquals(after, UncivFiles.gameInfoToString(session.game!!, false))
     }
 
+    @Test fun assetDecisionsUseAuthenticatedStrictReadOnlyQueriesAndIdempotentWrites() {
+        fun api(body: JsonObject): JsonObject {
+            val response = send(body.toString())
+            assertEquals(response.body(), 200, response.statusCode())
+            return Json.parseToJsonElement(response.body()).jsonObject
+        }
+        for ((name, choices) in AssetDecisionFixtures.cases) for (choice in choices) {
+            val source = AssetDecisionFixtures.file(name)
+            assertTrue(api(BattleFixtures.request(session, "load", "path" to source.absolutePath)).boolean("ok"))
+            val game = session.game!!
+            val revision = session.revision
+            val before = UncivFiles.gameInfoToString(game, false)
+            val query = BattleFixtures.request(session, "assetDecisionOptions")
+            val options = api(query)
+            assertEquals(options, api(query))
+            val ticket = options["data"]!!.jsonObject["decision"]!!.jsonObject.text("token")
+            val command = BattleFixtures.request(session, "assetDecision", "decisionToken" to ticket, "choice" to choice)
+            assertHttpError(send(command.toString(), authorization = null), 401)
+            val invalid = mutableListOf(
+                JsonObject(query + ("target" to JsonPrimitive("forged"))) to "INVALID_ARGUMENT",
+                JsonObject(command + ("session" to JsonPrimitive("old-session"))) to "SESSION",
+                JsonObject(command + ("decisionToken" to JsonPrimitive("old-ticket"))) to "ASSET_DECISION",
+                JsonObject(command + ("cityId" to JsonPrimitive("forged"))) to "INVALID_ARGUMENT")
+            for (key in listOf("decisionToken", "choice")) {
+                invalid += JsonObject(command - key) to "INVALID_ARGUMENT"
+                for (value in listOf(JsonNull, JsonPrimitive(3), JsonPrimitive(false), JsonPrimitive(""), dto(), JsonArray(emptyList())))
+                    invalid += JsonObject(command + (key to value)) to "INVALID_ARGUMENT"
+            }
+            for ((bad, code) in invalid) {
+                assertEquals(code, api(bad)["error"]!!.jsonObject.text("code"))
+                assertSame(game, session.game)
+                assertEquals(revision, session.revision)
+                assertEquals(before, UncivFiles.gameInfoToString(game, false))
+            }
+            val expected = UncivFiles.gameInfoFromString(source.readText())
+            AssetDecisionFixtures.decide(expected, choice)
+            assertIdempotentOverHttp(command.toString())
+            GameplayAssertions.assertGameplayEquals("HTTP $name/$choice", expected, session.game!!)
+        }
+    }
+
     @Test fun developmentCommandsAreIdempotentOverHttp() {
         val (workerId, cityId) = loadDevelopment("http-development", withWorker = true)
         // 施工：工人在农场地块开始改良。
@@ -276,12 +317,14 @@ class GatewayHttpTest {
     @Test fun purchaseEconomyHttpContract() = economyHttp("cityPurchase", "name" to "Warrior", "stat" to "Gold", "queueIndex" to 2)
     @Test fun saleEconomyHttpContract() = economyHttp("citySellBuilding", "name" to "Market")
 
-    private fun diplomacyHttp(action: String) {
+    private fun diplomacyHttp(action: String,
+        alertType: com.unciv.logic.civilization.AlertType = com.unciv.logic.civilization.AlertType.DemandToNotAttackUs,
+        alertChoice: String = "refuseAndDeclareWar") {
         val fixture = DiplomacyFixtures.file("http-$action", action != "diplomacyDeclareWar" && action != "diplomacyAlertDecision") {
             when (action) {
                 "diplomacyRetractPeace" -> DiplomacyFixtures.propose(it, 20)
                 "diplomacyTradeDecision" -> DiplomacyFixtures.incoming(it, 20)
-                "diplomacyAlertDecision" -> DiplomacyFixtures.alert(it, com.unciv.logic.civilization.AlertType.DemandToNotAttackUs)
+                "diplomacyAlertDecision" -> DiplomacyFixtures.alert(it, alertType)
             }
         }
         fun response(body: JsonObject): JsonObject {
@@ -306,24 +349,38 @@ class GatewayHttpTest {
             "diplomacyRetractPeace" -> dto("civId" to id, "tradeToken" to data["civilizations"]!!.jsonArray
                 .first { it.jsonObject.text("civId") == id }.jsonObject["outgoingTrades"]!!.jsonArray.first().jsonObject.text("tradeToken"))
             "diplomacyTradeDecision" -> dto("tradeToken" to data["incomingTrade"]!!.jsonObject.text("tradeToken"), "choice" to "accept")
-            else -> dto("alertToken" to data["pendingAlert"]!!.jsonObject.text("alertToken"), "choice" to "refuseAndDeclareWar")
+            else -> dto("alertToken" to data["pendingAlert"]!!.jsonObject.text("alertToken"), "choice" to alertChoice)
         }
         val body = JsonObject(BattleFixtures.request(session, action) + params)
-        assertHttpError(send(body.toString(), authorization = null), 401)
-        assertEquals("SESSION", response(JsonObject(body + ("session" to JsonPrimitive("old-session"))))["error"]!!.jsonObject.text("code"))
-        for ((key, value) in params) {
-            val invalid = if (key.endsWith("Gold")) listOf(JsonNull, JsonPrimitive("2"), JsonPrimitive(2.5), JsonPrimitive(-1), JsonPrimitive(2147483648L), JsonPrimitive(true), JsonArray(emptyList()))
-                else listOf(JsonNull, JsonPrimitive(""), JsonPrimitive(2), JsonPrimitive(true), JsonArray(emptyList()))
-            assertEquals("INVALID_ARGUMENT", response(JsonObject(body - key))["error"]!!.jsonObject.text("code"))
-            for (bad in invalid) assertEquals("$key=$bad (合法值 $value)", "INVALID_ARGUMENT",
-                response(JsonObject(body + (key to bad)))["error"]!!.jsonObject.text("code"))
+        fun unchanged() {
+            assertSame(current, session.game)
+            assertEquals(revision, session.revision)
+            assertEquals(before, UncivFiles.gameInfoToString(current, false))
         }
-        assertSame(current, session.game)
-        assertEquals(revision, session.revision)
-        assertEquals(before, UncivFiles.gameInfoToString(session.game!!, false))
+        fun reject(bad: JsonObject, code: String = "INVALID_ARGUMENT") {
+            assertEquals(bad.toString(), code, response(bad)["error"]!!.jsonObject.text("code"))
+            unchanged()
+        }
+        assertHttpError(send(body.toString(), authorization = null), 401)
+        assertHttpError(send(query.toString(), authorization = null), 401)
+        unchanged()
+        reject(JsonObject(body + ("session" to JsonPrimitive("old-session"))), "SESSION")
+        reject(JsonObject(query + ("choice" to JsonPrimitive("agree"))))
+        reject(JsonObject(body + ("spyId" to JsonPrimitive("forged"))))
+        for ((key, _) in params) {
+            val invalid = if (key.endsWith("Gold")) listOf(JsonNull, JsonPrimitive("2"), JsonPrimitive(2.5), JsonPrimitive(-1), JsonPrimitive(2147483648L), JsonPrimitive(true), dto(), JsonArray(emptyList()))
+                else listOf(JsonNull, JsonPrimitive(""), JsonPrimitive(" \t"), JsonPrimitive(2), JsonPrimitive(true), dto(), JsonArray(emptyList()))
+            reject(JsonObject(body - key))
+            for (bad in invalid) reject(JsonObject(body + (key to bad)))
+        }
+        val expected = if (action == "diplomacyAlertDecision") UncivFiles.gameInfoFromString(fixture.readText()).also {
+            reject(JsonObject(body + ("alertToken" to JsonPrimitive("stale-ticket"))), "DIPLOMACY_REQUEST")
+            DiplomacyFixtures.alertDecision(it, alertChoice)
+        } else null
         assertIdempotentOverHttp(body.toString())
         assertEquals(revision + 1, session.revision)
         assertSame(current, session.game)
+        if (expected != null) GameplayAssertions.assertGameplayEquals("HTTP $alertType/$alertChoice", expected, session.game!!)
     }
 
     @Test fun declareWarHttpContract() = diplomacyHttp("diplomacyDeclareWar")
@@ -331,6 +388,10 @@ class GatewayHttpTest {
     @Test fun retractPeaceHttpContract() = diplomacyHttp("diplomacyRetractPeace")
     @Test fun tradeDecisionHttpContract() = diplomacyHttp("diplomacyTradeDecision")
     @Test fun alertDecisionHttpContract() = diplomacyHttp("diplomacyAlertDecision")
+    @Test fun newAlertChoicesOverHttp() {
+        for ((type, choices) in DiplomacyFixtures.alertChoices.drop(4)) for (choice in choices)
+            diplomacyHttp("diplomacyAlertDecision", type, choice)
+    }
 
     /**
      * 宗教新入口的 HTTP 外壳契约：载入 FoundingReligion 待决场景，验证 religionOptions 只读确定性，

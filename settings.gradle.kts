@@ -1,5 +1,9 @@
 import java.util.Properties
 
+// Kotlin internal 成员的 JVM 名携带模块名（如 foundReligion$Unciv_core），模块名默认取根工程名，
+// 而根工程名默认取目录名。godot/kernel 的 Java 桥接依赖该名称，必须固定，不能随克隆目录漂移。
+rootProject.name = "Unciv"
+
 pluginManagement {
     repositories {
         mavenLocal() // To get the compiler plugin locally

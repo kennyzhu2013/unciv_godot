@@ -122,6 +122,7 @@ internal class PlayerSnapshot(private val game: GameInfo) {
             val alert = civ.popupAlerts.first()
             if (alert.type == com.unciv.logic.civilization.AlertType.CityConquered)
                 add(CityCaptureCommands(game).pending(alert))
+            else if (alert.type in AssetDecisionCommands.alertTypes) add(AssetDecisionCommands(game).pending(alert))
             else if (alert.type in DiplomacyCommands.alertTypes) add(diplomacy.pendingAlert(alert))
             else add("alert", "${alert.type}：${alert.value}" +
                 (if (alert.type in GameSession.informationalAlerts) "" else "；此选择尚未接入，请保存后用原客户端处理"),

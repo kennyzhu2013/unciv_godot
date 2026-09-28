@@ -9,6 +9,8 @@ import com.unciv.logic.civilization.AlertType
 import com.unciv.logic.civilization.NotificationCategory
 import com.unciv.logic.civilization.NotificationIcon
 import com.unciv.logic.civilization.PopupAlert
+import com.unciv.logic.civilization.diplomacy.DeclareWarReason
+import com.unciv.logic.civilization.diplomacy.WarType
 import com.unciv.logic.civilization.diplomacy.Demand
 import com.unciv.logic.civilization.diplomacy.DiplomacyFlags
 import com.unciv.logic.files.UncivFiles
@@ -21,6 +23,15 @@ import java.io.File
 internal object DiplomacyFixtures {
     val root get() = BattleFixtures.root
     fun enemy(game: GameInfo) = BattleFixtures.enemy(game)
+    val cityStateAlerts = listOf(AlertType.BulliedProtectedMinor, AlertType.AttackedProtectedMinor, AlertType.AttackedAllyMinor)
+    val spyAlerts = listOf(AlertType.DemandToStopSpyingOnUs, AlertType.SpyingOnUsDespiteOurPromise)
+    val alertChoices = listOf(
+        AlertType.DeclarationOfFriendship to listOf("accept", "decline"),
+        AlertType.DemandToStopSettlingCitiesNear to listOf("agree", "refuse"),
+        AlertType.DemandToNotAttackUs to listOf("agree", "refuseAndDeclareWar"),
+        AlertType.Denounced to listOf("dismiss", "declareWar"),
+        AlertType.DemandToStopSpreadingReligion to listOf("agree", "refuse")) +
+        spyAlerts.map { it to listOf("agree", "refuse") } + cityStateAlerts.map { it to listOf("declareWar", "support", "withdrawProtection") }
 
     fun game(war: Boolean = false): GameInfo = BattleFixtures.game().also { game ->
         native(game) {
@@ -131,11 +142,7 @@ internal object DiplomacyFixtures {
             tradeDecision(g, if (choice == "mixed") "decline" else choice)
             record("trade-$choice-done", g)
         }
-        for ((type, choices) in listOf(
-            AlertType.DeclarationOfFriendship to listOf("accept", "decline"),
-            AlertType.DemandToStopSettlingCitiesNear to listOf("agree", "refuse"),
-            AlertType.DemandToNotAttackUs to listOf("agree", "refuseAndDeclareWar"),
-            AlertType.Denounced to listOf("dismiss", "declareWar"))) {
+        for ((type, choices) in alertChoices) {
             val file = file("diplomacy-$type") { alert(it, type) }
             for (choice in choices) {
                 val g = UncivFiles.gameInfoFromString(file.readText())
@@ -169,8 +176,36 @@ internal object DiplomacyFixtures {
         game.currentPlayerCiv.tradeRequests.add(TradeRequest(enemy(game).civID, peace(game, ourGold, theirGold)))
     }
 
+    /** 仅在初始场景建立城邦关系；连续回合测试不会调用此初始化或清空中途事件。 */
+    fun protectedCityState(game: GameInfo, allied: Boolean = false): Civilization = native(game) {
+        val player = game.currentPlayerCiv
+        val cityState = addCiv(game, "Geneva", -2, 5)
+        enemy(game).diplomacyFunctions.makeCivilizationsMeet(cityState)
+        cityState.getDiplomacyManager(player)!!.setInfluence(if (allied) 100f else 45f)
+        if (!allied) cityState.cityStateFunctions.addProtectorCiv(player)
+        player.popupAlerts.removeAll { it.type == AlertType.FirstContact && it.value == cityState.civID }
+        cityState
+    }
+
     fun alert(game: GameInfo, type: AlertType) {
-        game.currentPlayerCiv.popupAlerts.add(PopupAlert(type, enemy(game).civID))
+        // 固定选项矩阵使用显式注入，不声称该提示由间谍行动自然产生。
+        if (type in spyAlerts) {
+            val player = game.currentPlayerCiv
+            if (player.espionageManager.spyList.isEmpty())
+                player.espionageManager.addSpy().moveTo(enemy(game).cities.first())
+            if (type == AlertType.SpyingOnUsDespiteOurPromise) {
+                val theirs = enemy(game).getDiplomacyManager(player)!!
+                theirs.removeFlag(DiplomacyFlags.AgreedToNotSendSpies)
+                theirs.setFlag(DiplomacyFlags.IgnoreThemSendingSpies, 100, true)
+                theirs.setModifier(com.unciv.logic.civilization.diplomacy.DiplomaticModifiers.BetrayedPromiseToNotSendingSpiesToUs, -20f)
+            }
+        }
+        val value = if (type in cityStateAlerts) {
+            val cityState = game.civilizations.firstOrNull { it.civName == "Geneva" }
+                ?: protectedCityState(game, type == AlertType.AttackedAllyMinor)
+            "${enemy(game).civID}@${cityState.civID}"
+        } else enemy(game).civID
+        game.currentPlayerCiv.popupAlerts.add(PopupAlert(type, value))
     }
 
     fun propose(game: GameInfo, ourGold: Int = 0, theirGold: Int = 0) = native(game) {
@@ -199,18 +234,47 @@ internal object DiplomacyFixtures {
     fun alertDecision(game: GameInfo, choice: String) = native(game) {
         val player = game.currentPlayerCiv
         val alert = player.popupAlerts.first()
-        val diplo = player.getDiplomacyManager(game.getCivilization(alert.value))!!
+        val ids = alert.value.split('@')
+        val diplo = player.getDiplomacyManager(game.getCivilization(ids.first()))!!
         when (alert.type) {
             AlertType.DeclarationOfFriendship -> when (choice) {
                 "accept" -> diplo.signDeclarationOfFriendship()
                 "decline" -> diplo.otherCivDiplomacy().setFlag(DiplomacyFlags.DeclinedDeclarationOfFriendship, 20)
             }
-            AlertType.DemandToStopSettlingCitiesNear, AlertType.DemandToNotAttackUs -> {
-                val demand = if (alert.type == AlertType.DemandToNotAttackUs) Demand.DoNotAttackUs else Demand.DoNotSettleNearUs
+            AlertType.DemandToStopSettlingCitiesNear, AlertType.DemandToNotAttackUs, AlertType.DemandToStopSpreadingReligion,
+            AlertType.DemandToStopSpyingOnUs, AlertType.SpyingOnUsDespiteOurPromise -> {
+                val demand = when (alert.type) {
+                    AlertType.DemandToNotAttackUs -> Demand.DoNotAttackUs
+                    AlertType.DemandToStopSpreadingReligion -> Demand.DoNotSpreadReligion
+                    AlertType.DemandToStopSpyingOnUs, AlertType.SpyingOnUsDespiteOurPromise -> Demand.DontSpyOnUs
+                    else -> Demand.DoNotSettleNearUs
+                }
                 if (choice == "agree") diplo.agreeToDemand(demand)
                 else if (choice != "dismiss") diplo.refuseDemand(demand)
             }
             AlertType.Denounced -> if (choice == "declareWar") diplo.declareWar()
+            AlertType.BulliedProtectedMinor, AlertType.AttackedProtectedMinor, AlertType.AttackedAllyMinor -> {
+                if (choice != "dismiss") {
+                    val cityState = game.getCivilization(ids[1])
+                    // 独立重现 AlertPopup 的三个回调，不借用网关选项或执行器。
+                    when (choice) {
+                        "declareWar" -> {
+                            diplo.sideWithCityState()
+                            diplo.declareWar(DeclareWarReason(
+                                if (alert.type == AlertType.AttackedAllyMinor) WarType.AlliedCityStateWar else WarType.ProtectedCityStateWar, cityState))
+                            val manager = cityState.getDiplomacyManager(player)!!
+                            manager.setInfluenceWithoutSideEffects(NativeDiplomacyBridge.rawInfluence(manager) + 20f)
+                        }
+                        "support" -> diplo.sideWithCityState()
+                        "withdrawProtection" -> {
+                            player.addNotification("You have broken your Pledge to Protect [${cityState.civName}]!",
+                                cityState.cityStateFunctions.getNotificationActions(), NotificationCategory.Diplomacy, cityState.civName)
+                            cityState.cityStateFunctions.removeProtectorCiv(player, forced = true)
+                        }
+                        else -> error(choice)
+                    }
+                }
+            }
             else -> error("未接入的测试事件：${alert.type}")
         }
         player.popupAlerts.remove(alert)

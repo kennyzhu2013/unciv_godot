@@ -7,6 +7,8 @@ import com.unciv.logic.civilization.Civilization
 import com.unciv.logic.civilization.NotificationCategory
 import com.unciv.logic.civilization.NotificationIcon
 import com.unciv.logic.civilization.PopupAlert
+import com.unciv.logic.civilization.diplomacy.DeclareWarReason
+import com.unciv.logic.civilization.diplomacy.WarType
 import com.unciv.logic.civilization.diplomacy.Demand
 import com.unciv.logic.civilization.diplomacy.DiplomacyFlags
 import com.unciv.logic.civilization.diplomacy.DiplomaticStatus
@@ -20,8 +22,18 @@ import java.security.MessageDigest
 /** 玩家可见外交边界；报价／选择只读，所有玩法效果委托原生内核。 */
 internal class DiplomacyCommands(private val game: GameInfo, private val session: String = "", private val revision: Int = -1) {
     private val player = game.currentPlayerCiv
-    private data class Choice(val id: String, val label: String, val problem: GatewayError?) {
-        fun dto() = dto("id" to id, "label" to label, "enabled" to (problem == null), "reason" to (problem?.message ?: ""))
+    private data class Choice(val id: String, val label: String, val problem: GatewayError?, val description: String = "") {
+        fun dto() = dto("id" to id, "label" to label, "enabled" to (problem == null),
+            "reason" to (problem?.message ?: ""), "description" to description)
+    }
+    private data class AlertParties(val other: Civilization?, val cityState: Civilization?)
+
+    /** 复合引用只按原生 civID 解析；格式错误或未接触的对象不向 DTO 暴露。 */
+    private fun alertParties(alert: PopupAlert): AlertParties {
+        if (alert.type !in cityStateAlertTypes) return AlertParties(known(alert.value), null)
+        val ids = alert.value.split('@')
+        if (ids.size != 2 || ids.any { it.isEmpty() }) return AlertParties(null, null)
+        return AlertParties(known(ids[0]), known(ids[1])?.takeIf { it.isCityState })
     }
     private fun problem(code: String, text: String) = GatewayError(code, text)
     private fun ensure(ok: Boolean, code: String, text: String) { if (!ok) throw problem(code, text) }
@@ -120,18 +132,36 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
             }))
     }
     private fun alertChoices(alert: PopupAlert): List<Choice> {
-        val other = known(alert.value)
-        val base = checked { GameSession.validateGame(game); major(alert.value) }
         if (alert.type !in alertTypes) return emptyList()
+        val (other, cityState) = alertParties(alert)
         val expired = other != null && (other.isDefeated()
             || alert.type == AlertType.DeclarationOfFriendship && player.isAtWarWith(other))
+        val base = checked {
+            GameSession.validateGame(game)
+            major(other?.civID ?: "")
+            if (!expired && alert.type in cityStateAlertTypes)
+                ensure(cityState != null, "DIPLOMACY_TARGET", "事件涉及的城邦不可用或尚未接触")
+        }
         if (expired) return listOf(Choice("dismiss", "清理过期事件", base))
-        fun choice(id: String, label: String, war: Boolean = false) = Choice(id, label,
-            base ?: if (war) checked { warCheck(other!!) } else null)
+        fun choice(id: String, label: String, war: Boolean = false, description: String = "") = Choice(id, label,
+            base ?: if (war) checked { warCheck(other!!) } else null, description)
+        if (alert.type in cityStateAlertTypes) return buildList {
+            if (other == null || !player.isAtWarWith(other)) add(choice("declareWar", "为城邦宣战", true,
+                "支持城邦并向施压方宣战；在原生宣战效果之外，额外获得该城邦影响力 +20。"))
+            add(choice("support", "支持城邦", description = "向施压方表示反对，不另行宣战；不会增加城邦影响力。"))
+            add(choice("withdrawProtection", "接受现状并撤销保护", description =
+                "按原生规则撤销保护并降低城邦影响力（-20），20 回合内不能重新承诺保护；盟友事件也按此规则处理。"))
+        }
         return when (alert.type) {
             AlertType.DeclarationOfFriendship -> listOf(choice("accept", "接受友好声明"), choice("decline", "拒绝友好声明"))
             AlertType.DemandToStopSettlingCitiesNear -> listOf(choice("agree", "承诺不在附近定居"), choice("refuse", "拒绝定居要求"))
             AlertType.DemandToNotAttackUs -> listOf(choice("agree", "承诺不攻击"), choice("refuseAndDeclareWar", "拒绝并宣战", true))
+            AlertType.DemandToStopSpreadingReligion -> listOf(
+                choice("agree", "承诺停止传播宗教", description = "承诺停止向其城市传播宗教；期限按游戏速度计算（标准速度 100 回合），由原生回合逻辑检查履约。"),
+                choice("refuse", "拒绝停止传教", description = "拒绝要求会影响双方外交评价，但不会因此宣战。"))
+            AlertType.DemandToStopSpyingOnUs, AlertType.SpyingOnUsDespiteOurPromise -> listOf(
+                choice("agree", "承诺停止间谍活动", description = "承诺停止向对方派遣间谍；期限按游戏速度计算（标准速度 100 回合）。我方对其评价降低 10；不会自动撤回或改变现有间谍任务。违约惩罚若已结算，不会重复施加。"),
+                choice("refuse", "拒绝停止间谍活动", description = "我方对其评价降低 20，对方对我方的拒绝要求评价降低 15，并在标准速度 100 回合内忽略此类活动（期限随游戏速度调整）。不会宣战或改变现有间谍任务，也不会重复结算已发生的违约惩罚。"))
             AlertType.Denounced -> listOf(choice("dismiss", "知道了"), choice("declareWar", "回应并宣战", true))
             else -> emptyList()
         }
@@ -215,20 +245,42 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
                 ensure(token == alertToken(alert), "DIPLOMACY_REQUEST", "事件已变化，请重新确认")
                 ensure(alert.type in alertTypes, "UNSUPPORTED", "此事件尚未接入")
                 requireChoice(alertChoices(alert), choice)
-                val diplo = player.getDiplomacyManager(major(alert.value))!!
+                val (other, cityState) = alertParties(alert)
+                val diplo = player.getDiplomacyManager(other!!)!!
                 return {
                     when (alert.type) {
                         AlertType.DeclarationOfFriendship -> when (choice) {
                             "accept" -> diplo.signDeclarationOfFriendship()
                             "decline" -> diplo.otherCivDiplomacy().setFlag(DiplomacyFlags.DeclinedDeclarationOfFriendship, 20)
                         }
-                        AlertType.DemandToStopSettlingCitiesNear, AlertType.DemandToNotAttackUs -> {
-                            val demand = if (alert.type == AlertType.DemandToNotAttackUs) Demand.DoNotAttackUs else Demand.DoNotSettleNearUs
+                        AlertType.DemandToStopSettlingCitiesNear, AlertType.DemandToNotAttackUs, AlertType.DemandToStopSpreadingReligion,
+                        AlertType.DemandToStopSpyingOnUs, AlertType.SpyingOnUsDespiteOurPromise -> {
+                            val demand = when (alert.type) {
+                                AlertType.DemandToNotAttackUs -> Demand.DoNotAttackUs
+                                AlertType.DemandToStopSpreadingReligion -> Demand.DoNotSpreadReligion
+                                AlertType.DemandToStopSpyingOnUs, AlertType.SpyingOnUsDespiteOurPromise -> Demand.DontSpyOnUs
+                                else -> Demand.DoNotSettleNearUs
+                            }
                             if (choice == "agree") diplo.agreeToDemand(demand)
                             // refuseDemand 已执行宣战，不复制旧 UI 的第二次 declareWar。
                             else if (choice != "dismiss") diplo.refuseDemand(demand)
                         }
                         AlertType.Denounced -> if (choice == "declareWar") diplo.declareWar()
+                        in cityStateAlertTypes -> when (choice) {
+                            "declareWar" -> {
+                                diplo.sideWithCityState()
+                                val reason = if (alert.type == AlertType.AttackedAllyMinor) WarType.AlliedCityStateWar else WarType.ProtectedCityStateWar
+                                diplo.declareWar(DeclareWarReason(reason, cityState!!))
+                                val influence = cityState.getDiplomacyManager(player)!!
+                                NativeDiplomacyBridge.setRawInfluence(influence, NativeDiplomacyBridge.rawInfluence(influence) + 20f)
+                            }
+                            "support" -> diplo.sideWithCityState()
+                            "withdrawProtection" -> {
+                                player.addNotification("You have broken your Pledge to Protect [${cityState!!.civName}]!",
+                                    cityState.cityStateFunctions.getNotificationActions(), NotificationCategory.Diplomacy, cityState.civName)
+                                cityState.cityStateFunctions.removeProtectorCiv(player, forced = true)
+                            }
+                        }
                         else -> Unit
                     }
                     player.popupAlerts.remove(alert)
@@ -246,8 +298,9 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
             add("与 ${diplo.otherCiv.civName} 的共同防御条约将取消。")
     }
 
-    fun options(): JsonObject {
+    fun options(request: JsonObject = dto()): JsonObject {
         GameSession.validateGame(game)
+        ensure((request.keys - envelope).isEmpty(), "INVALID_ARGUMENT", "外交查询不接受业务参数")
         return dto("playerGold" to player.gold, "civilizations" to player.diplomacyFunctions.getKnownCivsSorted().map { other ->
             val ours = player.getDiplomacyManager(other)!!
             val theirs = other.getDiplomacyManager(player)!!
@@ -265,7 +318,7 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
                 fields["proposedTreatyTurns"] = TradeOffer(Constants.peaceTreaty, TradeOfferType.Treaty, speed = game.speed).duration
                 fields["friendshipTurns"] = ours.getFlag(DiplomacyFlags.DeclarationOfFriendship)
                 fields["gold"] = dto("ourAvailable" to player.gold.coerceAtLeast(0), "theirAvailable" to other.gold.coerceAtLeast(0))
-                fields["promises"] = listOf(Demand.DoNotAttackUs, Demand.DoNotSettleNearUs).flatMap { demand ->
+                fields["promises"] = listOf(Demand.DoNotAttackUs, Demand.DoNotSettleNearUs, Demand.DoNotSpreadReligion, Demand.DontSpyOnUs).flatMap { demand ->
                     listOf("us" to theirs, "them" to ours).mapNotNull { (giver, manager) ->
                         if (!manager.hasFlag(demand.agreedToDemand)) null
                         else dto("type" to demand.name, "giver" to giver, "turns" to manager.getFlag(demand.agreedToDemand))
@@ -289,17 +342,29 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
                 "ourOffers" to safeOffers(request.trade.ourOffers), "theirOffers" to safeOffers(request.trade.theirOffers),
                 "choices" to tradeChoices(request).map { it.dto() })
         }, "pendingAlert" to player.popupAlerts.firstOrNull()?.takeIf { it.type in alertTypes }?.let { alert ->
-            val other = known(alert.value)
+            val (other, cityState) = alertParties(alert)
             dto("civId" to other?.civID, "name" to (other?.civName ?: "不可用的外交对象"), "type" to alert.type.name,
+                "cityState" to cityState?.let { dto("civId" to it.civID, "name" to it.civName) },
                 "message" to alertMessage(alert), "alertToken" to alertToken(alert), "choices" to alertChoices(alert).map { it.dto() },
                 "warWarnings" to if (other != null) warWarnings(other) else emptyList<String>())
         })
     }
 
-    private fun alertMessage(alert: PopupAlert): String = "${known(alert.value)?.civName ?: "不可用的外交对象"}：" + when (alert.type) {
+    private fun alertMessage(alert: PopupAlert): String = "${alertParties(alert).other?.civName ?: "不可用的外交对象"}：" + when (alert.type) {
         AlertType.DeclarationOfFriendship -> "提议发表友好声明"
         AlertType.DemandToStopSettlingCitiesNear -> "要求停止在附近定居"
         AlertType.DemandToNotAttackUs -> "要求承诺不攻击；拒绝将宣战"
+        AlertType.DemandToStopSpreadingReligion -> "要求停止向其城市传播宗教"
+        AlertType.DemandToStopSpyingOnUs -> "要求停止间谍活动"
+        AlertType.SpyingOnUsDespiteOurPromise -> "发现我方违背停止间谍活动的承诺；请选择重新承诺或拒绝"
+        in cityStateAlertTypes -> {
+            val cityState = alertParties(alert).cityState?.civName ?: "不可用的城邦"
+            when (alert.type) {
+                AlertType.BulliedProtectedMinor -> "向我们保护的城邦 $cityState 征收了贡品"
+                AlertType.AttackedProtectedMinor -> "攻击了我们保护的城邦 $cityState"
+                else -> "攻击了我们的盟友城邦 $cityState"
+            }
+        }
         AlertType.Denounced -> "谴责了我们，可以知道了或选择宣战回应"
         else -> "尚未接入的事件"
     }
@@ -309,16 +374,19 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
             "target" to (other?.civID ?: ""), "supported" to (other?.isMajorCiv() == true && other.isAI()), "diplomacy" to true)
     }
     fun pendingAlert(alert: PopupAlert): JsonObject = dto("kind" to "diplomacyAlert", "message" to alertMessage(alert),
-        "target" to (known(alert.value)?.civID ?: ""), "supported" to alertChoices(alert).any { it.problem == null }, "diplomacy" to true)
+        "target" to (alertParties(alert).other?.civID ?: ""), "supported" to alertChoices(alert).any { it.problem == null }, "diplomacy" to true)
 
     companion object {
-        val alertTypes = setOf(AlertType.DeclarationOfFriendship, AlertType.DemandToStopSettlingCitiesNear, AlertType.DemandToNotAttackUs, AlertType.Denounced)
+        private val cityStateAlertTypes = setOf(AlertType.BulliedProtectedMinor, AlertType.AttackedProtectedMinor, AlertType.AttackedAllyMinor)
+        val alertTypes = setOf(AlertType.DeclarationOfFriendship, AlertType.DemandToStopSettlingCitiesNear,
+            AlertType.DemandToNotAttackUs, AlertType.DemandToStopSpreadingReligion, AlertType.Denounced,
+            AlertType.DemandToStopSpyingOnUs, AlertType.SpyingOnUsDespiteOurPromise) + cityStateAlertTypes
         private val envelope = setOf("protocol", "session", "revision", "requestId", "action")
     }
 }
 
 private fun JsonObject.requiredDiplomacyText(key: String): String = (this[key] as? JsonPrimitive)
-    ?.takeIf { it.isString && it.content.isNotEmpty() }?.content
+    ?.takeIf { it.isString && it.content.isNotBlank() }?.content
     ?: throw GatewayError("INVALID_ARGUMENT", "缺少字符串参数或类型错误：$key")
 private fun JsonObject.requiredGold(key: String): Int = (this[key] as? JsonPrimitive)
     ?.takeIf { !it.isString }?.intOrNull?.takeIf { it >= 0 }
