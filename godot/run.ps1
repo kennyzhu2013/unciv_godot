@@ -14,6 +14,7 @@ $previousJava = $env:JAVA_HOME
 $previousToken = $env:UNCIV_GATEWAY_TOKEN
 $previousPort = $env:UNCIV_GATEWAY_PORT
 $previousSave = $env:UNCIV_INITIAL_SAVE
+$previousSmoke = $env:UNCIV_SMOKE
 $kernel = $null
 $exitCode = 0
 try {
@@ -46,6 +47,8 @@ try {
     $env:UNCIV_GATEWAY_TOKEN = [Convert]::ToBase64String($bytes)
     $env:UNCIV_GATEWAY_PORT = [string]$Port
     $env:UNCIV_INITIAL_SAVE = if ($Save) { (Resolve-Path $Save).Path } else { '' }
+    # 仅冒烟运行开启内核 debugInjectEvent 门控（真实游玩/交互窗口不设此变量，该命令等同不存在）。
+    $env:UNCIV_SMOKE = if ($Smoke) { '1' } else { '' }
     $kernel = Start-Process -FilePath "$JavaHome\bin\java.exe" -PassThru -WindowStyle Hidden `
         -WorkingDirectory "$root\android\assets" `
         -ArgumentList @('-Xmx2g', '-cp', "`"$libs`"", 'com.unciv.godot.GatewayMainKt', '--root', "`"$root`"", '--port', "$Port") `
@@ -87,5 +90,6 @@ try {
     $env:UNCIV_GATEWAY_TOKEN = $previousToken
     $env:UNCIV_GATEWAY_PORT = $previousPort
     $env:UNCIV_INITIAL_SAVE = $previousSave
+    $env:UNCIV_SMOKE = $previousSmoke
 }
 exit $exitCode

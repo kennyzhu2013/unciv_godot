@@ -124,6 +124,8 @@ internal class PlayerSnapshot(private val game: GameInfo) {
                 add(CityCaptureCommands(game).pending(alert))
             else if (alert.type in AssetDecisionCommands.alertTypes) add(AssetDecisionCommands(game).pending(alert))
             else if (alert.type in DiplomacyCommands.alertTypes) add(diplomacy.pendingAlert(alert))
+            // 有效触发事件返回结构化选项；无效事件返回 null（复刻原生直接移除，不阻塞结束回合）。
+            else if (alert.type == com.unciv.logic.civilization.AlertType.Event) EventCommands(game).pending(alert)?.let { add(it) }
             else add("alert", "${alert.type}：${alert.value}" +
                 (if (alert.type in GameSession.informationalAlerts) "" else "；此选择尚未接入，请保存后用原客户端处理"),
                 alert.type in GameSession.informationalAlerts)

@@ -28,6 +28,8 @@ internal class GameSession(private val root: File) {
         private set
     private val responses = LinkedHashMap<String, Pair<JsonObject, JsonObject>>()
     private val saveDirectory = File(root, "godot/.local/saves").apply { mkdirs() }
+    /** 仅冒烟运行时（run.ps1 -Smoke 设置 UNCIV_SMOKE=1）开启：允许 debugInjectEvent 向实时会话注入合成事件；真实游玩不设该变量即完全不存在此命令。 */
+    private val smokeEnabled: Boolean = System.getenv("UNCIV_SMOKE") == "1"
 
     @Synchronized
     fun handle(request: JsonObject): JsonObject {
@@ -49,6 +51,7 @@ internal class GameSession(private val root: File) {
             if (action == "religionOptions") return reply("data" to ReligionCommands(requireGame(), sessionId, revision).options())
             if (action == "greatPersonOptions") return reply("data" to GreatPersonCommands(requireGame(), sessionId, revision).options(request))
             if (action == "diplomaticVoteOptions") return reply("data" to DiplomaticVoteCommands(requireGame(), sessionId, revision).options(request))
+            if (action == "eventOptions") return reply("data" to EventCommands(requireGame(), sessionId, revision).options(request))
             if (action == "unitOptions" || action == "cityOptions") {
                 val snapshot = PlayerSnapshot(requireGame())
                 val data = if (action == "unitOptions") snapshot.unitOptions(unit(snapshot, request.integer("unitId")))
@@ -77,6 +80,7 @@ internal class GameSession(private val root: File) {
                 GreatPersonCommands(requireGame(), sessionId, revision).prepare(request) else null
             val preparedAction: (() -> Unit)? = when (action) {
                 "assetDecision" -> AssetDecisionCommands(requireGame(), sessionId, revision).prepare(request)
+                "eventChoose" -> EventCommands(requireGame(), sessionId, revision).prepare(request)
                 "diplomaticVoteCast", "diplomaticVoteAcknowledge" -> DiplomaticVoteCommands(requireGame(), sessionId, revision).prepare(request)
                 "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision" ->
                     DiplomacyCommands(requireGame(), sessionId, revision).prepare(request)
@@ -140,7 +144,7 @@ internal class GameSession(private val root: File) {
                     "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision",
                     "cityStateGiftGold", "cityStatePledgeProtection", "cityStateRevokeProtection", "cityStateDemandTribute",
                     "cityStateDeclareWar", "cityStateNegotiatePeace", "cityStateMarriage",
-                    "unitAction", "cityDecision", "assetDecision", "workerOrder",
+                    "unitAction", "cityDecision", "assetDecision", "workerOrder", "eventChoose",
                     "cityCitizen", "cityFocus", "cityAvoidGrowth", "cityResetCitizens", "citySpecialists", "cityQueue", "cityBuyTile", "cityPurchase", "citySellBuilding",
                     "religionUseProphet", "religionChooseBeliefs", "religionFound",
                     "diplomaticVoteCast", "diplomaticVoteAcknowledge" -> preparedAction!!.invoke()
@@ -210,6 +214,13 @@ internal class GameSession(private val root: File) {
                         val pending = snapshot.pending()
                         ensure(pending.isEmpty(), "PENDING_DECISION", pending.joinToString("；") { it.text("message") })
                         candidate.nextTurn()
+                        // 复刻 AlertPopup：无效事件（shouldOpen==false）在原生 update 中被直接移除，这里在回合推进后清理队首无效事件。
+                        EventCommands(candidate).drainInvalidEventAlerts()
+                    }
+                    "debugInjectEvent" -> {
+                        // 门控测试命令：基础规则集无 Alert 型事件且 ruleset 不序列化，端到端前端验收只能由内核注入。
+                        ensure(smokeEnabled, "UNKNOWN_COMMAND", "未实现命令：$action")
+                        EventCommands(candidate).injectSmokeEvent(request.text("kind"))
                     }
                     "save" -> {
                         val name = request.text("name")
@@ -301,6 +312,7 @@ internal class GameSession(private val root: File) {
             AlertType.ReligionSpreadDespiteOurPromise, AlertType.AttackedUsDespitePromise)
         /** 原客户端直接作用于当前局、会修改状态的玩家命令；save 只读不改，nextTurn 在副本上执行。 */
         val inPlaceCommands = setOf("move", "foundCity", "production", "research", "policy", "deferPolicy", "acknowledge", "declineTrade",
+                    "eventChoose", "debugInjectEvent",
                     "diplomacyDeclareWar", "diplomacyProposePeace", "diplomacyRetractPeace", "diplomacyTradeDecision", "diplomacyAlertDecision",
                     "cityStateGiftGold", "cityStatePledgeProtection", "cityStateRevokeProtection", "cityStateDemandTribute",
                     "cityStateDeclareWar", "cityStateNegotiatePeace", "cityStateMarriage",

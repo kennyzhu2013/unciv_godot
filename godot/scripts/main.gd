@@ -177,6 +177,19 @@ var vote_open: Button
 var vote_submit: Button
 var vote_abstain: Button
 var vote_continue: Button
+# 通用事件对话框：pending kind=="event" 时在事项页处置；选项按钮动态构建，选择走 eventChoose。
+# 这是「统一事件对话框」的第一个消费者：以后新增需选择的 alert 只要在内核补一个 pending 适配器即可复用。
+var event_generation := 0
+var event_data: Dictionary = {}
+var event_stamp: Dictionary = {}
+var event_payload: Dictionary = {}
+var event_transaction := false
+var event_uncertain := false
+var event_confirmation := ConfirmationDialog.new()
+var event_panel := VBoxContainer.new()
+var event_summary := Label.new()
+var event_choices_box := VBoxContainer.new()
+var event_open_button: Button
 
 const ACTION_NAMES := {"skip": "跳过／取消跳过本回合", "fortify": "驻防", "fortifyUntilHealed": "驻防至恢复",
 	"sleep": "休眠", "sleepUntilHealed": "休眠至恢复", "setUp": "架设"}
@@ -1222,6 +1235,7 @@ func _build_matters_tab() -> void:
 	religion_open_button.name = "OpenReligion"
 	_build_great_person(page)
 	_build_vote(page)
+	_build_event(page)
 	label(page, "科研")
 	page.add_child(research_picker)
 	button(page, "选择科技", func():
@@ -1818,7 +1832,7 @@ func label(parent: Node, text: String) -> void:
 	parent.add_child(result)
 
 func _on_busy(is_busy: bool) -> void:
-	is_busy = is_busy or asset_transaction or asset_confirmation.visible or vote_transaction or vote_confirmation.visible or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or diplomacy_confirmation.visible or economy_confirmation.visible or religion_confirmation.visible or great_person_confirmation.visible
+	is_busy = is_busy or asset_transaction or asset_confirmation.visible or event_transaction or event_confirmation.visible or vote_transaction or vote_confirmation.visible or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or diplomacy_confirmation.visible or economy_confirmation.visible or religion_confirmation.visible or great_person_confirmation.visible
 	vote_picker.disabled = is_busy or vote_uncertain or vote_picker.item_count == 0 or not _vote_stamp_valid(vote_stamp)
 	great_person_picker.disabled = is_busy or great_person_picker.item_count == 0 or not _great_person_stamp_valid(great_person_stamp)
 	diplomacy_picker.disabled = is_busy or diplomacy_picker.item_count == 0
@@ -1861,12 +1875,16 @@ func _on_busy(is_busy: bool) -> void:
 	else:
 		message.text = "内核处理中……界面仍可拖动和缩放"
 
-func execute(action: String, params: Dictionary = {}, economic_commit := false, diplomatic_commit := false, religious_commit := false, great_person_commit := false, vote_commit := false, asset_commit := false) -> Dictionary:
-	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "assetDecisionOptions", "snapshot"]
+func execute(action: String, params: Dictionary = {}, economic_commit := false, diplomatic_commit := false, religious_commit := false, great_person_commit := false, vote_commit := false, asset_commit := false, event_commit := false) -> Dictionary:
+	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "assetDecisionOptions", "eventOptions", "snapshot"]
 	if asset_transaction and not asset_commit and not query:
 		return {"ok": false, "error": {"code": "BUSY", "message": "资产处置事务尚未完成"}}
 	if asset_confirmation.visible and not query and action not in ["load", "demo"]:
 		return {"ok": false, "error": {"code": "BUSY", "message": "请先确认或取消资产处置"}}
+	if event_transaction and not event_commit and not query:
+		return {"ok": false, "error": {"code": "BUSY", "message": "事件处置事务尚未完成"}}
+	if event_confirmation.visible and not query and action not in ["load", "demo"]:
+		return {"ok": false, "error": {"code": "BUSY", "message": "请先确认或取消事件选择"}}
 	if (economy_transaction and not economic_commit or diplomacy_transaction and not diplomatic_commit or religion_transaction and not religious_commit or great_person_transaction and not great_person_commit or vote_transaction and not vote_commit) and not query:
 		return {"ok": false, "error": {"code": "BUSY", "message": "当前事务尚未完成"}}
 	if diplomacy_confirmation.visible and not query and action not in ["load", "demo"]:
@@ -1879,6 +1897,7 @@ func execute(action: String, params: Dictionary = {}, economic_commit := false, 
 		return {"ok": false, "error": {"code": "BUSY", "message": "请先确认或取消外交投票"}}
 	if action == "snapshot":
 		_invalidate_asset()
+		_invalidate_event()
 		_invalidate_vote()
 		_invalidate_great_person()
 		_invalidate_diplomacy()
@@ -1913,8 +1932,17 @@ func execute(action: String, params: Dictionary = {}, economic_commit := false, 
 		elif great_person_commit and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
 			great_person_uncertain = true
 			await _refresh_great_person()
-		elif failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST", "GREAT_PERSON_DECISION", "DIPLOMATIC_VOTE_DECISION", "DIPLOMATIC_VOTE_RESULT", "ASSET_DECISION"]:
+		elif event_commit and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
+			event_uncertain = true
+			_invalidate_event()
+			var recovery: Dictionary = await client.command("snapshot")
+			if recovery.get("ok", false):
+				await _refresh_active_context()
+			else:
+				_rebuild_pending(client.snapshot)
+		elif failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST", "GREAT_PERSON_DECISION", "DIPLOMATIC_VOTE_DECISION", "DIPLOMATIC_VOTE_RESULT", "ASSET_DECISION", "EVENT", "EVENT_INVALID"]:
 			_invalidate_asset()
+			_invalidate_event()
 			_invalidate_vote()
 			_invalidate_great_person()
 			_cancel_economy()
@@ -1922,7 +1950,7 @@ func execute(action: String, params: Dictionary = {}, economic_commit := false, 
 			_invalidate_religion()
 			await client.command("snapshot")
 			await _refresh_active_context()
-		elif economic_commit or diplomatic_commit or religious_commit or great_person_commit or vote_commit:
+		elif economic_commit or diplomatic_commit or religious_commit or great_person_commit or vote_commit or event_commit:
 			await _refresh_active_context()
 		message.text = str(failure.get("message", "请求失败"))
 	else:
@@ -1941,7 +1969,9 @@ func _confirm_founding() -> void:
 
 func _apply_snapshot(data: Dictionary) -> void:
 	asset_uncertain = false
+	event_uncertain = false
 	_invalidate_asset()
+	_invalidate_event()
 	_invalidate_vote()
 	# gameId 改变（不同存档）视为重载：自增纪元并清空本地选择与确认状态；
 	# 同一局的写命令快照不清空选择，改由 _refresh_active_context 保留并重解析活动面板。
@@ -2033,6 +2063,7 @@ func _rebuild_pending(data: Dictionary) -> void:
 	diplomacy_open_button.set_meta("allowed", data.pending.any(func(item): return item.get("diplomacy", false)))
 	religion_open_button.set_meta("allowed", data.pending.any(func(item): return item.get("kind", "") == "religion"))
 	great_person_open.set_meta("allowed", data.pending.any(func(item): return item.get("kind", "") == "greatPerson") or great_person_uncertain)
+	event_open_button.set_meta("allowed", data.pending.any(func(item): return item.get("kind", "") == "event") or event_uncertain)
 	_update_vote_summary()
 	# 待决占城优先显示处置区。
 	if not capture_id.is_empty():
@@ -2041,6 +2072,7 @@ func _rebuild_pending(data: Dictionary) -> void:
 # 本地选择状态：用户切换选择或重载时自增代际；异步详情回填前比对，任一不符即丢弃。
 func _reset_selection() -> void:
 	_invalidate_asset()
+	_invalidate_event()
 	vote_panel.hide()
 	vote_uncertain = false
 	_invalidate_vote()
@@ -2094,6 +2126,8 @@ func _own_city_exists(id: String) -> bool:
 
 # 写命令后统一按仍存在且仍己方的 ID 重新解析活动面板；对象消失或失去所有权则清空对应上下文。
 func _refresh_active_context() -> void:
+	if event_transaction or (tabs and tabs.current_tab == TAB_MATTERS and event_panel.visible):
+		await _refresh_event()
 	if vote_transaction or (tabs and tabs.current_tab == TAB_MATTERS and vote_panel.visible):
 		await _refresh_vote()
 	if great_person_transaction or (tabs and tabs.current_tab == TAB_MATTERS and great_person_panel.visible):
@@ -2337,7 +2371,7 @@ func _stamp_valid(stamp: Dictionary) -> bool:
 	return not stamp.is_empty() and stamp == _state_stamp() and _own_city_exists(city_id)
 
 func _input_locked() -> bool:
-	return client.busy or asset_transaction or asset_confirmation.visible or vote_transaction or vote_confirmation.visible or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or economy_confirmation.visible or diplomacy_confirmation.visible or religion_confirmation.visible or great_person_confirmation.visible
+	return client.busy or asset_transaction or asset_confirmation.visible or event_transaction or event_confirmation.visible or vote_transaction or vote_confirmation.visible or economy_transaction or diplomacy_transaction or religion_transaction or great_person_transaction or economy_confirmation.visible or diplomacy_confirmation.visible or religion_confirmation.visible or great_person_confirmation.visible
 
 func _economy() -> Dictionary:
 	return city_data.get("economy", {})
@@ -3138,6 +3172,184 @@ func _confirm_asset() -> void:
 	_on_busy(true)
 	await execute("assetDecision", payload.params, false, false, false, false, false, true)
 	asset_transaction = false
+	_on_busy(client.busy)
+
+# —— 通用事件对话框（复刻原生 AlertPopup.addEvent/RenderEvent 语义）——
+# 面板挂在事项页，open 按钮在存在 kind=="event" 待决时启用；选项按钮由 eventOptions 的
+# decision.choices 动态构建，点击后走「查询取票 → 校验戳 → 确认框 → eventChoose」的事务链。
+func _build_event(page: Node) -> void:
+	event_open_button = button(page, "打开事件处理", _open_event)
+	event_open_button.name = "OpenEvent"
+	event_open_button.set_meta("allowed", false)
+	page.add_child(event_panel)
+	event_panel.name = "EventPanel"
+	event_panel.hide()
+	event_summary.name = "EventSummary"
+	event_summary.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	event_panel.add_child(event_summary)
+	event_choices_box.name = "EventChoices"
+	event_panel.add_child(event_choices_box)
+	button(event_panel, "返回地图（保留待决）", _back_event).name = "EventBack"
+	event_confirmation.name = "EventConfirmation"
+	event_confirmation.title = "确认事件选择"
+	event_confirmation.dialog_autowrap = true
+	event_confirmation.get_ok_button().text = "确认"
+	event_confirmation.get_cancel_button().text = "取消"
+	var dialog_theme := Theme.new()
+	dialog_theme.set_constant("buttons_min_height", "AcceptDialog", 34)
+	event_confirmation.theme = dialog_theme
+	event_confirmation.confirmed.connect(_confirm_event)
+	event_confirmation.canceled.connect(_cancel_event)
+	event_confirmation.close_requested.connect(_cancel_event)
+	add_child(event_confirmation)
+
+func _event_state_stamp(event_name := "", ticket := "") -> Dictionary:
+	return {"session": client.session, "revision": client.revision, "gameId": current_game,
+		"player": client.snapshot.get("player", ""), "loadEpoch": load_epoch,
+		"selectionGeneration": selection_generation, "eventGeneration": event_generation,
+		"eventName": event_name, "ticket": ticket}
+
+func _event_stamp_valid(stamp: Dictionary) -> bool:
+	# 与 _great_person_stamp_valid 同模式：用 stamp 自身字段重算当前基础状态并整体比较，
+	# 会话／版本／代际任一变化即失效；带票据时再与当前 decision.token / eventName 交叉验证。
+	if stamp.is_empty() or stamp != _event_state_stamp(str(stamp.get("eventName", "")), str(stamp.get("ticket", ""))):
+		return false
+	if str(stamp.get("ticket", "")).is_empty():
+		return true
+	var decision = event_data.get("decision")
+	return decision is Dictionary and decision.get("token") == stamp.ticket and str(decision.get("eventName", "")) == stamp.eventName
+
+func _cancel_event() -> void:
+	event_payload = {}
+	event_confirmation.hide()
+	_on_busy(client.busy)
+
+func _invalidate_event() -> void:
+	event_generation += 1
+	event_stamp = {}
+	event_data = {}
+	_cancel_event()
+	if is_instance_valid(event_choices_box):
+		_populate_event()
+
+func _open_event() -> void:
+	if _input_locked():
+		return
+	event_panel.show()
+	tabs.current_tab = TAB_MATTERS
+	await _refresh_event()
+	matters_scroll.ensure_control_visible(event_summary)
+
+func _back_event() -> void:
+	if _input_locked():
+		return
+	event_panel.hide()
+	tabs.current_tab = TAB_UNIT
+
+func _refresh_event() -> void:
+	if client.busy or client.snapshot.is_empty():
+		return
+	_invalidate_event()
+	# 传输结果不确定时，必须先恢复快照，再获取新票据；不能凭旧事件状态重新提交。
+	if event_uncertain:
+		var recovered: Dictionary = await client.command("snapshot")
+		if not recovered.get("ok", false) or not recovered.get("snapshot") is Dictionary:
+			event_summary.text = "状态未确认，事件处置已禁用。请恢复连接后刷新。"
+			return
+	var stamp := _event_state_stamp()
+	var result: Dictionary = await client.command("eventOptions")
+	_apply_event_response(result, stamp)
+
+# 此入口可注入旧响应以验证本地防护，不代表真实网络乱序。
+func _apply_event_response(result: Dictionary, stamp: Dictionary) -> bool:
+	if not _event_stamp_valid(stamp):
+		return false
+	if not result.get("ok", false):
+		event_stamp = {}
+		event_data = {}
+		event_summary.text = "详情未确认，事件处置已禁用：" + str(result.get("error", {}).get("message", "查询失败"))
+		_populate_event()
+		return false
+	if str(result.get("session", "")) != str(stamp.session) or int(result.get("revision", -1)) != int(stamp.revision):
+		return false
+	event_uncertain = false
+	event_data = result.get("data", {})
+	event_stamp = _event_state_stamp(str(_event_decision().get("eventName", "")))
+	_populate_event()
+	return true
+
+func _event_decision() -> Dictionary:
+	var decision = event_data.get("decision")
+	return decision if decision is Dictionary else {}
+
+func _populate_event() -> void:
+	_clear_dynamic(event_choices_box)
+	var decision := _event_decision()
+	if decision.is_empty():
+		event_summary.text = "当前没有待决事件。"
+		_on_busy(client.busy)
+		return
+	event_summary.text = "【%s】\n%s" % [str(decision.get("eventName", "")), str(decision.get("message", ""))]
+	var choices: Array = decision.get("choices", [])
+	if decision.get("dismissable", false) or choices.is_empty():
+		# 仅文本事件：关闭即移除（复刻 RenderEvent 无按钮 + AlertPopup.close）。
+		button(event_choices_box, "知道了", _choose_event.bind(-1)).name = "Event_Dismiss"
+	else:
+		for option in choices:
+			var index := int(option.get("index", 0))
+			var control := button(event_choices_box, str(option.get("text", "")), _choose_event.bind(index))
+			control.name = "Event_Choice_%d" % index
+			control.set_meta("allowed", bool(option.get("enabled", true)) and not event_uncertain)
+			var detail := "；".join((option.get("detail", []) as Array).map(func(line): return str(line)))
+			control.tooltip_text = detail
+			if not detail.is_empty():
+				_diplomacy_text(event_choices_box, detail)
+	_on_busy(client.busy)
+
+func _choose_event(index: int) -> void:
+	if _input_locked() or event_uncertain or not _event_stamp_valid(event_stamp):
+		return
+	var decision := _event_decision()
+	if decision.is_empty():
+		return
+	var dismissable: bool = decision.get("dismissable", false) or (decision.get("choices", []) as Array).is_empty()
+	if not dismissable:
+		var matches: Array = (decision.get("choices", []) as Array).filter(
+			func(item): return int(item.get("index", -1)) == index and bool(item.get("enabled", false)))
+		if matches.is_empty():
+			return
+	event_payload = {"params": ({"eventToken": str(decision.token)} if index < 0 else {"eventToken": str(decision.token), "index": index}),
+		"stamp": _event_state_stamp(str(decision.get("eventName", "")), str(decision.token)), "index": index, "text": _event_choice_text(decision, index)}
+	event_confirmation.dialog_text = "【%s】\n%s" % [str(decision.get("eventName", "")), str(event_payload.text)]
+	event_confirmation.popup_centered(Vector2i(mini(480, int(size.x) - 48), mini(320, int(size.y) - 80)))
+	_on_busy(false)
+
+func _event_choice_text(decision: Dictionary, index: int) -> String:
+	if index < 0:
+		return "关闭此事件（不触发任何效果）。"
+	for option in decision.get("choices", []):
+		if int(option.get("index", -1)) == index:
+			var detail := "；".join((option.get("detail", []) as Array).map(func(line): return str(line)))
+			return str(option.get("text", "")) + ("\n（%s）" % detail if not detail.is_empty() else "")
+	return ""
+
+func _confirm_event() -> void:
+	var payload := event_payload.duplicate(true)
+	event_payload = {}
+	event_confirmation.hide()
+	if _input_locked() or event_uncertain or payload.is_empty():
+		_on_busy(client.busy)
+		return
+	if not _event_stamp_valid(payload.get("stamp", {})):
+		await _refresh_event()
+		message.text = "事件选择已失效，未提交；请重新选择。"
+		return
+	event_transaction = true
+	_on_busy(true)
+	var result := await execute("eventChoose", payload.params, false, false, false, false, false, false, true)
+	if result.get("ok", false):
+		message.text = "事件已处置。"
+	event_transaction = false
 	_on_busy(client.busy)
 
 func _choose_capture(choice: String) -> void:

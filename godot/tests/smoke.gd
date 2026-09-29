@@ -46,6 +46,9 @@ var asset_lock_valid := true
 var asset_lock_handoffs := 0
 var citystate_steps := 0
 var citystate_expected: Dictionary = {}
+var event_steps := 0
+var event_lock_valid := true
+var event_lock_handoffs := 0
 
 # 客户端边界故障注入：请求仍走真实 HTTP，不作为真实网络故障证据。
 class DiplomacyFaultClient extends "res://scripts/kernel_client.gd":
@@ -232,6 +235,8 @@ func run(frontend) -> void:
 		return
 	if not await verify_city_state_flow():
 		return
+	if not await verify_event_flow():
+		return
 	await get_tree().process_frame
 	await get_tree().process_frame
 	var directory := ProjectSettings.globalize_path("res://.local")
@@ -242,7 +247,7 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "asset-decisions", "city-state"],
+		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "asset-decisions", "city-state", "event"],
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -254,6 +259,7 @@ func run(frontend) -> void:
 		"spyDecisionSteps": spy_steps, "spyEvidence": spy_evidence,
 		"assetDecisionSteps": asset_steps, "assetLockHandoffs": asset_lock_handoffs,
 		"cityStateSteps": citystate_steps,
+		"eventSteps": event_steps, "eventLockHandoffs": event_lock_handoffs,
 		"renderBackend": DisplayServer.get_name()}, "\t"))
 	report.close()
 	archive_smoke_result()
@@ -459,6 +465,168 @@ func verify_asset_flow() -> bool:
 	if not check(asset_lock_valid and asset_lock_handoffs > 0, "资产查询、写入、刷新全过程保持事务锁"):
 		return false
 	steps.append("三类资产处置：12条原生结果、混合队首、取消／双击／旧确认、未决及结果重载、丢响应恢复及完整存档差分")
+	return true
+
+# —— 通用事件对话框场景：真实点击选项、断言回合不再被 PENDING_DECISION 阻塞、能连续结束回合 ——
+# 事件定义无法随存档序列化且基础规则集无 Alert 型事件，故由内核 debugInjectEvent（UNCIV_SMOKE 门控）在实时会话注入。
+func observe_event_lock(busy: bool) -> void:
+	if not app.event_transaction:
+		return
+	for control in app.buttons:
+		event_lock_valid = event_lock_valid and control.disabled
+	event_lock_valid = event_lock_valid and app._input_locked()
+	if not busy:
+		event_lock_handoffs += 1
+
+func event_choice_button(index: int):
+	return find_by_name(app.event_choices_box, "Event_Choice_%d" % index)
+
+func click_event_dialog(confirm: bool, twice := false) -> bool:
+	var dialog: ConfirmationDialog = app.event_confirmation
+	if not check(dialog.visible, "事件确认可见"):
+		return false
+	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
+	await get_tree().process_frame
+	var pos := control.get_global_rect().get_center()
+	if not check(dialog.get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34, "事件确认按钮完整可见"):
+		return false
+	await window_motion(dialog, pos)
+	if not check(dialog.gui_get_hovered_control() == control, "事件确认实际悬停命中"):
+		return false
+	var viewport: Viewport = dialog
+	while viewport is Window and viewport.is_embedded():
+		pos = Vector2(viewport.position) + viewport.get_final_transform() * pos
+		viewport = viewport.get_parent().get_viewport()
+	await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false)
+	if twice:
+		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
+	await settle()
+	return check(not dialog.visible and app.event_payload.is_empty(), "事件确认关闭且载荷清空")
+
+func open_event_panel() -> bool:
+	if not await click_tab(app.tabs, app.TAB_MATTERS):
+		return false
+	if not await click_control(app.event_open_button):
+		return false
+	await settle()
+	return true
+
+func inject_event(kind: String) -> bool:
+	return await perform("debugInjectEvent", {"kind": kind})
+
+func clear_informational_alerts() -> bool:
+	for choice in app.client.snapshot.pending.duplicate():
+		if choice.kind == "alert" and choice.supported:
+			if not await perform("acknowledge"):
+				return false
+	return true
+
+func verify_event_flow() -> bool:
+	app.client.busy_changed.connect(observe_event_lock)
+	# 场景1：多选事件——真实点击选项、取消零写入、确认后触发原生 Gain [10] [Gold]、解除阻塞、连续结束回合、持久化。
+	if not await perform("demo") or not await clear_informational_alerts():
+		return false
+	if not await inject_event("gainGold"):
+		return false
+	if not check(app.turn_button.disabled, "事件待决时阻止结束回合"):
+		return false
+	var pending_event: Dictionary = {}
+	for item in app.client.snapshot.pending:
+		if item.get("kind", "") == "event":
+			pending_event = item
+	if not check(not pending_event.is_empty() and str(pending_event.get("eventName", "")) == "SmokeEvent"
+			and (pending_event.get("choices", []) as Array).size() == 2, "事件结构化待决含两个选项"):
+		return false
+	if not await open_event_panel():
+		return false
+	if not check(app.event_panel.visible and app.event_summary.text.contains("SmokeEvent"), "事件面板展示事件名与正文"):
+		return false
+	if not check(event_choice_button(0) != null and event_choice_button(1) != null, "事件对话框渲染两个选项按钮"):
+		return false
+	await screenshot("smoke-event-choices.png")
+	var gold_before := int(app.client.snapshot.gold)
+	var revision: int = app.client.revision
+	# 取消路径：点击选项0弹出确认后取消，零写入、金币不变。
+	if not await click_control(event_choice_button(0)):
+		return false
+	if not check(app.event_confirmation.visible and app.event_confirmation.dialog_text.contains("获得金币"), "事件确认展示所选选项文本"):
+		return false
+	if not await click_event_dialog(false):
+		return false
+	if not check(app.client.revision == revision and int(app.client.snapshot.gold) == gold_before, "事件取消零写入"):
+		return false
+	# 确认路径：真实点击选项0 → 双击确认仅提交一次 → 原生 +10 金币、待决清空、回合解锁。
+	if not await click_control(event_choice_button(0)):
+		return false
+	if not await click_event_dialog(true, true):
+		return false
+	if not check(app.client.revision == revision + 1, "事件双击仅提交一次且版本递增"):
+		return false
+	if not check(int(app.client.snapshot.gold) == gold_before + 10, "事件选项触发原生 Gain [10] [Gold]（+10 金币）"):
+		return false
+	if not check(not app.turn_button.disabled, "事件处置后解除回合阻塞"):
+		return false
+	event_steps += 1
+	# 持久化：保存重载后金币保持一致（合成事件定义不序列化，重载后队首已无该事件）。
+	if not await perform("save", {"name": run_id + "-event-gain"}):
+		return false
+	if not await perform("load", {"path": app.last_saved_path}):
+		return false
+	if not check(int(app.client.snapshot.gold) == gold_before + 10, "事件结果持久化"):
+		return false
+	# 连续结束回合：处置事件后不再被 PENDING_DECISION 阻塞（清理常规白类提示后连续推进两回合）。
+	for round_index in range(2):
+		if not await clear_informational_alerts():
+			return false
+		var turn := int(app.client.snapshot.turn)
+		if not await click_control(app.turn_button):
+			return false
+		if not check(int(app.client.snapshot.turn) == turn + 1, "事件后可连续结束回合 %d" % (round_index + 1)):
+			return false
+	event_steps += 1
+
+	# 场景2：仅文本事件——dismissable，点击“知道了”关闭即移除、无副作用。
+	if not await inject_event("textOnly"):
+		return false
+	if not check(app.turn_button.disabled, "仅文本事件同样阻塞回合直至处置"):
+		return false
+	if not await open_event_panel():
+		return false
+	var dismiss = find_by_name(app.event_choices_box, "Event_Dismiss")
+	if not check(dismiss != null, "仅文本事件渲染关闭按钮而非选项"):
+		return false
+	var gold_text := int(app.client.snapshot.gold)
+	revision = app.client.revision
+	if not await click_control(dismiss):
+		return false
+	if not await click_event_dialog(true):
+		return false
+	if not check(app.client.revision == revision + 1 and int(app.client.snapshot.gold) == gold_text, "仅文本事件关闭无副作用"):
+		return false
+	if not check(not app.turn_button.disabled, "仅文本事件处置后解除阻塞"):
+		return false
+	event_steps += 1
+
+	# 场景3：无效事件——不进入 pending（不阻塞），nextTurn 后由内核 drain 清理（复刻 AlertPopup 直接移除）。
+	if not await inject_event("invalid"):
+		return false
+	var has_event_pending := false
+	for item in app.client.snapshot.pending:
+		if item.get("kind", "") == "event":
+			has_event_pending = true
+	if not check(not has_event_pending and not app.turn_button.disabled, "无效事件不阻塞结束回合"):
+		return false
+	var turn_invalid := int(app.client.snapshot.turn)
+	if not await clear_informational_alerts() or not await click_control(app.turn_button):
+		return false
+	if not check(int(app.client.snapshot.turn) == turn_invalid + 1, "无效事件在回合推进后被清理且回合正常前进"):
+		return false
+	event_steps += 1
+
+	app.client.busy_changed.disconnect(observe_event_lock)
+	if not check(event_lock_valid and event_lock_handoffs > 0, "事件查询、写入全过程保持事务锁"):
+		return false
+	steps.append("通用事件对话框：多选触发原生 Gain、取消零写入、双击仅一次、仅文本关闭、无效事件 drain 不阻塞、连续结束回合及持久化")
 	return true
 
 func normalize_city_state(value, key := ""):
@@ -3313,7 +3481,7 @@ func settle() -> void:
 	var guard := 0
 	while idle < 3 and guard < 900:
 		guard += 1
-		if app.client.busy or app.economy_transaction or app.diplomacy_transaction or app.religion_transaction or app.great_person_transaction or app.vote_transaction or app.asset_transaction:
+		if app.client.busy or app.economy_transaction or app.diplomacy_transaction or app.religion_transaction or app.great_person_transaction or app.vote_transaction or app.asset_transaction or app.event_transaction:
 			idle = 0
 		else:
 			idle += 1
