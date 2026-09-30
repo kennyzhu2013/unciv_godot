@@ -554,7 +554,7 @@ class GameSessionTest {
 
     /**
      * 会话级接线守护：religionOptions 经只读分支返回且不推进 revision；宗教待决经通用 snapshot.pending() 阻塞 nextTurn；
-     * religionFound 经 preparedAction／execute／inPlaceCommands 事务写入，与独立原生期望全存档一致且重放不重复写入。
+     * religionFound 经注册表 prepare／execute／就地备份事务写入，与独立原生期望全存档一致且重放不重复写入。
      * 期望端仅用原生桥接与 chooseBeliefs，不经 ReligionCommands／DTO。
      */
     @Test fun religionCommandsRouteThroughSessionTransactionAndGateNextTurn() {

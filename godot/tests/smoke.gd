@@ -282,7 +282,7 @@ func normalize_asset(value, key := ""):
 	return value
 
 func asset_matches(step: String) -> bool:
-	if not check(not app.asset_transaction and not app.client.busy, "资产事务完整解锁：" + step):
+	if not check(not app.asset_panel_inst.transaction and not app.client.busy, "资产事务完整解锁：" + step):
 		return false
 	if not await perform("save", {"name": run_id + "-asset-" + str(asset_steps)}):
 		return false
@@ -310,7 +310,7 @@ func asset_button(choice: String):
 	return find_by_name(app.capture_panel, "Asset_" + choice)
 
 func click_asset_dialog(confirm: bool, twice := false) -> bool:
-	var dialog: ConfirmationDialog = app.asset_confirmation
+	var dialog: ConfirmationDialog = app.asset_panel_inst.confirmation
 	if not check(dialog.visible, "资产确认可见"):
 		return false
 	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
@@ -330,10 +330,10 @@ func click_asset_dialog(confirm: bool, twice := false) -> bool:
 	if twice:
 		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
 	await settle()
-	return check(not dialog.visible and app.asset_payload.is_empty(), "资产确认载荷清空")
+	return check(not dialog.visible and app.asset_panel_inst.payload.is_empty(), "资产确认载荷清空")
 
 func observe_asset_lock(busy: bool) -> void:
-	if not app.asset_transaction:
+	if not app.asset_panel_inst.transaction:
 		return
 	asset_lock_valid = asset_lock_valid and app._input_locked()
 	for control in app.buttons:
@@ -349,8 +349,8 @@ func verify_asset_stamps() -> bool:
 			return false
 		var revision: int = app.client.revision
 		# 仅本地确认票据故障注入，提交仍通过实际鼠标；任一字段变旧都必须零请求。
-		var value = app.asset_payload.stamp[field]
-		app.asset_payload.stamp[field] = int(value) + 1 if value is int else "stale-" + str(value)
+		var value = app.asset_panel_inst.payload.stamp[field]
+		app.asset_panel_inst.payload.stamp[field] = int(value) + 1 if value is int else "stale-" + str(value)
 		var requests: int = app.client.request_counter
 		if not await click_asset_dialog(true) or not check(app.client.revision == revision and app.client.request_counter == requests, "资产旧确认零提交：" + field):
 			return false
@@ -359,11 +359,11 @@ func verify_asset_stamps() -> bool:
 	var revision: int = app.client.revision
 	await diplomacy_key(KEY_ESCAPE)
 	await settle()
-	if not check(not app.asset_confirmation.visible and app.asset_payload.is_empty() and app.client.revision == revision, "资产 Escape 取消零写入"):
+	if not check(not app.asset_panel_inst.confirmation.visible and app.asset_panel_inst.payload.is_empty() and app.client.revision == revision, "资产 Escape 取消零写入"):
 		return false
 	if not await click_control(asset_button("keep")) or not await perform("snapshot"):
 		return false
-	if not check(not app.asset_confirmation.visible and app.asset_payload.is_empty() and app.client.revision == revision, "资产刷新作废确认"):
+	if not check(not app.asset_panel_inst.confirmation.visible and app.asset_panel_inst.payload.is_empty() and app.client.revision == revision, "资产刷新作废确认"):
 		return false
 	return await asset_matches("civilian-worker-initial")
 
@@ -380,7 +380,7 @@ func verify_asset_transport() -> bool:
 		swap_great_person_test_client(fault)
 		var clicked := await click_asset_dialog(true, true)
 		var writes: Array = fault.trace.filter(func(entry): return entry.request.action == "assetDecision")
-		var guarded: bool = app.asset_uncertain == (mode == "unconfirmed") and not app.asset_transaction and not fault.busy
+		var guarded: bool = app.asset_panel_inst.uncertain == (mode == "unconfirmed") and not app.asset_panel_inst.transaction and not fault.busy
 		if mode == "unconfirmed":
 			guarded = guarded and asset_button("return").disabled and asset_button("keep").disabled
 		var evidence := FileAccess.open("res://.local/" + run_id + "-asset-transport-" + mode + ".json", FileAccess.WRITE)
@@ -396,9 +396,9 @@ func verify_asset_transport() -> bool:
 			await settle()
 			await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, asset_button("return").get_global_rect().get_center())
 			await settle()
-			if not check(original.request_counter == requests and not app.asset_confirmation.visible, "资产结果不确定时点击零请求") or not await perform("snapshot"):
+			if not check(original.request_counter == requests and not app.asset_panel_inst.confirmation.visible, "资产结果不确定时点击零请求") or not await perform("snapshot"):
 				return false
-		if not check(original.revision == revision + 1 and not app.asset_uncertain, "资产恢复实际版本、不重复处置：" + mode) or not await asset_matches("civilian-worker-return"):
+		if not check(original.revision == revision + 1 and not app.asset_panel_inst.uncertain, "资产恢复实际版本、不重复处置：" + mode) or not await asset_matches("civilian-worker-return"):
 			return false
 	return true
 
@@ -415,17 +415,17 @@ func verify_asset_flow() -> bool:
 			if not await click_control(asset_button(choice)):
 				return false
 			var revision: int = app.client.revision
-			var description: String = app._asset_pending().choices.filter(func(item): return item.id == choice)[0].description
-			if not check(app.asset_confirmation.dialog_text.contains(description) and app.turn_button.disabled, "资产确认展示原生后果并阻止回合推进"):
+			var description: String = app.asset_panel_inst.asset_pending().choices.filter(func(item): return item.id == choice)[0].description
+			if not check(app.asset_panel_inst.confirmation.dialog_text.contains(description) and app.turn_button.disabled, "资产确认展示原生后果并阻止回合推进"):
 				return false
 			if not await click_asset_dialog(false) or not check(app.client.revision == revision, "资产取消零写入"):
 				return false
 			if not await click_control(asset_button(choice)):
 				return false
-			var old: Dictionary = app.asset_payload.stamp.duplicate(true)
+			var old: Dictionary = app.asset_panel_inst.payload.stamp.duplicate(true)
 			if not await perform("load", {"path": pending_path}):
 				return false
-			if not check(not app._asset_stamp_valid(old) and app.asset_payload.is_empty() and not app.asset_confirmation.visible, "资产未决重载使旧确认失效"):
+			if not check(not app.asset_panel_inst.stamp_valid(old) and app.asset_panel_inst.payload.is_empty() and not app.asset_panel_inst.confirmation.visible, "资产未决重载使旧确认失效"):
 				return false
 			if not await click_control(asset_button(choice)):
 				return false
@@ -441,7 +441,7 @@ func verify_asset_flow() -> bool:
 	var index := 0
 	for pair in [["RecapturedCivilian", "keep"], ["CityTraded", "keep"], ["DiplomaticMarriage", "puppet"]]:
 		var controls: Array = app.capture_panel.get_children().filter(func(item): return item is Button)
-		if not check(app._asset_pending().type == pair[0] and controls.size() == 2, "混合资产仅显示队首选项：" + pair[0]):
+		if not check(app.asset_panel_inst.asset_pending().type == pair[0] and controls.size() == 2, "混合资产仅显示队首选项：" + pair[0]):
 			return false
 		if not await click_control(asset_button(pair[1])) or not await click_asset_dialog(true):
 			return false
@@ -470,7 +470,7 @@ func verify_asset_flow() -> bool:
 # —— 通用事件对话框场景：真实点击选项、断言回合不再被 PENDING_DECISION 阻塞、能连续结束回合 ——
 # 事件定义无法随存档序列化且基础规则集无 Alert 型事件，故由内核 debugInjectEvent（UNCIV_SMOKE 门控）在实时会话注入。
 func observe_event_lock(busy: bool) -> void:
-	if not app.event_transaction:
+	if not app.event_panel_inst.transaction:
 		return
 	for control in app.buttons:
 		event_lock_valid = event_lock_valid and control.disabled
@@ -479,10 +479,10 @@ func observe_event_lock(busy: bool) -> void:
 		event_lock_handoffs += 1
 
 func event_choice_button(index: int):
-	return find_by_name(app.event_choices_box, "Event_Choice_%d" % index)
+	return find_by_name(app.event_panel_inst.choices_box, "Event_Choice_%d" % index)
 
 func click_event_dialog(confirm: bool, twice := false) -> bool:
-	var dialog: ConfirmationDialog = app.event_confirmation
+	var dialog: ConfirmationDialog = app.event_panel_inst.confirmation
 	if not check(dialog.visible, "事件确认可见"):
 		return false
 	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
@@ -501,12 +501,12 @@ func click_event_dialog(confirm: bool, twice := false) -> bool:
 	if twice:
 		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
 	await settle()
-	return check(not dialog.visible and app.event_payload.is_empty(), "事件确认关闭且载荷清空")
+	return check(not dialog.visible and app.event_panel_inst.payload.is_empty(), "事件确认关闭且载荷清空")
 
 func open_event_panel() -> bool:
 	if not await click_tab(app.tabs, app.TAB_MATTERS):
 		return false
-	if not await click_control(app.event_open_button):
+	if not await click_control(app.event_panel_inst.open_button):
 		return false
 	await settle()
 	return true
@@ -539,7 +539,7 @@ func verify_event_flow() -> bool:
 		return false
 	if not await open_event_panel():
 		return false
-	if not check(app.event_panel.visible and app.event_summary.text.contains("SmokeEvent"), "事件面板展示事件名与正文"):
+	if not check(app.event_panel_inst.panel.visible and app.event_panel_inst.summary.text.contains("SmokeEvent"), "事件面板展示事件名与正文"):
 		return false
 	if not check(event_choice_button(0) != null and event_choice_button(1) != null, "事件对话框渲染两个选项按钮"):
 		return false
@@ -549,7 +549,7 @@ func verify_event_flow() -> bool:
 	# 取消路径：点击选项0弹出确认后取消，零写入、金币不变。
 	if not await click_control(event_choice_button(0)):
 		return false
-	if not check(app.event_confirmation.visible and app.event_confirmation.dialog_text.contains("获得金币"), "事件确认展示所选选项文本"):
+	if not check(app.event_panel_inst.confirmation.visible and app.event_panel_inst.confirmation.dialog_text.contains("获得金币"), "事件确认展示所选选项文本"):
 		return false
 	if not await click_event_dialog(false):
 		return false
@@ -592,7 +592,7 @@ func verify_event_flow() -> bool:
 		return false
 	if not await open_event_panel():
 		return false
-	var dismiss = find_by_name(app.event_choices_box, "Event_Dismiss")
+	var dismiss = find_by_name(app.event_panel_inst.choices_box, "Event_Dismiss")
 	if not check(dismiss != null, "仅文本事件渲染关闭按钮而非选项"):
 		return false
 	var gold_text := int(app.client.snapshot.gold)
@@ -645,7 +645,7 @@ func normalize_city_state(value, key := ""):
 	return value
 
 func citystate_matches(step: String) -> bool:
-	if not check(not app.diplomacy_transaction and not app.client.busy, "城邦事务完整解锁：" + step):
+	if not check(not app.diplomacy_panel_inst.transaction and not app.client.busy, "城邦事务完整解锁：" + step):
 		return false
 	if not await perform("save", {"name": run_id + "-citystate-" + step}):
 		return false
@@ -673,13 +673,13 @@ func load_city_state(name: String) -> bool:
 		return false
 	if not await click_tab(app.tabs, app.TAB_DIPLOMACY):
 		return false
-	for i in range(app.diplomacy_picker.item_count):
-		if app.diplomacy_picker.get_item_text(i) == "Geneva":
-			if app.diplomacy_picker.selected != i and not await click_option(app.diplomacy_picker, i):
+	for i in range(app.diplomacy_panel_inst.picker.item_count):
+		if app.diplomacy_panel_inst.picker.get_item_text(i) == "Geneva":
+			if app.diplomacy_panel_inst.picker.selected != i and not await click_option(app.diplomacy_panel_inst.picker, i):
 				return false
-	if not check(not app.diplomacy_data.is_empty(), "城邦详情已取得新版本：" + name):
+	if not check(not app.diplomacy_panel_inst.data.is_empty(), "城邦详情已取得新版本：" + name):
 		return false
-	var civ: Dictionary = app._diplomacy_civ()
+	var civ: Dictionary = app.diplomacy_panel_inst.diplomacy_civ()
 	return check(str(civ.get("type", "")) == "cityState" and not civ.get("cityState", {}).is_empty(), "选中目标为城邦且详情节点非空：" + name)
 
 func verify_city_state_flow() -> bool:
@@ -700,7 +700,7 @@ func verify_city_state_flow() -> bool:
 			return false
 		if not await click_control(diplomacy_control(choice)):
 			return false
-		if not check(app.diplomacy_confirmation.dialog_text.length() > 0, "城邦确认展示后果文案：" + name):
+		if not check(app.diplomacy_panel_inst.confirmation.dialog_text.length() > 0, "城邦确认展示后果文案：" + name):
 			return false
 		await screenshot("smoke-citystate-" + name + ".png")
 		revision = app.client.revision
@@ -714,7 +714,7 @@ func verify_city_state_flow() -> bool:
 	var stale_revision: int = app.client.revision
 	if not await click_control(diplomacy_control("gift250")):
 		return false
-	app.diplomacy_payload.params.cityStateToken = "expired-citystate-token"
+	app.diplomacy_panel_inst.payload.params.cityStateToken = "expired-citystate-token"
 	if not await click_diplomacy_dialog(true):
 		return false
 	if not check(app.client.revision == stale_revision and app.message.text.contains("刷新"), "城邦票据过期仅刷新且零写入，保留内核原因"):
@@ -730,7 +730,7 @@ func verify_city_state_flow() -> bool:
 		return false
 	if not await citystate_matches("marriage-done"):
 		return false
-	if not check(app._asset_pending().type == "DiplomaticMarriage", "联姻后弹出资产处置待决"):
+	if not check(app.asset_panel_inst.asset_pending().type == "DiplomaticMarriage", "联姻后弹出资产处置待决"):
 		return false
 	if not await click_control(asset_button("annex")) or not await click_asset_dialog(true):
 		return false
@@ -772,7 +772,7 @@ func great_person_state(raw: String) -> Dictionary:
 	return normalize_great_person(state)
 
 func great_person_matches(step: String) -> bool:
-	if not check(not app.great_person_transaction and not app.client.busy, "伟人事务完整解锁：" + step):
+	if not check(not app.great_person_panel_inst.transaction and not app.client.busy, "伟人事务完整解锁：" + step):
 		return false
 	if not await perform("save", {"name": run_id + "-gp-" + str(great_person_steps) + "-" + step}):
 		return false
@@ -801,16 +801,16 @@ func load_great_person(name: String, open := true) -> bool:
 		return false
 	if not await click_tab(app.tabs, app.TAB_MATTERS):
 		return false
-	return not open or await click_control(app.great_person_open)
+	return not open or await click_control(app.great_person_panel_inst.open_button)
 
 func pick_great_person(name: String) -> bool:
-	for index in range(app.great_person_picker.item_count):
-		if app.great_person_picker.get_item_metadata(index).unitName == name:
-			return await click_option(app.great_person_picker, index)
+	for index in range(app.great_person_panel_inst.picker.item_count):
+		if app.great_person_panel_inst.picker.get_item_metadata(index).unitName == name:
+			return await click_option(app.great_person_panel_inst.picker, index)
 	return check(false, "免费伟人候选不存在：" + name)
 
 func click_great_person_dialog(confirm: bool, twice := false) -> bool:
-	var dialog: ConfirmationDialog = app.great_person_confirmation
+	var dialog: ConfirmationDialog = app.great_person_panel_inst.confirmation
 	if not check(dialog.visible, "伟人确认可见"):
 		return false
 	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
@@ -829,25 +829,25 @@ func click_great_person_dialog(confirm: bool, twice := false) -> bool:
 	if twice:
 		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
 	await settle()
-	return check(not dialog.visible and app.great_person_payload.is_empty(), "伟人确认关闭且载荷清空")
+	return check(not dialog.visible and app.great_person_panel_inst.payload.is_empty(), "伟人确认关闭且载荷清空")
 
 func choose_great_person(name: String, placed := true, twice := false) -> bool:
-	if not await pick_great_person(name) or not await click_control(app.great_person_submit):
+	if not await pick_great_person(name) or not await click_control(app.great_person_panel_inst.submit):
 		return false
 	var revision: int = app.client.revision
-	if not app.great_person_confirmation.visible:
+	if not app.great_person_panel_inst.confirmation.visible:
 		await screenshot("smoke-great-person-confirm-missing.png")
 	if not await click_great_person_dialog(true, twice):
 		return false
-	return check(app.client.revision == revision + 1 and app.great_person_picker.selected == -1
-		and app.great_person_result.text.contains("已领取" if placed else "未生成，额度保留"), "伟人一次尝试只提交一次，结果明确且不自动选下一位")
+	return check(app.client.revision == revision + 1 and app.great_person_panel_inst.picker.selected == -1
+		and app.great_person_panel_inst.result.text.contains("已领取" if placed else "未生成，额度保留"), "伟人一次尝试只提交一次，结果明确且不自动选下一位")
 
 func observe_great_person_lock(busy: bool) -> void:
-	if not app.great_person_transaction:
+	if not app.great_person_panel_inst.transaction:
 		return
 	for control in app.buttons:
 		great_person_lock_valid = great_person_lock_valid and control.disabled
-	great_person_lock_valid = great_person_lock_valid and app._input_locked() and app.great_person_picker.disabled
+	great_person_lock_valid = great_person_lock_valid and app._input_locked() and app.great_person_panel_inst.picker.disabled
 	if not busy:
 		great_person_lock_handoffs += 1
 	if not busy and not great_person_pan_checked:
@@ -875,7 +875,7 @@ func observe_great_person_lock(busy: bool) -> void:
 		great_person_lock_valid = great_person_lock_valid and dragged != before and app.map.scale != zoom
 
 func verify_great_person_disabled() -> bool:
-	var picker: OptionButton = app.great_person_picker
+	var picker: OptionButton = app.great_person_panel_inst.picker
 	var disabled_index := -1
 	var enabled_index := -1
 	for index in range(picker.item_count):
@@ -901,8 +901,8 @@ func verify_great_person_disabled() -> bool:
 	await window_mouse(popup, MOUSE_BUTTON_LEFT, pos)
 	await settle()
 	await screenshot("smoke-great-person-disabled-click.png")
-	if not check(popup.visible and picker.selected == -1 and app.great_person_submit.disabled
-			and app.great_person_payload.is_empty() and app.client.revision == revision and app.client.request_counter == requests,
+	if not check(popup.visible and picker.selected == -1 and app.great_person_panel_inst.submit.disabled
+			and app.great_person_panel_inst.payload.is_empty() and app.client.revision == revision and app.client.request_counter == requests,
 			"真实鼠标点击禁用伟人不选中、不确认、零请求"):
 		return false
 	await diplomacy_key(KEY_ESCAPE)
@@ -913,55 +913,55 @@ func verify_great_person_stamps() -> bool:
 	if not await load_great_person("mixed") or not await verify_great_person_disabled():
 		return false
 	var revision: int = app.client.revision
-	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_panel_inst.submit):
 		return false
 	await diplomacy_key(KEY_ESCAPE)
 	await settle()
-	if not check(not app.great_person_confirmation.visible and app.great_person_payload.is_empty() and app.client.revision == revision, "伟人 Escape 取消零写入"):
+	if not check(not app.great_person_panel_inst.confirmation.visible and app.great_person_panel_inst.payload.is_empty() and app.client.revision == revision, "伟人 Escape 取消零写入"):
 		return false
 	for key in ["revision", "loadEpoch", "selectionGeneration", "greatPersonGeneration", "session", "gameId", "player", "unitName", "ticket"]:
-		if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+		if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_panel_inst.submit):
 			return false
-		var old = app.great_person_payload.stamp[key]
-		app.great_person_payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		var old = app.great_person_panel_inst.payload.stamp[key]
+		app.great_person_panel_inst.payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
 		if not await click_great_person_dialog(true) or not check(app.client.revision == revision, "本地注入旧伟人确认拒绝提交：" + key):
 			return false
-	var fresh: Dictionary = app.great_person_stamp.duplicate(true)
-	var data: Dictionary = app.great_person_data.duplicate(true)
+	var fresh: Dictionary = app.great_person_panel_inst.stamp.duplicate(true)
+	var data: Dictionary = app.great_person_panel_inst.data.duplicate(true)
 	for key in ["revision", "loadEpoch", "selectionGeneration", "greatPersonGeneration", "session", "gameId", "player"]:
 		var stale := fresh.duplicate(true)
 		var old = stale[key]
 		stale[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
-		if not check(not app._apply_great_person_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale)
-				and app.great_person_data == data, "本地旧响应注入不回填：" + key):
+		if not check(not app.great_person_panel_inst.apply_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale)
+				and app.great_person_panel_inst.data == data, "本地旧响应注入不回填：" + key):
 			return false
-	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_panel_inst.submit):
 		return false
-	if not await perform("snapshot") or not check(not app.great_person_confirmation.visible and app.great_person_payload.is_empty(), "手动快照使伟人确认失效"):
+	if not await perform("snapshot") or not check(not app.great_person_panel_inst.confirmation.visible and app.great_person_panel_inst.payload.is_empty(), "手动快照使伟人确认失效"):
 		return false
-	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit) or not await load_great_person("mixed"):
+	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_panel_inst.submit) or not await load_great_person("mixed"):
 		return false
-	if not check(not app._great_person_stamp_valid(fresh) and app.great_person_payload.is_empty(), "同存档重载使旧确认失效"):
+	if not check(not app.great_person_panel_inst.stamp_valid(fresh) and app.great_person_panel_inst.payload.is_empty(), "同存档重载使旧确认失效"):
 		return false
 	# 修改票据参数但保留本地 stamp，真实确认后由网关拒绝，只刷新不重交。
-	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+	if not await pick_great_person("Great Scientist") or not await click_control(app.great_person_panel_inst.submit):
 		return false
 	revision = app.client.revision
-	app.great_person_payload.params.decisionToken = "expired-ticket-injection"
-	if not await click_great_person_dialog(true) or not check(app.client.revision == revision and app.great_person_picker.selected == -1, "伟人票据拒绝后刷新且不重交"):
+	app.great_person_panel_inst.payload.params.decisionToken = "expired-ticket-injection"
+	if not await click_great_person_dialog(true) or not check(app.client.revision == revision and app.great_person_panel_inst.picker.selected == -1, "伟人票据拒绝后刷新且不重交"):
 		return false
-	if not await load_great_person("blocked") or not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+	if not await load_great_person("blocked") or not await pick_great_person("Great Scientist") or not await click_control(app.great_person_panel_inst.submit):
 		return false
-	var old_choice: Dictionary = app.great_person_payload.duplicate(true)
+	var old_choice: Dictionary = app.great_person_panel_inst.payload.duplicate(true)
 	revision = app.client.revision
 	if not await click_great_person_dialog(false) or not await pick_great_person("Great Engineer"):
 		return false
-	if not check(not app._great_person_stamp_valid(old_choice.stamp) and app.great_person_description.text.contains("Great Engineer"), "真实切换候选更新说明并使旧目标确认失效"):
+	if not check(not app.great_person_panel_inst.stamp_valid(old_choice.stamp) and app.great_person_panel_inst.description.text.contains("Great Engineer"), "真实切换候选更新说明并使旧目标确认失效"):
 		return false
-	if not await click_control(app.great_person_submit):
+	if not await click_control(app.great_person_panel_inst.submit):
 		return false
 	# 只回注已取消的旧载荷；切换与确认均由真实输入完成。
-	app.great_person_payload = old_choice
+	app.great_person_panel_inst.payload = old_choice
 	if not await click_great_person_dialog(true) or not check(app.client.revision == revision, "候选切换后回注旧确认仍零写入"):
 		return false
 	return await great_person_matches("blocked-initial")
@@ -979,7 +979,7 @@ func swap_great_person_test_client(replacement) -> void:
 func verify_great_person_transport() -> bool:
 	for kind in ["mixed", "blocked"]:
 		for mode in ["retry", "recover", "snapshot", "greatPersonOptions"]:
-			if not await load_great_person(kind) or not await pick_great_person("Great Scientist") or not await click_control(app.great_person_submit):
+			if not await load_great_person(kind) or not await pick_great_person("Great Scientist") or not await click_control(app.great_person_panel_inst.submit):
 				return false
 			var original = app.client
 			var revision: int = original.revision
@@ -991,10 +991,10 @@ func verify_great_person_transport() -> bool:
 			var clicked := await click_great_person_dialog(true, true)
 			var writes: Array = fault.trace.filter(func(entry): return entry.request.action == "greatPersonChoose")
 			var failures_expected := not fault.fail_query.is_empty()
-			var guarded: bool = app.great_person_submit.disabled and app.great_person_picker.selected == -1 \
-				and app.great_person_uncertain == failures_expected and not app.great_person_transaction and not fault.busy
+			var guarded: bool = app.great_person_panel_inst.submit.disabled and app.great_person_panel_inst.picker.selected == -1 \
+				and app.great_person_panel_inst.uncertain == failures_expected and not app.great_person_panel_inst.transaction and not fault.busy
 			if failures_expected:
-				guarded = guarded and app.great_person_data.is_empty() and app.great_person_result.text.contains("状态未确认")
+				guarded = guarded and app.great_person_panel_inst.data.is_empty() and app.great_person_panel_inst.result.text.contains("状态未确认")
 			var queries: Array = fault.trace.filter(func(entry): return entry.request.action != "greatPersonChoose")
 			var query_order: Array = queries.map(func(entry): return entry.request.action)
 			var expected_order: Array = ["greatPersonOptions"] if mode == "retry" else ["snapshot", "greatPersonOptions"]
@@ -1018,15 +1018,15 @@ func verify_great_person_transport() -> bool:
 			if failures_expected:
 				await screenshot("smoke-great-person-uncertain-" + kind + "-" + mode + ".png")
 				var requests: int = original.request_counter
-				scroll_into_view(app.great_person_submit)
+				scroll_into_view(app.great_person_panel_inst.submit)
 				await settle()
-				await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, app.great_person_submit.get_global_rect().get_center())
+				await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, app.great_person_panel_inst.submit.get_global_rect().get_center())
 				await settle()
-				if not check(original.request_counter == requests and not app.great_person_confirmation.visible, "状态未确认时实际点击领取零请求：" + kind + "/" + mode):
+				if not check(original.request_counter == requests and not app.great_person_panel_inst.confirmation.visible, "状态未确认时实际点击领取零请求：" + kind + "/" + mode):
 					return false
-				if not await click_control(app.great_person_open):
+				if not await click_control(app.great_person_panel_inst.open_button):
 					return false
-			if not check(original.revision == revision + 1 and not app.great_person_uncertain and app.great_person_picker.selected == -1, "连接恢复后同步真实版本、不自动再领取：" + kind + "/" + mode):
+			if not check(original.revision == revision + 1 and not app.great_person_panel_inst.uncertain and app.great_person_panel_inst.picker.selected == -1, "连接恢复后同步真实版本、不自动再领取：" + kind + "/" + mode):
 				return false
 			if not await great_person_matches("mixed-first" if kind == "mixed" else "blocked-notPlaced"):
 				return false
@@ -1053,11 +1053,11 @@ func verify_great_person_flow() -> bool:
 			return false
 		if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches(kind + "-reward-reload"):
 			return false
-		if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_open):
+		if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_panel_inst.open_button):
 			return false
 		if not await choose_great_person("Great Scientist", true, true) or not await great_person_matches(kind + "-granted"):
 			return false
-		if not await click_control(app.great_person_locate) or not check(app.unit_id == app.great_person_unit_id, "按新快照定位伟人"):
+		if not await click_control(app.great_person_panel_inst.locate) or not check(app.unit_id == app.great_person_panel_inst.unit_id, "按新快照定位伟人"):
 			return false
 		if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches(kind + "-granted-reload"):
 			return false
@@ -1068,23 +1068,23 @@ func verify_great_person_flow() -> bool:
 			return false
 	if not await load_great_person("mixed") or not await great_person_matches("mixed-initial"):
 		return false
-	if not check(app.great_person_data.decision.mode == "maya", "混合额度先受限"):
+	if not check(app.great_person_panel_inst.data.decision.mode == "maya", "混合额度先受限"):
 		return false
-	for index in range(app.great_person_picker.item_count):
-		if app.great_person_picker.get_item_metadata(index).unitName == "Great Engineer" and not check(app.great_person_picker.is_item_disabled(index), "玛雅已不可选项保留且禁用"):
+	for index in range(app.great_person_panel_inst.picker.item_count):
+		if app.great_person_panel_inst.picker.get_item_metadata(index).unitName == "Great Engineer" and not check(app.great_person_panel_inst.picker.is_item_disabled(index), "玛雅已不可选项保留且禁用"):
 			return false
 	if not await choose_great_person("Great Scientist") or not await great_person_matches("mixed-first"):
 		return false
 	if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches("mixed-reload"):
 		return false
-	if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_open):
+	if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_panel_inst.open_button):
 		return false
-	if not check(app.great_person_data.decision.mode == "ordinary", "混合第二份刷新为普通额度"):
+	if not check(app.great_person_panel_inst.data.decision.mode == "ordinary", "混合第二份刷新为普通额度"):
 		return false
-	if not await pick_great_person("Great Engineer") or not await click_control(app.great_person_submit):
+	if not await pick_great_person("Great Engineer") or not await click_control(app.great_person_panel_inst.submit):
 		return false
 	# Enter 经窗口键盘输入确认，不直接触发 confirmed 信号。
-	app.great_person_confirmation.get_ok_button().grab_focus()
+	app.great_person_panel_inst.confirmation.get_ok_button().grab_focus()
 	await diplomacy_key(KEY_ENTER)
 	await settle()
 	if not await great_person_matches("mixed-second"):
@@ -1093,11 +1093,11 @@ func verify_great_person_flow() -> bool:
 		return false
 	if not await choose_great_person("Great Scientist", false) or not await great_person_matches("blocked-notPlaced"):
 		return false
-	if not check(app.turn_button.disabled and not app.great_person_locate.visible, "未生成保留待决且不展示定位"):
+	if not check(app.turn_button.disabled and not app.great_person_panel_inst.locate.visible, "未生成保留待决且不展示定位"):
 		return false
 	if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches("blocked-reload"):
 		return false
-	if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_open) or not await click_control(find_by_name(app, "GreatPersonBack")):
+	if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_panel_inst.open_button) or not await click_control(find_by_name(app, "GreatPersonBack")):
 		return false
 	app.map.center_on(Vector2i(10, 0))
 	await settle()
@@ -1105,7 +1105,7 @@ func verify_great_person_flow() -> bool:
 		return false
 	if not await great_person_matches("blocked-moved"):
 		return false
-	if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_open) or not await choose_great_person("Great Scientist") or not await great_person_matches("blocked-granted"):
+	if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.great_person_panel_inst.open_button) or not await choose_great_person("Great Scientist") or not await great_person_matches("blocked-granted"):
 		return false
 	if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches("blocked-final-reload"):
 		return false
@@ -1131,31 +1131,31 @@ func verify_great_person_sizes() -> bool:
 		var size_name := "%dx%d" % [target_size.x, target_size.y]
 		if not await load_great_person("blocked") or not await pick_great_person("Great Scientist"):
 			return false
-		scroll_into_view(app.great_person_description)
+		scroll_into_view(app.great_person_panel_inst.description)
 		await settle()
 		await screenshot("smoke-great-person-" + size_name + "-details.png")
-		if not await click_control(app.great_person_submit):
+		if not await click_control(app.great_person_panel_inst.submit):
 			return false
 		await screenshot("smoke-great-person-" + size_name + "-confirm.png")
 		if not await click_great_person_dialog(false) or not await choose_great_person("Great Scientist", false):
 			return false
-		scroll_into_view(app.great_person_result)
+		scroll_into_view(app.great_person_panel_inst.result)
 		await settle()
 		await screenshot("smoke-great-person-" + size_name + "-notPlaced.png")
 		if not await great_person_matches("blocked-notPlaced"):
 			return false
 		# 仅布局注入长名称／中文说明，不提交到内核；注入样本与真实玩法证据分开命名。
-		var layout: Dictionary = app.great_person_data.duplicate(true)
+		var layout: Dictionary = app.great_person_panel_inst.data.duplicate(true)
 		layout.candidates[0].unitName = "长名称布局样例·免费伟人完整名称·验证中文说明与换行"
 		layout.candidates[0].effects = ["长说明布局样例：一次只领取一位，未生成时额度保留。".repeat(10)]
-		if not check(app._apply_great_person_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": layout}, app.great_person_stamp), "长文本布局注入"):
+		if not check(app.great_person_panel_inst.apply_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": layout}, app.great_person_panel_inst.stamp), "长文本布局注入"):
 			return false
-		if not await click_option(app.great_person_picker, 0):
+		if not await click_option(app.great_person_panel_inst.picker, 0):
 			return false
-		scroll_into_view(app.great_person_submit)
+		scroll_into_view(app.great_person_panel_inst.submit)
 		await settle()
 		await screenshot("smoke-great-person-" + size_name + "-long-injected.png")
-		if not check(app.matters_scroll.get_v_scroll_bar().max_value > app.matters_scroll.size.y and app.great_person_description.size.x <= app.tabs.size.x, "长说明可纵向滚动且不横向溢出"):
+		if not check(app.matters_scroll.get_v_scroll_bar().max_value > app.matters_scroll.size.y and app.great_person_panel_inst.description.size.x <= app.tabs.size.x, "长说明可纵向滚动且不横向溢出"):
 			return false
 		if not await click_control(find_by_name(app, "GreatPersonBack")):
 			return false
@@ -1178,16 +1178,16 @@ func load_vote(name: String, open := true) -> bool:
 func open_vote() -> bool:
 	if not await click_tab(app.tabs, app.TAB_MATTERS):
 		return false
-	return await click_control(app.vote_open)
+	return await click_control(app.vote_panel_inst.open_button)
 
 func pick_vote(id: String) -> bool:
-	for index in range(app.vote_picker.item_count):
-		if app.vote_picker.get_item_metadata(index).civId == id:
-			return await click_option(app.vote_picker, index)
+	for index in range(app.vote_panel_inst.picker.item_count):
+		if app.vote_panel_inst.picker.get_item_metadata(index).civId == id:
+			return await click_option(app.vote_panel_inst.picker, index)
 	return check(false, "缺少投票候选：" + id)
 
 func click_vote_dialog(confirm: bool, twice := false) -> bool:
-	var dialog: ConfirmationDialog = app.vote_confirmation
+	var dialog: ConfirmationDialog = app.vote_panel_inst.confirmation
 	if not check(dialog.visible, "外交投票确认可见"):
 		return false
 	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
@@ -1206,10 +1206,10 @@ func click_vote_dialog(confirm: bool, twice := false) -> bool:
 	if twice:
 		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
 	await settle()
-	return check(not dialog.visible and app.vote_payload.is_empty(), "投票确认载荷清空")
+	return check(not dialog.visible and app.vote_panel_inst.payload.is_empty(), "投票确认载荷清空")
 
 func vote_matches(name: String, step: String) -> bool:
-	if not check(not app.vote_transaction and not app.client.busy, "投票事务完整解锁：" + step):
+	if not check(not app.vote_panel_inst.transaction and not app.client.busy, "投票事务完整解锁：" + step):
 		return false
 	if not await perform("save", {"name": run_id + "-dv-" + str(vote_steps)}):
 		return false
@@ -1234,9 +1234,9 @@ func vote_matches(name: String, step: String) -> bool:
 	return true
 
 func observe_vote_lock(busy: bool) -> void:
-	if not app.vote_transaction:
+	if not app.vote_panel_inst.transaction:
 		return
-	vote_lock_valid = vote_lock_valid and app._input_locked() and app.vote_picker.disabled
+	vote_lock_valid = vote_lock_valid and app._input_locked() and app.vote_panel_inst.picker.disabled
 	for control in app.buttons:
 		vote_lock_valid = vote_lock_valid and control.disabled
 	if not busy:
@@ -1269,49 +1269,49 @@ func verify_vote_stamps() -> bool:
 	if not await load_vote("choices"):
 		return false
 	var revision: int = app.client.revision
-	if not check(app.vote_picker.selected == -1 and app.vote_submit.disabled and not app.vote_abstain.disabled, "投票默认不选、不默认弃权"):
+	if not check(app.vote_panel_inst.picker.selected == -1 and app.vote_panel_inst.submit.disabled and not app.vote_panel_inst.abstain.disabled, "投票默认不选、不默认弃权"):
 		return false
-	if not await pick_vote("Greece") or not await click_control(app.vote_submit):
+	if not await pick_vote("Greece") or not await click_control(app.vote_panel_inst.submit):
 		return false
-	var previous: Dictionary = app.vote_payload.duplicate(true)
+	var previous: Dictionary = app.vote_panel_inst.payload.duplicate(true)
 	if not await click_vote_dialog(false) or not await pick_vote("Egypt"):
 		return false
-	if not check(not app._vote_stamp_valid(previous.stamp), "真实候选切换使旧确认失效"):
+	if not check(not app.vote_panel_inst.stamp_valid(previous.stamp), "真实候选切换使旧确认失效"):
 		return false
-	if not await click_control(app.vote_submit):
+	if not await click_control(app.vote_panel_inst.submit):
 		return false
 	await diplomacy_key(KEY_ESCAPE)
 	await settle()
-	if not check(app.client.revision == revision and app.vote_payload.is_empty() and not app.vote_confirmation.visible, "投票取消与 Escape 零写入"):
+	if not check(app.client.revision == revision and app.vote_panel_inst.payload.is_empty() and not app.vote_panel_inst.confirmation.visible, "投票取消与 Escape 零写入"):
 		return false
 	for key in ["revision", "loadEpoch", "selectionGeneration", "voteGeneration", "session", "gameId", "player", "mode", "choice", "civId", "ticket"]:
-		if not await pick_vote("Greece") or not await click_control(app.vote_submit):
+		if not await pick_vote("Greece") or not await click_control(app.vote_panel_inst.submit):
 			return false
-		var old = app.vote_payload.stamp[key]
-		app.vote_payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		var old = app.vote_panel_inst.payload.stamp[key]
+		app.vote_panel_inst.payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
 		if not await click_vote_dialog(true) or not check(app.client.revision == revision, "本地旧投票确认注入拒绝：" + key):
 			return false
-	var fresh: Dictionary = app.vote_stamp.duplicate(true)
-	var data: Dictionary = app.vote_data.duplicate(true)
+	var fresh: Dictionary = app.vote_panel_inst.stamp.duplicate(true)
+	var data: Dictionary = app.vote_panel_inst.data.duplicate(true)
 	for key in ["revision", "loadEpoch", "selectionGeneration", "voteGeneration", "session", "gameId", "player"]:
 		var stale := fresh.duplicate(true)
 		var old = stale[key]
 		stale[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
-		if not check(not app._apply_vote_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale) and app.vote_data == data, "本地旧投票响应不回填：" + key):
+		if not check(not app.vote_panel_inst.apply_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale) and app.vote_panel_inst.data == data, "本地旧投票响应不回填：" + key):
 			return false
-	if not await pick_vote("Greece") or not await click_control(app.vote_submit) or not await perform("snapshot"):
+	if not await pick_vote("Greece") or not await click_control(app.vote_panel_inst.submit) or not await perform("snapshot"):
 		return false
-	if not check(app.vote_payload.is_empty() and not app.vote_confirmation.visible, "手动 snapshot 废弃投票确认"):
+	if not check(app.vote_panel_inst.payload.is_empty() and not app.vote_panel_inst.confirmation.visible, "手动 snapshot 废弃投票确认"):
 		return false
-	if not await pick_vote("Greece") or not await click_control(app.vote_submit) or not await load_vote("choices"):
+	if not await pick_vote("Greece") or not await click_control(app.vote_panel_inst.submit) or not await load_vote("choices"):
 		return false
-	if not check(not app._vote_stamp_valid(fresh) and app.vote_payload.is_empty(), "同存档 load 废弃投票确认"):
+	if not check(not app.vote_panel_inst.stamp_valid(fresh) and app.vote_panel_inst.payload.is_empty(), "同存档 load 废弃投票确认"):
 		return false
 	revision = app.client.revision
-	if not await pick_vote("Greece") or not await click_control(app.vote_submit):
+	if not await pick_vote("Greece") or not await click_control(app.vote_panel_inst.submit):
 		return false
-	app.vote_payload.params.decisionToken = "expired-ticket-injection"
-	if not await click_vote_dialog(true) or not check(app.client.revision == revision and app.vote_picker.selected == -1, "网关旧票据拒绝只刷新、不重交"):
+	app.vote_panel_inst.payload.params.decisionToken = "expired-ticket-injection"
+	if not await click_vote_dialog(true) or not check(app.client.revision == revision and app.vote_panel_inst.picker.selected == -1, "网关旧票据拒绝只刷新、不重交"):
 		return false
 	if not await click_control(find_by_name(app, "DiplomaticVoteBack")) or not check(app.turn_button.disabled, "关闭投票面板保留待决"):
 		return false
@@ -1324,7 +1324,7 @@ func verify_vote_transport() -> bool:
 			var scenario := "choices" if cast else "results-edge-tie"
 			if not await load_vote(scenario):
 				return false
-			if cast and (not await pick_vote("Greece") or not await click_control(app.vote_submit)):
+			if cast and (not await pick_vote("Greece") or not await click_control(app.vote_panel_inst.submit)):
 				return false
 			var original = app.client
 			var revision: int = original.revision
@@ -1333,7 +1333,7 @@ func verify_vote_transport() -> bool:
 			fault.drop_writes = 1 if mode == "retry" else 2
 			fault.fail_query = mode if mode in ["snapshot", "diplomaticVoteOptions"] else ""
 			swap_great_person_test_client(fault)
-			var clicked := await click_vote_dialog(true, true) if cast else await click_control(app.vote_continue)
+			var clicked := await click_vote_dialog(true, true) if cast else await click_control(app.vote_panel_inst.continue_button)
 			var writes: Array = fault.trace.filter(func(entry): return entry.request.action == action)
 			var query_order: Array = fault.trace.filter(func(entry): return entry.request.action != action).map(func(entry): return entry.request.action)
 			var expected_order: Array = ["diplomaticVoteOptions"] if mode == "retry" else ["snapshot", "diplomaticVoteOptions"]
@@ -1342,9 +1342,9 @@ func verify_vote_transport() -> bool:
 			elif mode == "diplomaticVoteOptions":
 				expected_order = ["snapshot", "diplomaticVoteOptions", "diplomaticVoteOptions"]
 			var uncertain: bool = not fault.fail_query.is_empty()
-			var guarded: bool = app.vote_submit.disabled and app.vote_abstain.disabled and app.vote_continue.disabled and app.vote_uncertain == uncertain and not app.vote_transaction
+			var guarded: bool = app.vote_panel_inst.submit.disabled and app.vote_panel_inst.abstain.disabled and app.vote_panel_inst.continue_button.disabled and app.vote_panel_inst.uncertain == uncertain and not app.vote_panel_inst.transaction
 			if uncertain:
-				guarded = guarded and app.vote_data.is_empty() and app.vote_description.text.contains("状态未确认")
+				guarded = guarded and app.vote_panel_inst.data.is_empty() and app.vote_panel_inst.description.text.contains("状态未确认")
 			var path: String = "res://.local/" + run_id + "-dv-transport-" + action + "-" + mode + ".json"
 			var file := FileAccess.open(path, FileAccess.WRITE)
 			file.store_string(JSON.stringify({"method": "客户端边界故障注入；写操作仍走真实 HTTP", "trace": fault.trace, "guarded": guarded}))
@@ -1359,13 +1359,13 @@ func verify_vote_transport() -> bool:
 			if uncertain:
 				await screenshot("smoke-vote-uncertain-" + action + "-" + mode + ".png")
 				var requests: int = original.request_counter
-				for control in [app.vote_submit, app.vote_abstain, app.vote_continue]:
+				for control in [app.vote_panel_inst.submit, app.vote_panel_inst.abstain, app.vote_panel_inst.continue_button]:
 					scroll_into_view(control)
 					await settle()
 					await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, control.get_global_rect().get_center())
-				if not check(original.request_counter == requests, "状态未确认真实点击零请求") or not await click_control(app.vote_open):
+				if not check(original.request_counter == requests, "状态未确认真实点击零请求") or not await click_control(app.vote_panel_inst.open_button):
 					return false
-			if not check(original.revision == revision + 1 and not app.vote_uncertain, "恢复后仅一次写入、不自动重交"):
+			if not check(original.revision == revision + 1 and not app.vote_panel_inst.uncertain, "恢复后仅一次写入、不自动重交"):
 				return false
 			if not await vote_matches(scenario, "choices-2-diplomaticVoteCast" if cast else "results-edge-tie-2-diplomaticVoteAcknowledge"):
 				return false
@@ -1386,21 +1386,21 @@ func verify_vote_sequence(scenario: Dictionary) -> bool:
 					return false
 				if params.choice == "civilization" and not await pick_vote(params.civId):
 					return false
-				if not await click_control(app.vote_abstain if params.choice == "abstain" else app.vote_submit):
+				if not await click_control(app.vote_panel_inst.abstain if params.choice == "abstain" else app.vote_panel_inst.submit):
 					return false
-				app.vote_confirmation.get_ok_button().grab_focus()
+				app.vote_panel_inst.confirmation.get_ok_button().grab_focus()
 				await diplomacy_key(KEY_ENTER)
 				await settle()
-				if not check(app.client.revision == revision + 1 and app.vote_submit.disabled and app.vote_abstain.disabled and app.vote_data.get("results") == null, "明确投票／弃权一次提交，未公布前无票数"):
+				if not check(app.client.revision == revision + 1 and app.vote_panel_inst.submit.disabled and app.vote_panel_inst.abstain.disabled and app.vote_panel_inst.data.get("results") == null, "明确投票／弃权一次提交，未公布前无票数"):
 					return false
 			"diplomaticVoteAcknowledge":
 				if not await open_vote():
 					return false
 				if not await click_control(find_by_name(app, "DiplomaticVoteBack")) or not check(app.turn_button.disabled, "返回地图保留结果待决") or not await open_vote():
 					return false
-				if not await click_control(app.vote_continue):
+				if not await click_control(app.vote_panel_inst.continue_button):
 					return false
-				if not check(app.client.revision == revision + 1 and app.vote_data.results.acknowledged and app.vote_continue.disabled, "结果确认仅提交一次、保留可读结果"):
+				if not check(app.client.revision == revision + 1 and app.vote_panel_inst.data.results.acknowledged and app.vote_panel_inst.continue_button.disabled, "结果确认仅提交一次、保留可读结果"):
 					return false
 			"nextTurn":
 				if not await click_control(app.turn_button):
@@ -1428,28 +1428,28 @@ func verify_vote_sizes() -> bool:
 			return false
 		await screenshot("smoke-vote-" + size_name + "-candidates.png")
 		for choice in ["civilization", "abstain"]:
-			if not await click_control(app.vote_submit if choice == "civilization" else app.vote_abstain):
+			if not await click_control(app.vote_panel_inst.submit if choice == "civilization" else app.vote_panel_inst.abstain):
 				return false
 			await screenshot("smoke-vote-" + size_name + "-confirm-" + choice + ".png")
 			if not await click_vote_dialog(false):
 				return false
 		if not await load_vote("results-edge-hidden"):
 			return false
-		scroll_into_view(app.vote_results.get_parent())
+		scroll_into_view(app.vote_panel_inst.results.get_parent())
 		await settle()
 		await screenshot("smoke-vote-" + size_name + "-results.png")
-		var layout: Dictionary = app.vote_data.duplicate(true)
+		var layout: Dictionary = app.vote_panel_inst.data.duplicate(true)
 		layout.results.rows[0].name = "长名称布局样例·联合国外交投票公开明细·中文与换行"
 		layout.results.winnerText = "仅布局注入：本轮不可改票；结果表按原生返回。".repeat(12)
-		if not check(app._apply_vote_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": layout}, app.vote_stamp), "外交结果长文本本地布局注入"):
+		if not check(app.vote_panel_inst.apply_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": layout}, app.vote_panel_inst.stamp), "外交结果长文本本地布局注入"):
 			return false
 		await settle()
 		await screenshot("smoke-vote-" + size_name + "-long-injected.png")
-		var scroll: ScrollContainer = app.vote_results.get_parent()
+		var scroll: ScrollContainer = app.vote_panel_inst.results.get_parent()
 		scroll.scroll_vertical = int(scroll.get_v_scroll_bar().max_value)
 		await settle()
 		await screenshot("smoke-vote-" + size_name + "-long-scrolled.png")
-		if not check(app.vote_results.size.x <= app.tabs.size.x and scroll.get_v_scroll_bar().max_value > scroll.size.y, "投票长名称换行、结果可滚动且不横向溢出"):
+		if not check(app.vote_panel_inst.results.size.x <= app.tabs.size.x and scroll.get_v_scroll_bar().max_value > scroll.size.y, "投票长名称换行、结果可滚动且不横向溢出"):
 			return false
 		window_sizes_checked.append("diplomatic-vote-" + size_name)
 	get_window().size = original
@@ -1650,12 +1650,12 @@ func verify_combat_flow() -> bool:
 
 # —— 外交：业务写入只由真实窗口控件触发；注入仅用于显式陈旧响应测试。 ——
 func observe_diplomacy_lock(busy: bool) -> void:
-	if not app.diplomacy_transaction:
+	if not app.diplomacy_panel_inst.transaction:
 		return
 	for control in app.buttons:
 		diplomacy_lock_valid = diplomacy_lock_valid and control.disabled
-	diplomacy_lock_valid = diplomacy_lock_valid and app.diplomacy_picker.disabled \
-		and not app.diplomacy_our_gold.editable and not app.diplomacy_their_gold.editable \
+	diplomacy_lock_valid = diplomacy_lock_valid and app.diplomacy_panel_inst.picker.disabled \
+		and not app.diplomacy_panel_inst.our_gold.editable and not app.diplomacy_panel_inst.their_gold.editable \
 		and app.tabs.get_tab_bar().mouse_filter == Control.MOUSE_FILTER_IGNORE
 	if not busy:
 		diplomacy_lock_handoffs += 1
@@ -1684,7 +1684,7 @@ func observe_diplomacy_lock(busy: bool) -> void:
 		var wheel_release := InputEventMouseButton.new()
 		wheel_release.button_index = MOUSE_BUTTON_WHEEL_UP
 		push_window_input(get_viewport(), wheel_release, pos)
-		diplomacy_pan_result = {"locked": app._input_locked(), "transaction": app.diplomacy_transaction,
+		diplomacy_pan_result = {"locked": app._input_locked(), "transaction": app.diplomacy_panel_inst.transaction,
 			"before": str(before), "dragged": str(dragged), "after": str(app.map.position), "zoomBefore": str(zoom), "zoomAfter": str(app.map.scale)}
 		diplomacy_lock_valid = diplomacy_lock_valid and dragged != before and app.map.scale != zoom
 
@@ -1692,21 +1692,21 @@ func load_diplomacy(name: String, matters := false) -> bool:
 	if not await perform("load", {"path": ProjectSettings.globalize_path("res://.local/tests/diplomacy-" + name + ".json")}):
 		return false
 	if matters:
-		if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.diplomacy_open_button):
+		if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.diplomacy_panel_inst.open_button):
 			return false
 	elif not await click_tab(app.tabs, app.TAB_DIPLOMACY):
 		return false
-	for i in range(app.diplomacy_picker.item_count):
-		if app.diplomacy_picker.get_item_text(i) == "Greece":
-			if app.diplomacy_picker.selected != i and not await click_option(app.diplomacy_picker, i):
+	for i in range(app.diplomacy_panel_inst.picker.item_count):
+		if app.diplomacy_panel_inst.picker.get_item_text(i) == "Greece":
+			if app.diplomacy_panel_inst.picker.selected != i and not await click_option(app.diplomacy_panel_inst.picker, i):
 				return false
-	return check(not app.diplomacy_data.is_empty(), "外交详情已取得新版本")
+	return check(not app.diplomacy_panel_inst.data.is_empty(), "外交详情已取得新版本")
 
 func diplomacy_control(choice: String, pending := false):
-	return find_by_name(app.diplomacy_pending if pending else app.diplomacy_details, "Diplomacy_" + choice)
+	return find_by_name(app.diplomacy_panel_inst.pending if pending else app.diplomacy_panel_inst.details, "Diplomacy_" + choice)
 
 func click_diplomacy_dialog(confirm: bool, twice := false) -> bool:
-	var dialog: ConfirmationDialog = app.diplomacy_confirmation
+	var dialog: ConfirmationDialog = app.diplomacy_panel_inst.confirmation
 	if not check(dialog.visible, "外交确认可见"):
 		return false
 	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
@@ -1725,7 +1725,7 @@ func click_diplomacy_dialog(confirm: bool, twice := false) -> bool:
 	if twice:
 		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
 	await settle()
-	return check(not dialog.visible and app.diplomacy_payload.is_empty(), "外交确认关闭且载荷清空")
+	return check(not dialog.visible and app.diplomacy_panel_inst.payload.is_empty(), "外交确认关闭且载荷清空")
 
 func diplomacy_key(code: Key, unicode_value := 0, ctrl := false) -> void:
 	for pressed in [true, false]:
@@ -1764,7 +1764,7 @@ func normalize_diplomacy(value, key := ""):
 	return value
 
 func diplomacy_matches(step: String) -> bool:
-	if not check(not app.diplomacy_transaction and not app.client.busy, "外交事务完整解锁：" + step):
+	if not check(not app.diplomacy_panel_inst.transaction and not app.client.busy, "外交事务完整解锁：" + step):
 		return false
 	if not await perform("save", {"name": run_id + "-dip-" + step}):
 		return false
@@ -1792,14 +1792,14 @@ func verify_diplomacy_flow() -> bool:
 	app.client.busy_changed.connect(observe_diplomacy_lock)
 	if not await load_diplomacy("peace") or not await diplomacy_matches("peace-initial"):
 		return false
-	var selected: String = app.diplomacy_civ_id
-	var old_stamp: Dictionary = app.diplomacy_stamp.duplicate(true)
-	if not await click_option(app.diplomacy_picker, 0 if app.diplomacy_picker.selected != 0 else 1):
+	var selected: String = app.diplomacy_panel_inst.civ_id
+	var old_stamp: Dictionary = app.diplomacy_panel_inst.stamp.duplicate(true)
+	if not await click_option(app.diplomacy_panel_inst.picker, 0 if app.diplomacy_panel_inst.picker.selected != 0 else 1):
 		return false
-	if not check(not app._diplomacy_stamp_valid(old_stamp) and app.diplomacy_our_gold.value == 0, "切文明使旧详情失效并清空金额"):
+	if not check(not app.diplomacy_panel_inst.stamp_valid(old_stamp) and app.diplomacy_panel_inst.our_gold.value == 0, "切文明使旧详情失效并清空金额"):
 		return false
-	for i in range(app.diplomacy_picker.item_count):
-		if str(app.diplomacy_picker.get_item_metadata(i)) == selected and not await click_option(app.diplomacy_picker, i):
+	for i in range(app.diplomacy_panel_inst.picker.item_count):
+		if str(app.diplomacy_panel_inst.picker.get_item_metadata(i)) == selected and not await click_option(app.diplomacy_panel_inst.picker, i):
 			return false
 	var revision: int = app.client.revision
 	for attempt in range(3):
@@ -1819,7 +1819,7 @@ func verify_diplomacy_flow() -> bool:
 		return false
 	if not await load_diplomacy("war") or not await diplomacy_matches("war-initial"):
 		return false
-	if not await click_control(app.diplomacy_gold_box.get_node("ProposePeace")) or not await click_diplomacy_dialog(true):
+	if not await click_control(app.diplomacy_panel_inst.gold_box.get_node("ProposePeace")) or not await click_diplomacy_dialog(true):
 		return false
 	if not check(app.message.text.contains("仍在战争"), "发送完成提示不被详情刷新覆盖") or not await diplomacy_matches("war-pure"):
 		return false
@@ -1828,14 +1828,14 @@ func verify_diplomacy_flow() -> bool:
 	if not await click_control(diplomacy_control("retract")):
 		return false
 	# 注入业务票据错误验证内核拒绝后的刷新；提交仍由真实确认按钮触发。
-	app.diplomacy_payload.params.tradeToken = "expired-ticket-injection"
+	app.diplomacy_panel_inst.payload.params.tradeToken = "expired-ticket-injection"
 	if not await click_diplomacy_dialog(true) or not check(app.client.revision == revision and app.message.text.contains("重新确认"), "票据拒绝仅刷新且保留内核原因，不自动重交"):
 		return false
 	if not await click_control(diplomacy_control("retract")) or not await click_diplomacy_dialog(true) or not await diplomacy_matches("war-retract"):
 		return false
-	if not await enter_gold(app.diplomacy_our_gold, 1000) or not await enter_gold(app.diplomacy_their_gold, 0):
+	if not await enter_gold(app.diplomacy_panel_inst.our_gold, 1000) or not await enter_gold(app.diplomacy_panel_inst.their_gold, 0):
 		return false
-	if not await click_control(app.diplomacy_gold_box.get_node("ProposePeace")):
+	if not await click_control(app.diplomacy_panel_inst.gold_box.get_node("ProposePeace")):
 		return false
 	await screenshot("smoke-diplomacy-gold-confirm.png")
 	if not await click_diplomacy_dialog(true) or not await diplomacy_matches("war-gold"):
@@ -1867,24 +1867,24 @@ func verify_diplomacy_flow() -> bool:
 			if pair[0] in new_alerts:
 				if not await diplomacy_matches(pair[0] + "-initial") or not await click_control(diplomacy_control(choice, true)):
 					return false
-				var stale_confirmation: Dictionary = app.diplomacy_payload.stamp.duplicate(true)
+				var stale_confirmation: Dictionary = app.diplomacy_panel_inst.payload.stamp.duplicate(true)
 				if not await perform("load", {"path": app.last_saved_path}):
 					return false
-				if not check(not app.diplomacy_confirmation.visible and app.diplomacy_payload.is_empty()
-						and not app._diplomacy_stamp_valid(stale_confirmation), "新事件未处理重载保留待决并废弃旧确认：" + pair[0]):
+				if not check(not app.diplomacy_panel_inst.confirmation.visible and app.diplomacy_panel_inst.payload.is_empty()
+						and not app.diplomacy_panel_inst.stamp_valid(stale_confirmation), "新事件未处理重载保留待决并废弃旧确认：" + pair[0]):
 					return false
 				# 重载会回到单位页；从事项入口重新取得当前事件详情后再操作。
-				if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.diplomacy_open_button):
+				if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.diplomacy_panel_inst.open_button):
 					return false
-				if not check(app.diplomacy_data.get("pendingAlert", {}).get("type", "") == pair[0], "重载后重新打开同一待决事件：" + pair[0]):
+				if not check(app.diplomacy_panel_inst.data.get("pendingAlert", {}).get("type", "") == pair[0], "重载后重新打开同一待决事件：" + pair[0]):
 					return false
 			if not await click_control(diplomacy_control(choice, true)):
 				return false
 			if pair[0] in new_alerts:
-				var option: Dictionary = app.diplomacy_data.pendingAlert.choices.filter(func(item): return item.id == choice)[0]
-				if not check(not str(option.description).is_empty() and app.diplomacy_confirmation.dialog_text.contains(option.description), "新事件确认完整显示后果：" + choice):
+				var option: Dictionary = app.diplomacy_panel_inst.data.pendingAlert.choices.filter(func(item): return item.id == choice)[0]
+				if not check(not str(option.description).is_empty() and app.diplomacy_panel_inst.confirmation.dialog_text.contains(option.description), "新事件确认完整显示后果：" + choice):
 					return false
-			if choice == "refuseAndDeclareWar" and not check(app.diplomacy_confirmation.dialog_text.contains("拒绝并宣战"), "不攻击拒绝明确提示战争"):
+			if choice == "refuseAndDeclareWar" and not check(app.diplomacy_panel_inst.confirmation.dialog_text.contains("拒绝并宣战"), "不攻击拒绝明确提示战争"):
 				return false
 			revision = app.client.revision
 			if not await click_diplomacy_dialog(false) or not check(app.client.revision == revision, "事件取消零写入：" + pair[0]):
@@ -1915,8 +1915,8 @@ func verify_spy_transport() -> bool:
 				return false
 			var original = app.client
 			var revision: int = original.revision
-			var stale: Dictionary = app.diplomacy_payload.duplicate(true)
-			var old_data: Dictionary = app.diplomacy_data.duplicate(true)
+			var stale: Dictionary = app.diplomacy_panel_inst.payload.duplicate(true)
+			var old_data: Dictionary = app.diplomacy_panel_inst.data.duplicate(true)
 			var fault := DiplomacyFaultClient.new()
 			app.add_child(fault)
 			fault.drop_writes = 1 if mode == "retry" else 2
@@ -1931,10 +1931,10 @@ func verify_spy_transport() -> bool:
 			elif mode == "diplomacyOptions":
 				expected_order = ["snapshot", "diplomacyOptions", "diplomacyOptions"]
 			var uncertain := not fault.fail_query.is_empty()
-			var guarded: bool = app.diplomacy_uncertain == uncertain and not app.diplomacy_transaction and not fault.busy \
-				and app.diplomacy_payload.is_empty() and not app.diplomacy_confirmation.visible
+			var guarded: bool = app.diplomacy_panel_inst.uncertain == uncertain and not app.diplomacy_panel_inst.transaction and not fault.busy \
+				and app.diplomacy_panel_inst.payload.is_empty() and not app.diplomacy_panel_inst.confirmation.visible
 			if uncertain:
-				guarded = guarded and app.diplomacy_data.is_empty() and app.diplomacy_stamp.is_empty() and diplomacy_control(choice, true) == null
+				guarded = guarded and app.diplomacy_panel_inst.data.is_empty() and app.diplomacy_panel_inst.stamp.is_empty() and diplomacy_control(choice, true) == null
 			var path: String = "res://.local/" + run_id + "-spy-transport-" + kind + "-" + mode + ".json"
 			var evidence := FileAccess.open(path, FileAccess.WRITE)
 			evidence.store_string(JSON.stringify({"method": "客户端边界丢响应注入，写入仍为真实HTTP", "trace": fault.trace, "guarded": guarded}, "\t"))
@@ -1946,7 +1946,7 @@ func verify_spy_transport() -> bool:
 				return false
 			if not check(writes.size() == 2 and writes[0].request == writes[1].request and writes[0].answer == writes[1].answer and writes[0].answer.ok, "间谍外交同请求重试、仅一次写入：" + kind + "/" + mode):
 				return false
-			if not check(not app._apply_diplomacy_response({"ok": true, "session": stale.stamp.session, "revision": stale.stamp.revision, "data": old_data}, stale.stamp), "恢复后拒绝旧外交响应回填"):
+			if not check(not app.diplomacy_panel_inst.apply_response({"ok": true, "session": stale.stamp.session, "revision": stale.stamp.revision, "data": old_data}, stale.stamp), "恢复后拒绝旧外交响应回填"):
 				return false
 			if uncertain:
 				await screenshot("smoke-spy-uncertain-" + kind + "-" + mode + ".png")
@@ -1954,11 +1954,11 @@ func verify_spy_transport() -> bool:
 				if not check(refresh.size() == 1, "外交不确定状态仍有刷新入口") or not await click_control(refresh[0]):
 					return false
 				# 原选择已销毁；显式旧确认注入也只能刷新，不能重交写请求。
-				app.diplomacy_payload = stale
-				await app._confirm_diplomacy()
-				if not check(not app.diplomacy_confirmation.visible and app.diplomacy_payload.is_empty(), "间谍旧确认不可重交"):
+				app.diplomacy_panel_inst.payload = stale
+				await app.diplomacy_panel_inst.confirm_diplomacy()
+				if not check(not app.diplomacy_panel_inst.confirmation.visible and app.diplomacy_panel_inst.payload.is_empty(), "间谍旧确认不可重交"):
 					return false
-			if not check(original.revision == revision + 1 and not app.diplomacy_uncertain, "间谍恢复真实版本、不重复处置") or not await diplomacy_matches(kind + "-" + choice):
+			if not check(original.revision == revision + 1 and not app.diplomacy_panel_inst.uncertain, "间谍恢复真实版本、不重复处置") or not await diplomacy_matches(kind + "-" + choice):
 				return false
 	return true
 
@@ -1967,36 +1967,36 @@ func verify_diplomacy_stamps() -> bool:
 	if not await click_control(diplomacy_control("declareWar")):
 		return false
 	await diplomacy_key(KEY_ESCAPE)
-	if not check(not app.diplomacy_confirmation.visible and app.diplomacy_payload.is_empty(), "外交Esc清空确认载荷"):
+	if not check(not app.diplomacy_panel_inst.confirmation.visible and app.diplomacy_panel_inst.payload.is_empty(), "外交Esc清空确认载荷"):
 		return false
 	if not await click_control(diplomacy_control("declareWar")):
 		return false
-	var dialog: ConfirmationDialog = app.diplomacy_confirmation
+	var dialog: ConfirmationDialog = app.diplomacy_panel_inst.confirmation
 	var close_pos := Vector2(dialog.position) + Vector2(dialog.size.x - dialog.get_theme_constant("close_h_offset", "Window"),
 		-dialog.get_theme_constant("close_v_offset", "Window")) + dialog.get_theme_icon("close", "Window").get_size() / 2
 	await push_mouse(MOUSE_BUTTON_LEFT, close_pos)
 	await settle()
-	if not check(not dialog.visible and app.diplomacy_payload.is_empty() and app.client.revision == revision, "外交关闭窗口零写入"):
+	if not check(not dialog.visible and app.diplomacy_panel_inst.payload.is_empty() and app.client.revision == revision, "外交关闭窗口零写入"):
 		return false
 	for key in ["revision", "loadEpoch", "selectionGeneration", "diplomacyGeneration", "session", "gameId", "civId", "ticket"]:
 		if not await click_control(diplomacy_control("declareWar")):
 			return false
-		var old = app.diplomacy_payload.stamp[key]
-		app.diplomacy_payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		var old = app.diplomacy_panel_inst.payload.stamp[key]
+		app.diplomacy_panel_inst.payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
 		if not await click_diplomacy_dialog(true) or not check(app.client.revision == revision and app.message.text.contains("失效"), "注入旧外交确认拒绝提交：" + key):
 			return false
-	var fresh: Dictionary = app.diplomacy_stamp.duplicate(true)
-	var data: Dictionary = app.diplomacy_data.duplicate(true)
+	var fresh: Dictionary = app.diplomacy_panel_inst.stamp.duplicate(true)
+	var data: Dictionary = app.diplomacy_panel_inst.data.duplicate(true)
 	for key in ["revision", "loadEpoch", "selectionGeneration", "diplomacyGeneration", "session", "gameId", "civId"]:
 		var stale := fresh.duplicate(true)
 		var old = stale[key]
 		stale[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
-		if not check(not app._apply_diplomacy_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale)
-				and app.diplomacy_data == data, "注入旧外交响应不回填：" + key):
+		if not check(not app.diplomacy_panel_inst.apply_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale)
+				and app.diplomacy_panel_inst.data == data, "注入旧外交响应不回填：" + key):
 			return false
 	if not await click_control(diplomacy_control("declareWar")) or not await load_diplomacy("peace"):
 		return false
-	return check(not app._diplomacy_stamp_valid(fresh) and not dialog.visible and app.diplomacy_payload.is_empty(), "同存档重载关闭外交确认且旧stamp失效")
+	return check(not app.diplomacy_panel_inst.stamp_valid(fresh) and not dialog.visible and app.diplomacy_panel_inst.payload.is_empty(), "同存档重载关闭外交确认且旧stamp失效")
 
 func verify_diplomacy_sizes() -> bool:
 	var original := get_window().size
@@ -2011,12 +2011,12 @@ func verify_diplomacy_sizes() -> bool:
 		if not await click_diplomacy_dialog(false):
 			return false
 		# 显式布局注入：长名称／长警告不改变内核，只检查展示与取消，不作为玩法证据。
-		var long_data: Dictionary = app.diplomacy_data.duplicate(true)
+		var long_data: Dictionary = app.diplomacy_panel_inst.data.duplicate(true)
 		for civ in long_data.civilizations:
-			if str(civ.civId) == app.diplomacy_civ_id:
+			if str(civ.civId) == app.diplomacy_panel_inst.civ_id:
 				civ.name = "长名称布局注入·已接触文明的完整显示名称·验证折行与省略"
 				civ.warWarnings.append("长警告布局注入：宣战会取消相关条约和交易，并可能导致盟友连带参战，请核对不攻击承诺。")
-		if not check(app._apply_diplomacy_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": long_data}, app.diplomacy_stamp), label + " 长文本布局注入"):
+		if not check(app.diplomacy_panel_inst.apply_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": long_data}, app.diplomacy_panel_inst.stamp), label + " 长文本布局注入"):
 			return false
 		if not await click_control(diplomacy_control("declareWar")):
 			return false
@@ -2028,14 +2028,14 @@ func verify_diplomacy_sizes() -> bool:
 		await screenshot("smoke-diplomacy-" + label + "-incoming.png")
 		if not await click_diplomacy_dialog(false) or not await load_diplomacy("war"):
 			return false
-		for control in [app.diplomacy_picker, app.diplomacy_our_gold, app.diplomacy_their_gold, app.diplomacy_gold_box.get_node("ProposePeace")]:
+		for control in [app.diplomacy_panel_inst.picker, app.diplomacy_panel_inst.our_gold, app.diplomacy_panel_inst.their_gold, app.diplomacy_panel_inst.gold_box.get_node("ProposePeace")]:
 			scroll_into_view(control)
 			await get_tree().process_frame
 			await get_tree().process_frame
 			if not check(get_viewport().get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34, label + " 外交选择／金额／按钮可见可点"):
 				return false
-		if not await enter_gold(app.diplomacy_our_gold, 321) or not await enter_gold(app.diplomacy_their_gold, 123) \
-				or not await click_control(app.diplomacy_gold_box.get_node("ProposePeace")):
+		if not await enter_gold(app.diplomacy_panel_inst.our_gold, 321) or not await enter_gold(app.diplomacy_panel_inst.their_gold, 123) \
+				or not await click_control(app.diplomacy_panel_inst.gold_box.get_node("ProposePeace")):
 			return false
 		await screenshot("smoke-diplomacy-" + label + "-gold.png")
 		if not await click_diplomacy_dialog(false) or not await load_diplomacy("AttackedProtectedMinor", true):
@@ -2050,7 +2050,7 @@ func verify_diplomacy_sizes() -> bool:
 			for choice in ["agree", "refuse"]:
 				if not await load_diplomacy(kind, true) or not await click_control(diplomacy_control(choice, true)):
 					return false
-				if not check(app.diplomacy_confirmation.dialog_text.contains("间谍任务") and app.diplomacy_confirmation.dialog_text.contains("违约惩罚"), label + " 间谍确认完整后果"):
+				if not check(app.diplomacy_panel_inst.confirmation.dialog_text.contains("间谍任务") and app.diplomacy_panel_inst.confirmation.dialog_text.contains("违约惩罚"), label + " 间谍确认完整后果"):
 					return false
 				await screenshot("smoke-spy-" + label + "-" + kind + "-" + choice + ".png")
 				var revision: int = app.client.revision
@@ -2062,7 +2062,7 @@ func verify_diplomacy_sizes() -> bool:
 
 # —— 宗教：两步流程（使用预言家→选择信条）只由真实控件及模态窗口输入触发，逐步比较独立原生期望 ——
 func observe_religion_lock(busy: bool) -> void:
-	if not app.religion_transaction:
+	if not app.religion_panel_inst.transaction:
 		return
 	for control in app.buttons:
 		religion_lock_valid = religion_lock_valid and control.disabled
@@ -2095,7 +2095,7 @@ func observe_religion_lock(busy: bool) -> void:
 		wheel_release.button_index = MOUSE_BUTTON_WHEEL_UP
 		wheel_release.pressed = false
 		push_window_input(get_viewport(), wheel_release, pos)
-		religion_pan_result = {"locked": app._input_locked(), "transaction": app.religion_transaction,
+		religion_pan_result = {"locked": app._input_locked(), "transaction": app.religion_panel_inst.transaction,
 			"before": str(before), "dragged": str(dragged), "after": str(app.map.position), "zoomBefore": str(zoom), "zoomAfter": str(app.map.scale)}
 		religion_lock_valid = religion_lock_valid and dragged != before and app.map.scale != zoom
 
@@ -2103,23 +2103,23 @@ func load_religion(name: String, via_matters := false) -> bool:
 	if not await perform("load", {"path": ProjectSettings.globalize_path("res://.local/tests/religion-" + name + ".json")}):
 		return false
 	if via_matters:
-		if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.religion_open_button):
+		if not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(app.religion_panel_inst.open_button):
 			return false
 	elif not await click_tab(app.tabs, app.TAB_RELIGION):
 		return false
-	return check(not app.religion_data.is_empty(), "宗教详情已取得新版本")
+	return check(not app.religion_panel_inst.data.is_empty(), "宗教详情已取得新版本")
 
 func religion_control(target_name: String):
-	return find_by_name(app.religion_decision_box, target_name)
+	return find_by_name(app.religion_panel_inst.decision_box, target_name)
 
 func religion_prophet_button(mode: String):
-	for child in app.religion_prophets_box.get_children():
+	for child in app.religion_panel_inst.prophets_box.get_children():
 		if child is Button and str(child.name).ends_with("_" + mode) and not child.disabled:
 			return child
 	return null
 
 func click_religion_dialog(confirm: bool, twice := false) -> bool:
-	var dialog: ConfirmationDialog = app.religion_confirmation
+	var dialog: ConfirmationDialog = app.religion_panel_inst.confirmation
 	if not check(dialog.visible, "宗教确认可见"):
 		return false
 	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
@@ -2138,11 +2138,11 @@ func click_religion_dialog(confirm: bool, twice := false) -> bool:
 	if twice:
 		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
 	await settle()
-	return check(not dialog.visible and app.religion_payload.is_empty(), "宗教确认关闭且载荷清空")
+	return check(not dialog.visible and app.religion_panel_inst.payload.is_empty(), "宗教确认关闭且载荷清空")
 
 # 真实键盘输入宗教名称（含中文／重音）：聚焦命名框后逐字符投递带 unicode 的按键事件。
 func enter_religion_name(text: String) -> bool:
-	var edit: LineEdit = app.religion_name_edit
+	var edit: LineEdit = app.religion_panel_inst.name_edit
 	if not check(edit != null and is_instance_valid(edit), "宗教命名框存在"):
 		return false
 	if not await click_control(edit):
@@ -2170,7 +2170,7 @@ func normalize_religion(value, key := ""):
 	return value
 
 func religion_matches(step: String) -> bool:
-	if not check(not app.religion_transaction and not app.client.busy, "宗教事务完整解锁：" + step):
+	if not check(not app.religion_panel_inst.transaction and not app.client.busy, "宗教事务完整解锁：" + step):
 		return false
 	if not await perform("save", {"name": run_id + "-rel-" + step}):
 		return false
@@ -2196,10 +2196,10 @@ func verify_religion_flow() -> bool:
 	# 场景1：万神殿单步采用（事项页入口 → religionChooseBeliefs）
 	if not await load_religion("pantheon", true) or not await religion_matches("pantheon-initial"):
 		return false
-	var pantheon_decision = app.religion_data.get("decision")
+	var pantheon_decision = app.religion_panel_inst.data.get("decision")
 	if not check(pantheon_decision is Dictionary and str(pantheon_decision.get("mode")) == "pantheon", "万神殿待决出现在宗教页"):
 		return false
-	if not check(app.religion_slot_pickers.size() == 1, "万神殿单信条槽") or not await click_option(app.religion_slot_pickers[0], 0):
+	if not check(app.religion_panel_inst.slot_pickers.size() == 1, "万神殿单信条槽") or not await click_option(app.religion_panel_inst.slot_pickers[0], 0):
 		return false
 	await screenshot("smoke-religion-pantheon.png")
 	if not await click_control(religion_control("ReligionSubmit")) or not await click_religion_dialog(true):
@@ -2209,7 +2209,7 @@ func verify_religion_flow() -> bool:
 	# 场景2：两步创立（使用预言家 → religionFound，自定义中文／重音名称）
 	if not await load_religion("found") or not await religion_matches("found-initial"):
 		return false
-	if not check(app.religion_data.get("decision") == null, "创立前无待决，仅显示预言家"):
+	if not check(app.religion_panel_inst.data.get("decision") == null, "创立前无待决，仅显示预言家"):
 		return false
 	var use_button = religion_prophet_button("found")
 	if not check(use_button != null, "预言家创立动作可点击"):
@@ -2220,18 +2220,18 @@ func verify_religion_flow() -> bool:
 	await screenshot("smoke-religion-use-prophet.png")
 	if not await click_religion_dialog(true, true) or not check(app.client.revision == revision + 1, "宗教双击最多一次写入"):
 		return false
-	var found_decision = app.religion_data.get("decision")
+	var found_decision = app.religion_panel_inst.data.get("decision")
 	if not check(found_decision is Dictionary and str(found_decision.get("mode")) == "foundReligion", "使用预言家后进入创立待决"):
 		return false
-	if not check(app.religion_symbol_picker != null and app.religion_symbol_picker.item_count > 0, "创立显示可用符号下拉"):
+	if not check(app.religion_panel_inst.symbol_picker != null and app.religion_panel_inst.symbol_picker.item_count > 0, "创立显示可用符号下拉"):
 		return false
-	if not await click_option(app.religion_symbol_picker, 0):
+	if not await click_option(app.religion_panel_inst.symbol_picker, 0):
 		return false
 	if not await enter_religion_name(str(religion_expected.smokeName)):
 		return false
 	var used := {}
-	for i in range(app.religion_slot_pickers.size()):
-		var picker: OptionButton = app.religion_slot_pickers[i]
+	for i in range(app.religion_panel_inst.slot_pickers.size()):
+		var picker: OptionButton = app.religion_panel_inst.slot_pickers[i]
 		var chosen := -1
 		for j in range(picker.item_count):
 			var cid := str(picker.get_item_metadata(j))
@@ -2260,39 +2260,39 @@ func verify_religion_stamps() -> bool:
 	if not await load_religion("pantheon"):
 		return false
 	var revision: int = app.client.revision
-	if not await click_option(app.religion_slot_pickers[0], 0) or not await click_control(religion_control("ReligionSubmit")):
+	if not await click_option(app.religion_panel_inst.slot_pickers[0], 0) or not await click_control(religion_control("ReligionSubmit")):
 		return false
 	await diplomacy_key(KEY_ESCAPE)
-	if not check(not app.religion_confirmation.visible and app.religion_payload.is_empty(), "宗教Esc清空确认载荷"):
+	if not check(not app.religion_panel_inst.confirmation.visible and app.religion_panel_inst.payload.is_empty(), "宗教Esc清空确认载荷"):
 		return false
 	if not await click_control(religion_control("ReligionSubmit")):
 		return false
-	var dialog: ConfirmationDialog = app.religion_confirmation
+	var dialog: ConfirmationDialog = app.religion_panel_inst.confirmation
 	var close_pos := Vector2(dialog.position) + Vector2(dialog.size.x - dialog.get_theme_constant("close_h_offset", "Window"),
 		-dialog.get_theme_constant("close_v_offset", "Window")) + dialog.get_theme_icon("close", "Window").get_size() / 2
 	await push_mouse(MOUSE_BUTTON_LEFT, close_pos)
 	await settle()
-	if not check(not dialog.visible and app.religion_payload.is_empty() and app.client.revision == revision, "宗教关闭窗口零写入"):
+	if not check(not dialog.visible and app.religion_panel_inst.payload.is_empty() and app.client.revision == revision, "宗教关闭窗口零写入"):
 		return false
 	for key in ["revision", "loadEpoch", "selectionGeneration", "religionGeneration", "session", "gameId", "ticket"]:
 		if not await click_control(religion_control("ReligionSubmit")):
 			return false
-		var old = app.religion_payload.stamp[key]
-		app.religion_payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		var old = app.religion_panel_inst.payload.stamp[key]
+		app.religion_panel_inst.payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
 		if not await click_religion_dialog(true) or not check(app.client.revision == revision and app.message.text.contains("失效"), "注入旧宗教确认拒绝提交：" + key):
 			return false
-	var fresh: Dictionary = app.religion_stamp.duplicate(true)
-	var data: Dictionary = app.religion_data.duplicate(true)
+	var fresh: Dictionary = app.religion_panel_inst.stamp.duplicate(true)
+	var data: Dictionary = app.religion_panel_inst.data.duplicate(true)
 	for key in ["revision", "loadEpoch", "selectionGeneration", "religionGeneration", "session", "gameId"]:
 		var stale := fresh.duplicate(true)
 		var old = stale[key]
 		stale[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
-		if not check(not app._apply_religion_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale)
-				and app.religion_data == data, "注入旧宗教响应不回填：" + key):
+		if not check(not app.religion_panel_inst.apply_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": {}}, stale)
+				and app.religion_panel_inst.data == data, "注入旧宗教响应不回填：" + key):
 			return false
 	if not await click_control(religion_control("ReligionSubmit")) or not await load_religion("pantheon"):
 		return false
-	return check(not app._religion_stamp_valid(fresh) and not dialog.visible and app.religion_payload.is_empty(), "同存档重载关闭宗教确认且旧stamp失效")
+	return check(not app.religion_panel_inst.stamp_valid(fresh) and not dialog.visible and app.religion_panel_inst.payload.is_empty(), "同存档重载关闭宗教确认且旧stamp失效")
 
 func verify_religion_sizes() -> bool:
 	var original := get_window().size
@@ -2301,7 +2301,7 @@ func verify_religion_sizes() -> bool:
 		await get_tree().process_frame
 		await get_tree().process_frame
 		var label := "%dx%d" % [target_size.x, target_size.y]
-		if not await load_religion("pantheon") or not await click_option(app.religion_slot_pickers[0], 0):
+		if not await load_religion("pantheon") or not await click_option(app.religion_panel_inst.slot_pickers[0], 0):
 			return false
 		if not await click_control(religion_control("ReligionSubmit")):
 			return false
@@ -3481,7 +3481,7 @@ func settle() -> void:
 	var guard := 0
 	while idle < 3 and guard < 900:
 		guard += 1
-		if app.client.busy or app.economy_transaction or app.diplomacy_transaction or app.religion_transaction or app.great_person_transaction or app.vote_transaction or app.asset_transaction or app.event_transaction:
+		if app.client.busy or app.economy_transaction or app.diplomacy_panel_inst.transaction or app.religion_panel_inst.transaction or app.great_person_panel_inst.transaction or app.vote_panel_inst.transaction or app.asset_panel_inst.transaction or app.event_panel_inst.transaction:
 			idle = 0
 		else:
 			idle += 1
