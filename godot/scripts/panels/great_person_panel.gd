@@ -211,8 +211,8 @@ func confirm_great_person() -> void:
 		return
 	transaction = true
 	orchestrator._on_busy(true)
-	# execute 签名（删 great_person/event/religious/diplomatic/asset_commit 布尔后）：economic 单布尔 + committing。
-	var res: Dictionary = await orchestrator.execute("greatPersonChoose", p.params, false, self)
+	# execute 签名（7 个 commit 布尔全部删除后）：仅剩 committing（提交方控制器）。
+	var res: Dictionary = await orchestrator.execute("greatPersonChoose", p.params, self)
 	if res.get("ok", false):
 		var business: Dictionary = res.get("greatPersonResult", {})
 		result.text = str(business.get("message", "结果未确认"))

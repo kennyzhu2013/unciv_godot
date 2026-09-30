@@ -2328,13 +2328,13 @@ func verify_religion_sizes() -> bool:
 
 # —— 城市经济：写操作只由真实控件及模态窗口输入触发，逐步比较独立原生期望 ——
 func observe_economy_lock(busy: bool) -> void:
-	if busy or not app.economy_transaction:
+	if busy or not app.economy_panel_inst.transaction:
 		return
 	economy_lock_handoffs += 1
 	for control in app.buttons:
 		economy_lock_valid = economy_lock_valid and control.disabled
 	economy_lock_valid = economy_lock_valid and app.city_picker.disabled and app.unit_picker.disabled \
-		and app.economy_picker.disabled and not app.economy_filter.editable \
+		and app.economy_panel_inst.economy_picker.disabled and not app.economy_panel_inst.economy_filter.editable \
 		and app.tabs.get_tab_bar().mouse_filter == Control.MOUSE_FILTER_IGNORE \
 		and app.city_tabs.get_tab_bar().mouse_filter == Control.MOUSE_FILTER_IGNORE
 
@@ -2350,7 +2350,7 @@ func verify_economy_flow() -> bool:
 		return false
 	if not economy_matches("initial"):
 		return false
-	if not await click_control(app.buy_mode_button) or not await click_map(Vector2i(2, 0)):
+	if not await click_control(app.economy_panel_inst.buy_mode_button) or not await click_map(Vector2i(2, 0)):
 		return false
 	var revision: int = app.client.revision
 	var before: Dictionary = app.client.snapshot.duplicate(true)
@@ -2362,18 +2362,18 @@ func verify_economy_flow() -> bool:
 		return false
 	await screenshot("smoke-economy-quote.png")
 	for attempt in range(3):
-		if not await click_control(app.buy_tile_button) or not await click_economy_dialog(false):
+		if not await click_control(app.economy_panel_inst.buy_tile_button) or not await click_economy_dialog(false):
 			return false
 		if not check(app.client.revision == revision and app.client.snapshot == before, "经济连续取消零写入"):
 			return false
-	if not await click_control(app.buy_tile_button):
+	if not await click_control(app.economy_panel_inst.buy_tile_button):
 		return false
 	await screenshot("smoke-economy-confirm.png")
 	if not await click_economy_dialog(true, true):
 		return false
 	if not check(app.client.revision == revision + 1, "双击确认买地最多执行一次") or not economy_matches("buyTile"):
 		return false
-	if not check(app.buy_tile_mode and app.buy_tile_target == {"x": 2, "y": 0} and not app.buy_tile_button.visible
+	if not check(app.buy_tile_mode and app.buy_tile_target == {"x": 2, "y": 0} and not app.economy_panel_inst.buy_tile_button.visible
 			and app.city_tabs.current_tab == app.CTAB_ECONOMY, "买地后保留城市、子页、坐标且不再显示购买按钮"):
 		return false
 	var next_quote: Dictionary = app.map.buy_tiles.get(Vector2i(3, 0), {})
@@ -2381,11 +2381,11 @@ func verify_economy_flow() -> bool:
 		return false
 	await screenshot("smoke-economy-border.png")
 	var index := -1
-	for i in range(app.economy_picker.item_count):
-		var meta = app.economy_picker.get_item_metadata(i)
+	for i in range(app.economy_panel_inst.economy_picker.item_count):
+		var meta = app.economy_panel_inst.economy_picker.get_item_metadata(i)
 		if meta is Dictionary and meta.get("name") == "Monument":
 			index = i
-	if not await click_option(app.economy_picker, index) or not await click_control(app.purchase_button):
+	if not await click_option(app.economy_panel_inst.economy_picker, index) or not await click_control(app.economy_panel_inst.purchase_button):
 		return false
 	if not await click_economy_dialog(true) or not economy_matches("buyBuilding"):
 		return false
@@ -2396,7 +2396,7 @@ func verify_economy_flow() -> bool:
 	var queue_buy = economy_control(app.queue_box, "QueuePurchase", "Warrior", 2)
 	if not await click_control(queue_buy):
 		return false
-	if not check(int(app.economy_payload.params.queueIndex) == 2, "确认冻结第三项重复单位索引"):
+	if not check(int(app.economy_panel_inst.payload.params.queueIndex) == 2, "确认冻结第三项重复单位索引"):
 		return false
 	if not await click_economy_dialog(true) or not economy_matches("buyQueue"):
 		return false
@@ -2406,14 +2406,14 @@ func verify_economy_flow() -> bool:
 	await screenshot("smoke-economy-unit.png")
 	if not await click_tab(app.city_tabs, app.CTAB_ECONOMY):
 		return false
-	if not await click_control(economy_control(app.economy_buildings, "SellBuilding", "Market")):
+	if not await click_control(economy_control(app.economy_panel_inst.economy_buildings, "SellBuilding", "Market")):
 		return false
 	if not check(app.economy_confirmation.dialog_text.contains("不可撤销"), "出售确认提示不可撤销"):
 		return false
 	if not await click_economy_dialog(true) or not economy_matches("sell"):
 		return false
-	if not check(economy_control(app.economy_buildings, "SellBuilding", "Market") == null
-			and economy_control(app.economy_buildings, "SellBuilding", "Workshop").disabled, "售后建筑消失且同城第二次出售禁用"):
+	if not check(economy_control(app.economy_panel_inst.economy_buildings, "SellBuilding", "Market") == null
+			and economy_control(app.economy_panel_inst.economy_buildings, "SellBuilding", "Workshop").disabled, "售后建筑消失且同城第二次出售禁用"):
 		return false
 	if not await click_tab(app.city_tabs, app.CTAB_POPULATION):
 		return false
@@ -2500,7 +2500,7 @@ func equal_persisted(actual, expected, path: String) -> bool:
 
 func economy_matches(step: String) -> bool:
 	if step in ["buyTile", "buyBuilding", "buyQueue", "sell"]:
-		if not check(not app.economy_transaction and not app.client.busy
+		if not check(not app.economy_panel_inst.transaction and not app.client.busy
 				and app.message.text.begins_with("操作完成"), "经济事务结束恢复完成提示：" + step):
 			return false
 	var expected: Dictionary = economy_expected[step]
@@ -2554,29 +2554,29 @@ func verify_economy_stamps(fixture: String) -> bool:
 	await get_tree().process_frame
 	if not await click_map(Vector2i.ZERO) or not await click_tab(app.city_tabs, app.CTAB_ECONOMY):
 		return false
-	if not await click_control(app.buy_mode_button) or not await click_map(Vector2i(2, 0)) or not await click_control(app.buy_tile_button):
+	if not await click_control(app.economy_panel_inst.buy_mode_button) or not await click_map(Vector2i(2, 0)) or not await click_control(app.economy_panel_inst.buy_tile_button):
 		return false
-	var stamp: Dictionary = app.economy_payload.stamp.duplicate(true)
+	var stamp: Dictionary = app.economy_panel_inst.payload.stamp.duplicate(true)
 	var revision: int = app.client.revision
 	await press_economy_escape()
-	if not check(not app.economy_confirmation.visible and app.economy_payload.is_empty()
+	if not check(not app.economy_confirmation.visible and app.economy_panel_inst.payload.is_empty()
 			and app.buy_tile_mode and app.client.revision == revision, "Esc 仅取消经济确认且零写入"):
 		return false
-	if not await click_control(app.buy_tile_button):
+	if not await click_control(app.economy_panel_inst.buy_tile_button):
 		return false
-	var dialog: ConfirmationDialog = app.economy_confirmation
+	var dialog: ConfirmationDialog = app.economy_panel_inst.confirmation
 	var close_pos := Vector2(dialog.position) + Vector2(dialog.size.x - dialog.get_theme_constant("close_h_offset", "Window"),
 		-dialog.get_theme_constant("close_v_offset", "Window")) + dialog.get_theme_icon("close", "Window").get_size() / 2
 	await push_mouse(MOUSE_BUTTON_LEFT, close_pos)
 	await settle()
-	if not check(not dialog.visible and app.economy_payload.is_empty() and app.client.revision == revision, "关闭经济确认窗口零写入"):
+	if not check(not dialog.visible and app.economy_panel_inst.payload.is_empty() and app.client.revision == revision, "关闭经济确认窗口零写入"):
 		return false
 	# 冻结报价被异步状态推进作废：只改变测试中的旧载荷，确认仍由真实按钮触发。
 	for key in ["revision", "loadEpoch", "selectionGeneration", "session", "gameId", "cityId"]:
-		if not await click_control(app.buy_tile_button):
+		if not await click_control(app.economy_panel_inst.buy_tile_button):
 			return false
-		var old = app.economy_payload.stamp[key]
-		app.economy_payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		var old = app.economy_panel_inst.payload.stamp[key]
+		app.economy_panel_inst.payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
 		if not await click_economy_dialog(true):
 			return false
 		if not check(app.client.revision == revision and app.message.text.contains("失效"), "失效确认拒绝提交：" + key):
@@ -2586,12 +2586,12 @@ func verify_economy_stamps(fixture: String) -> bool:
 		return false
 	if not check(not app._stamp_valid(stamp) and not app.buy_tile_mode and app.map.buy_tiles.is_empty(), "切换城市使旧报价失效并清空覆盖"):
 		return false
-	if not await click_map(Vector2i.ZERO) or not await click_control(app.buy_mode_button) \
-			or not await click_map(Vector2i(2, 0)) or not await click_control(app.buy_tile_button):
+	if not await click_map(Vector2i.ZERO) or not await click_control(app.economy_panel_inst.buy_mode_button) \
+			or not await click_map(Vector2i(2, 0)) or not await click_control(app.economy_panel_inst.buy_tile_button):
 		return false
 	if not await perform("load", {"path": fixture}):
 		return false
-	if not check(not dialog.visible and app.economy_payload.is_empty() and not app.buy_tile_mode, "同存档重载关闭已打开确认并清空模式"):
+	if not check(not dialog.visible and app.economy_panel_inst.payload.is_empty() and not app.buy_tile_mode, "同存档重载关闭已打开确认并清空模式"):
 		return false
 	if not await click_map(Vector2i.ZERO):
 		return false
@@ -2623,19 +2623,19 @@ func verify_economy_poor(fixture: String) -> bool:
 	app.map.center_on(Vector2i.ZERO)
 	await get_tree().process_frame
 	if not await click_map(Vector2i.ZERO) or not await click_tab(app.city_tabs, app.CTAB_ECONOMY) \
-			or not await click_control(app.buy_mode_button) or not await click_map(Vector2i(2, 0)):
+			or not await click_control(app.economy_panel_inst.buy_mode_button) or not await click_map(Vector2i(2, 0)):
 		return false
-	if not check(app.client.snapshot.gold == 0 and app._buy_quote().cost > 0
-			and not app.buy_tile_button.visible and app.economy_tile_card.text.contains("金币不足"), "余额不足保留买地报价和原因且不能提交"):
+	if not check(app.client.snapshot.gold == 0 and app.economy_panel_inst.buy_quote().cost > 0
+			and not app.economy_panel_inst.buy_tile_button.visible and app.economy_panel_inst.economy_tile_card.text.contains("金币不足"), "余额不足保留买地报价和原因且不能提交"):
 		return false
 	var index := -1
-	for i in range(app.economy_picker.item_count):
-		var meta = app.economy_picker.get_item_metadata(i)
+	for i in range(app.economy_panel_inst.economy_picker.item_count):
+		var meta = app.economy_panel_inst.economy_picker.get_item_metadata(i)
 		if meta is Dictionary and meta.get("name") == "Monument":
 			index = i
-	if not await click_option(app.economy_picker, index):
+	if not await click_option(app.economy_panel_inst.economy_picker, index):
 		return false
-	if not check(app.purchase_button.disabled and app.economy_detail.text.contains("金币不足"), "余额不足候选仍可查看原因但购买按钮禁用"):
+	if not check(app.economy_panel_inst.purchase_button.disabled and app.economy_panel_inst.economy_detail.text.contains("金币不足"), "余额不足候选仍可查看原因但购买按钮禁用"):
 		return false
 	await screenshot("smoke-economy-poor.png")
 	await press_economy_escape()
@@ -3401,17 +3401,17 @@ func verify_window_sizes() -> bool:
 func verify_economy_layout(label: String) -> bool:
 	if not await click_tab(app.city_tabs, app.CTAB_ECONOMY):
 		return false
-	for control in [app.economy_balance, app.economy_tile_card, app.economy_picker,
-			app.purchase_button, economy_control(app.economy_buildings, "SellBuilding", "Workshop")]:
+	for control in [app.economy_panel_inst.economy_balance, app.economy_panel_inst.economy_tile_card, app.economy_panel_inst.economy_picker,
+			app.economy_panel_inst.purchase_button, economy_control(app.economy_panel_inst.economy_buildings, "SellBuilding", "Workshop")]:
 		if not check(control != null, label + "：经济卡片和末尾建筑存在"):
 			return false
 		scroll_into_view(control)
 		await get_tree().process_frame
 		await get_tree().process_frame
-		if not check(app.economy_scroll.get_global_rect().encloses(control.get_global_rect()), label + "：经济内容可滚动到完整可见且无横向溢出 " + str(control.name)):
+		if not check(app.economy_panel_inst.economy_scroll.get_global_rect().encloses(control.get_global_rect()), label + "：经济内容可滚动到完整可见且无横向溢出 " + str(control.name)):
 			return false
 	var revision: int = app.client.revision
-	if not await click_control(economy_control(app.economy_buildings, "SellBuilding", "Market")):
+	if not await click_control(economy_control(app.economy_panel_inst.economy_buildings, "SellBuilding", "Market")):
 		return false
 	await screenshot("smoke-economy-" + label + "-confirm.png")
 	if not await click_economy_dialog(false):
@@ -3425,7 +3425,7 @@ func verify_economy_layout(label: String) -> bool:
 	await screenshot("smoke-economy-" + label + "-queue.png")
 	if not await click_tab(app.city_tabs, app.CTAB_ECONOMY):
 		return false
-	scroll_into_view(app.economy_balance)
+	scroll_into_view(app.economy_panel_inst.economy_balance)
 	await get_tree().process_frame
 	if not check(app.client.revision == revision, label + "：布局确认检查零写入"):
 		return false
@@ -3481,7 +3481,7 @@ func settle() -> void:
 	var guard := 0
 	while idle < 3 and guard < 900:
 		guard += 1
-		if app.client.busy or app.economy_transaction or app.diplomacy_panel_inst.transaction or app.religion_panel_inst.transaction or app.great_person_panel_inst.transaction or app.vote_panel_inst.transaction or app.asset_panel_inst.transaction or app.event_panel_inst.transaction:
+		if app.client.busy or app.economy_panel_inst.transaction or app.diplomacy_panel_inst.transaction or app.religion_panel_inst.transaction or app.great_person_panel_inst.transaction or app.vote_panel_inst.transaction or app.asset_panel_inst.transaction or app.event_panel_inst.transaction:
 			idle = 0
 		else:
 			idle += 1
@@ -3675,7 +3675,7 @@ func click_option(ob: OptionButton, index: int) -> bool:
 	return check(false, "经济下拉条目未命中：" + str(index))
 
 func click_economy_dialog(confirm: bool, twice := false) -> bool:
-	var dialog: ConfirmationDialog = app.economy_confirmation
+	var dialog: ConfirmationDialog = app.economy_panel_inst.confirmation
 	if not check(dialog.visible, "经济模态确认可见"):
 		return false
 	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
@@ -3697,7 +3697,7 @@ func click_economy_dialog(confirm: bool, twice := false) -> bool:
 	if twice:
 		await window_mouse(click_viewport, MOUSE_BUTTON_LEFT, click_pos, false, true)
 	await settle()
-	return check(not dialog.visible and app.economy_payload.is_empty(), "经济确认关闭并清空载荷")
+	return check(not dialog.visible and app.economy_panel_inst.payload.is_empty(), "经济确认关闭并清空载荷")
 
 func economy_control(root: Node, node_name: String, project: String, index := -1):
 	if str(root.name) == node_name and str(root.get_meta("projectName", "")) == project \

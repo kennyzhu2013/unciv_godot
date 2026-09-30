@@ -8,6 +8,7 @@ const EventPanelScript = preload("res://scripts/panels/event_panel.gd")
 const ReligionPanelScript = preload("res://scripts/panels/religion_panel.gd")
 const DiplomacyPanelScript = preload("res://scripts/panels/diplomacy_panel.gd")
 const AssetPanelScript = preload("res://scripts/panels/asset_panel.gd")
+const EconomyPanelScript = preload("res://scripts/panels/economy_panel.gd")
 var client = ClientScript.new()
 var map = MapScript.new()
 var top_status := Label.new()
@@ -100,20 +101,11 @@ var load_epoch := 0             # load/demo/gameId 变化时自增，用于清�
 var tile_context: Dictionary = {}   # 空地格选中信息
 # 经济详情只与产生它的会话／版本／重载纪元／选择代际绑定。
 const CTAB_ECONOMY := 3
-var economy_scroll: ScrollContainer
-var economy_balance := Label.new()
-var economy_filter := LineEdit.new()
-var economy_picker := OptionButton.new()
-var economy_detail := Label.new()
-var economy_buildings := VBoxContainer.new()
-var economy_tile_card := Label.new()
-var buy_tile_button: Button
-var buy_mode_button: Button
-var purchase_button: Button
-var economy_confirmation := ConfirmationDialog.new()
-var economy_payload: Dictionary = {}
+# 城市经济事务域已迁移至 panels/economy_panel.gd（TransactionController 子类）；main 仅持有实例引用。
+# 经济是城市页子页，与城市上下文强耦合：city_stamp/buy_tile_mode/buy_tile_target 及 _economy/_state_stamp/
+# _stamp_valid/_set_buy_tile_mode/_select_buy_tile/_city_sub_page 仍归 main（城市上下文共享助手）。
+var economy_panel_inst = EconomyPanelScript.new()
 var city_stamp: Dictionary = {}
-var economy_transaction := false
 var buy_tile_mode := false
 var buy_tile_target: Dictionary = {}
 # 外交上下文独立于单位／城市选择；事务覆盖写请求及其后的详情刷新。
@@ -150,6 +142,8 @@ func _ready() -> void:
 	panels.append(diplomacy_panel_inst)
 	asset_panel_inst.orchestrator = self
 	panels.append(asset_panel_inst)
+	economy_panel_inst.orchestrator = self
+	panels.append(economy_panel_inst)
 	var system_font := SystemFont.new()
 	system_font.font_names = PackedStringArray(["Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC"])
 	theme = Theme.new()
@@ -161,7 +155,7 @@ func _ready() -> void:
 	client.snapshot_changed.connect(_apply_snapshot)
 	client.busy_changed.connect(_on_busy)
 	client.state_invalidated.connect(_clear_combat)
-	client.state_invalidated.connect(_cancel_economy)
+	client.state_invalidated.connect(economy_panel_inst.cancel)
 	client.state_invalidated.connect(diplomacy_panel_inst.invalidate)
 	client.state_invalidated.connect(religion_panel_inst.invalidate)
 	client.state_invalidated.connect(great_person_panel_inst.invalidate)
@@ -408,49 +402,7 @@ func _build_city_tab() -> void:
 		if not pname.is_empty():
 			await _city_queue("add", pname, -1))
 	enqueue.name = "EnqueueProduction"
-	_build_economy_tab()
-
-func _build_economy_tab() -> void:
-	var page := _city_sub_page("经济")
-	economy_scroll = page.get_parent()
-	page.name = "CityEconomy"
-	for text in [economy_balance, economy_tile_card, economy_detail]:
-		text.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	page.add_child(economy_balance)
-	label(page, "领土购买")
-	buy_mode_button = button(page, "选择购买地块", func(): _set_buy_tile_mode(not buy_tile_mode))
-	buy_mode_button.name = "BuyTileMode"
-	page.add_child(economy_tile_card)
-	buy_tile_button = button(page, "购买选中地块", _request_buy_tile)
-	buy_tile_button.name = "BuySelectedTile"
-	label(page, "金币购买（独立于生产队列资格）")
-	economy_filter.placeholder_text = "筛选金币购买项目…"
-	economy_filter.name = "EconomyFilter"
-	economy_filter.text_changed.connect(func(_text): _populate_economy_picker())
-	page.add_child(economy_filter)
-	economy_picker.name = "EconomyPurchasePicker"
-	economy_picker.fit_to_longest_item = false
-	economy_picker.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
-	economy_picker.custom_minimum_size.y = 34
-	economy_picker.item_selected.connect(func(_index): _preview_purchase())
-	page.add_child(economy_picker)
-	page.add_child(economy_detail)
-	purchase_button = button(page, "金币购买所选项目", _request_purchase)
-	purchase_button.name = "PurchaseConstruction"
-	label(page, "已建建筑")
-	page.add_child(economy_buildings)
-	economy_confirmation.name = "EconomyConfirmation"
-	economy_confirmation.title = "确认城市经济操作"
-	economy_confirmation.get_ok_button().text = "确认"
-	economy_confirmation.get_cancel_button().text = "取消"
-	economy_confirmation.confirmed.connect(_confirm_economy)
-	economy_confirmation.canceled.connect(_cancel_economy)
-	economy_confirmation.close_requested.connect(_cancel_economy)
-	# AcceptDialog 会按主题重置按钮尺寸，因此通过其主题合同设置最小高度。
-	var dialog_theme := Theme.new()
-	dialog_theme.set_constant("buttons_min_height", "AcceptDialog", 34)
-	economy_confirmation.theme = dialog_theme
-	add_child(economy_confirmation)
+	economy_panel_inst.build_tab()
 
 func _diplomacy_text(parent: Node, text: String) -> void:
 	var line := Label.new()
@@ -598,7 +550,6 @@ func label(parent: Node, text: String) -> void:
 	parent.add_child(result)
 
 func _on_busy(is_busy: bool) -> void:
-	is_busy = is_busy or economy_transaction or economy_confirmation.visible
 	for p in panels:
 		is_busy = is_busy or p.busy_active()
 	for p in panels:
@@ -609,8 +560,6 @@ func _on_busy(is_busy: bool) -> void:
 		city_tabs.get_tab_bar().mouse_filter = Control.MOUSE_FILTER_IGNORE if is_busy else Control.MOUSE_FILTER_STOP
 		tabs.get_tab_bar().focus_mode = Control.FOCUS_NONE if is_busy else Control.FOCUS_ALL
 		city_tabs.get_tab_bar().focus_mode = Control.FOCUS_NONE if is_busy else Control.FOCUS_ALL
-	economy_picker.disabled = is_busy or economy_picker.item_count == 0
-	economy_filter.editable = not is_busy
 	for control in buttons:
 		control.disabled = is_busy or not control.get_meta("allowed", true)
 	attack_button.disabled = is_busy or combat_preview.is_empty() or preview_revision != client.revision
@@ -633,16 +582,14 @@ func _on_busy(is_busy: bool) -> void:
 	else:
 		message.text = "内核处理中……界面仍可拖动和缩放"
 
-func execute(action: String, params: Dictionary = {}, economic_commit := false, committing = null) -> Dictionary:
+func execute(action: String, params: Dictionary = {}, committing = null) -> Dictionary:
 	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "assetDecisionOptions", "eventOptions", "snapshot"]
-	if economy_transaction and not economic_commit and not query:
-		return {"ok": false, "error": {"code": "BUSY", "message": "当前事务尚未完成"}}
-	# 已迁移面板的事务锁/确认框门禁（与上方硬编码等价）；提交方自身豁免事务锁检查。
+	# 已迁移面板的事务锁/确认框门禁；提交方自身豁免事务锁检查。
 	if not query:
 		for p in panels:
 			if p != committing and p.transaction:
 				return {"ok": false, "error": {"code": "BUSY", "message": p.busy_transaction_message()}}
-			if p.confirmation != null and p.confirmation.visible and action not in ["load", "demo"]:
+			if p.gates_on_confirmation_visible() and p.confirmation != null and p.confirmation.visible and action not in ["load", "demo"]:
 				return {"ok": false, "error": {"code": "BUSY", "message": p.busy_confirmation_message()}}
 	if action == "snapshot":
 		for p in panels:
@@ -665,10 +612,9 @@ func execute(action: String, params: Dictionary = {}, economic_commit := false, 
 		elif failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST", "GREAT_PERSON_DECISION", "DIPLOMATIC_VOTE_DECISION", "DIPLOMATIC_VOTE_RESULT", "ASSET_DECISION", "EVENT", "EVENT_INVALID"]:
 			for p in panels:
 				p.on_stale_state()
-			_cancel_economy()
 			await client.command("snapshot")
 			await _refresh_active_context()
-		elif economic_commit or (committing != null and committing.refresh_on_generic_failure()):
+		elif committing != null and committing.refresh_on_generic_failure():
 			await _refresh_active_context()
 		message.text = str(failure.get("message", "请求失败"))
 	else:
@@ -1064,19 +1010,15 @@ func _stamp_valid(stamp: Dictionary) -> bool:
 	return not stamp.is_empty() and stamp == _state_stamp() and _own_city_exists(city_id)
 
 func _input_locked() -> bool:
-	return client.busy or asset_panel_inst.busy_active() or vote_panel_inst.busy_active() or event_panel_inst.busy_active() or religion_panel_inst.busy_active() or economy_transaction or economy_confirmation.visible or diplomacy_panel_inst.busy_active() or great_person_panel_inst.busy_active()
+	return client.busy or asset_panel_inst.busy_active() or vote_panel_inst.busy_active() or event_panel_inst.busy_active() or religion_panel_inst.busy_active() or economy_panel_inst.busy_active() or diplomacy_panel_inst.busy_active() or great_person_panel_inst.busy_active()
 
 func _economy() -> Dictionary:
 	return city_data.get("economy", {})
 
-func _cancel_economy() -> void:
-	economy_payload = {}
-	economy_confirmation.hide()
-
 func _set_buy_tile_mode(enabled: bool) -> void:
-	if not buy_mode_button:
+	if not economy_panel_inst.buy_mode_button:
 		return
-	_cancel_economy()
+	economy_panel_inst.cancel()
 	buy_tile_mode = enabled and not city_id.is_empty() and _stamp_valid(city_stamp)
 	if buy_tile_mode:
 		_set_city_mode(false)
@@ -1087,163 +1029,18 @@ func _set_buy_tile_mode(enabled: bool) -> void:
 	map.reachable.clear()
 	map.attack_targets.clear()
 	map.set_buy_tiles(_economy().get("buyTiles", []) if buy_tile_mode else [])
-	if buy_mode_button:
-		buy_mode_button.text = "退出购买地块" if buy_tile_mode else "选择购买地块"
-	_populate_buy_tile()
+	if economy_panel_inst.buy_mode_button:
+		economy_panel_inst.buy_mode_button.text = "退出购买地块" if buy_tile_mode else "选择购买地块"
+	economy_panel_inst.populate_buy_tile()
 	_on_busy(client.busy)
 
 func _select_buy_tile(tile: Dictionary) -> void:
-	_cancel_economy()
+	economy_panel_inst.cancel()
 	buy_tile_target = {"x": int(tile.x), "y": int(tile.y)}
 	map.selected = Vector2i(int(tile.x), int(tile.y))
 	map.queue_redraw()
-	_populate_buy_tile()
+	economy_panel_inst.populate_buy_tile()
 	_on_busy(client.busy)
-
-func _buy_quote() -> Dictionary:
-	for item in _economy().get("buyTiles", []):
-		if not buy_tile_target.is_empty() and int(item.x) == int(buy_tile_target.x) and int(item.y) == int(buy_tile_target.y):
-			return item
-	return {}
-
-func _populate_buy_tile() -> void:
-	if not buy_tile_button:
-		return
-	var quote := _buy_quote()
-	buy_tile_button.visible = buy_tile_mode and quote.get("enabled", false)
-	buy_tile_button.set_meta("allowed", buy_tile_mode and quote.get("enabled", false))
-	if not buy_tile_mode or buy_tile_target.is_empty():
-		economy_tile_card.text = "开启买地模式后左键选格，再确认购买。圆框＝可买，叉号＝暂不可买；右键不移动或攻击。"
-		return
-	var coord := Vector2i(int(buy_tile_target.x), int(buy_tile_target.y))
-	var tile: Dictionary = map.tiles.get(coord, {})
-	var visible := str(tile.get("visibility", "unknown")) == "visible"
-	economy_tile_card.text = "(%s, %s) · %s\n价格 %s · 余额 %s\n%s" % [coord.x, coord.y,
-		_dash(tile.get("terrain")) if visible else "当前不可见", _num(quote.get("cost"), true),
-		_num(_economy().get("gold"), true), str(quote.get("reason", "目标不可购买或当前不可见"))]
-
-func _populate_economy() -> void:
-	var data := _economy()
-	economy_balance.text = "余额：%s 金币%s\n%s" % [_num(data.get("gold"), true),
-		" · godMode（各动作遵循原生规则）" if data.get("godMode", false) else "", data.get("blockedReason", "")]
-	buy_mode_button.set_meta("allowed", not data.is_empty())
-	map.set_buy_tiles(data.get("buyTiles", []) if buy_tile_mode else [])
-	_populate_buy_tile()
-	_populate_economy_picker()
-	_clear_dynamic(economy_buildings)
-	for item in data.get("buildings", []):
-		var row := VBoxContainer.new()
-		economy_buildings.add_child(row)
-		var text := Label.new()
-		text.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		text.text = "%s · 出售收入 %s%s\n%s" % [item.name, _num(item.get("sellGold"), true),
-			" · 免费" if item.get("isFree", false) else "", item.get("reason", "")]
-		row.add_child(text)
-		var payload := _economy_request("citySellBuilding", {"name": str(item.name)}, item.get("sellGold"))
-		var sell := button(row, "出售建筑", _open_economy.bind(payload))
-		sell.name = "SellBuilding"
-		_economy_button_metadata(sell, item, -1)
-		sell.set_meta("allowed", item.get("canSell", false))
-
-func _economy_selection() -> Dictionary:
-	if economy_picker.selected < 0:
-		return {}
-	var item = economy_picker.get_item_metadata(economy_picker.selected)
-	return item if item is Dictionary else {}
-
-func _populate_economy_picker() -> void:
-	var previous := str(_economy_selection().get("name", ""))
-	var filter := economy_filter.text.strip_edges().to_lower()
-	economy_picker.clear()
-	var restored := -1
-	for category in [["unit", "单位"], ["building", "建筑"]]:
-		var added := false
-		for item in _economy().get("purchaseOptions", []):
-			if item.get("type") != category[0] or (not filter.is_empty() and not str(item.name).to_lower().contains(filter)):
-				continue
-			if not added:
-				economy_picker.add_separator(category[1])
-				added = true
-			economy_picker.add_item(str(item.name))
-			var index := economy_picker.item_count - 1
-			economy_picker.set_item_metadata(index, item.duplicate(true))
-			economy_picker.set_item_tooltip(index, str(item.get("reason", "")))
-			if item.name == previous:
-				restored = index
-	# 禁用项目仍可选择查看原因；无有效旧选择时保持明确未选择。
-	economy_picker.select(restored)
-	_preview_purchase()
-
-func _preview_purchase() -> void:
-	var item := _economy_selection()
-	economy_detail.text = "请选择项目查看内核报价。" if item.is_empty() else "%s · %s 金币\n%s" % [
-		item.name, _num(item.get("goldCost"), true), item.get("reason", "")]
-	if purchase_button:
-		purchase_button.set_meta("allowed", item.get("enabled", false))
-	_on_busy(client.busy)
-
-func _economy_button_metadata(control: Button, item: Dictionary, index: int) -> void:
-	control.set_meta("cityId", city_id)
-	control.set_meta("projectName", str(item.get("name", "")))
-	control.set_meta("queueIndex", index)
-	control.set_meta("revision", client.revision)
-	control.set_meta("allowed", item.get("enabled", false))
-	control.tooltip_text = str(item.get("reason", ""))
-
-func _economy_request(action: String, params: Dictionary, price) -> Dictionary:
-	var args := params.duplicate(true)
-	args.cityId = city_id
-	return {"action": action, "params": args, "stamp": city_stamp.duplicate(true), "price": price,
-		"gold": _economy().get("gold"), "cityName": city_data.get("name", "")}
-
-func _request_buy_tile() -> void:
-	var quote := _buy_quote()
-	if buy_tile_mode and quote.get("enabled", false):
-		await _open_economy(_economy_request("cityBuyTile", buy_tile_target, quote.get("cost")))
-
-func _request_purchase() -> void:
-	var item := _economy_selection()
-	if item.get("enabled", false):
-		await _open_economy(_economy_request("cityPurchase", {"name": str(item.name), "stat": "Gold", "queueIndex": -1}, item.get("goldCost")))
-
-func _open_economy(payload: Dictionary) -> void:
-	if _input_locked():
-		return
-	if not _stamp_valid(payload.get("stamp", {})):
-		_cancel_economy()
-		await _refresh_active_context()
-		message.text = "报价已过期，请重新选择并确认。"
-		return
-	economy_payload = payload.duplicate(true)
-	var args: Dictionary = payload.params
-	var description := str(args.get("name", ""))
-	if payload.action == "cityBuyTile":
-		description = "地块 (%s, %s)" % [args.x, args.y]
-	elif int(args.get("queueIndex", -1)) >= 0:
-		description += " · 队列第 %d 项" % (int(args.queueIndex) + 1)
-	economy_confirmation.dialog_text = "%s\n%s\n%s：%s 金币 · 当前余额：%s%s" % [payload.cityName,
-		description, "出售收入" if payload.action == "citySellBuilding" else "价格", _num(payload.price, true),
-		_num(payload.gold, true), "\n出售不可撤销。" if payload.action == "citySellBuilding" else ""]
-	economy_confirmation.dialog_autowrap = true
-	economy_confirmation.popup_centered(Vector2i(mini(480, int(size.x) - 48), 230))
-
-func _confirm_economy() -> void:
-	var payload := economy_payload.duplicate(true)
-	_cancel_economy()
-	if client.busy or economy_transaction or diplomacy_panel_inst.transaction or great_person_panel_inst.busy_active() or vote_panel_inst.busy_active() or payload.is_empty():
-		return
-	if not _stamp_valid(payload.get("stamp", {})):
-		await _refresh_active_context()
-		message.text = "报价已失效，未提交。请重新确认。"
-		return
-	# HTTP 完成与顺序详情回填之间保持同一事务锁；传输重试仍由 client 复用原 requestId。
-	economy_transaction = true
-	_on_busy(true)
-	var result := await execute(str(payload.action), payload.params, true)
-	economy_transaction = false
-	_on_busy(client.busy)
-	if result.get("ok", false):
-		message.text = "操作完成 · 状态版本 %s" % client.revision
 
 const STAT_NAMES := {"Food": "食物", "Production": "生产", "Gold": "金币",
 	"Science": "科研", "Culture": "文化", "Faith": "信仰"}
@@ -1278,7 +1075,7 @@ func _populate_city() -> void:
 	_populate_queue(editable)
 	_populate_citizen(editable)
 	_populate_constructions()
-	_populate_economy()
+	economy_panel_inst.populate_economy()
 
 # 产出来源明细填入可折叠容器，默认折叠；无明细时禁用切换按钮，避免概况页过长。
 func _populate_breakdown() -> void:
@@ -1424,10 +1221,10 @@ func _populate_queue(editable: bool) -> void:
 			for item in _economy().get("queuePurchases", []):
 				if int(item.index) != idx:
 					continue
-				var payload := _economy_request("cityPurchase", {"name": str(item.name), "stat": "Gold", "queueIndex": idx}, item.get("goldCost"))
-				var buy := button(row, "金币购买此项 · %s" % _num(item.get("goldCost"), true), _open_economy.bind(payload))
+				var payload: Dictionary = economy_panel_inst.economy_request("cityPurchase", {"name": str(item.name), "stat": "Gold", "queueIndex": idx}, item.get("goldCost"))
+				var buy := button(row, "金币购买此项 · %s" % _num(item.get("goldCost"), true), economy_panel_inst.open_economy.bind(payload))
 				buy.name = "QueuePurchase"
-				_economy_button_metadata(buy, item, idx)
+				economy_panel_inst.economy_button_metadata(buy, item, idx)
 
 func _populate_constructions() -> void:
 	# 记住刷新前的选中项目名，重建后按名称恢复；本地筛选只影响展示，不改变内核候选或排序。

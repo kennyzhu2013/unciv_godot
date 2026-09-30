@@ -288,8 +288,8 @@ func commit_vote(p: Dictionary) -> void:
 		return
 	transaction = true
 	orchestrator._on_busy(true)
-	# execute 签名（删 vote/great_person/event/religious/diplomatic/asset_commit 布尔后）：economic 单布尔 + committing。
-	var result: Dictionary = await orchestrator.execute(str(p.action), p.params, false, self)
+	# execute 签名（7 个 commit 布尔全部删除后）：仅剩 committing（提交方控制器）。
+	var result: Dictionary = await orchestrator.execute(str(p.action), p.params, self)
 	transaction = false
 	orchestrator._on_busy(orchestrator.client.busy)
 	orchestrator.message.text = summary_text(orchestrator.client.snapshot.get("diplomaticVote", {})) if result.get("ok", false) or uncertain else str(result.get("error", {}).get("message", "操作未完成，请查看最新状态。"))

@@ -361,8 +361,8 @@ func confirm_religion() -> void:
 		return
 	transaction = true
 	orchestrator._on_busy(true)
-	# execute 签名（删 religious/diplomatic/asset_commit 布尔后）：economic 单布尔 + committing。
-	var res: Dictionary = await orchestrator.execute(str(p.action), p.params, false, self)
+	# execute 签名（7 个 commit 布尔全部删除后）：仅剩 committing（提交方控制器）。
+	var res: Dictionary = await orchestrator.execute(str(p.action), p.params, self)
 	transaction = false
 	orchestrator._on_busy(orchestrator.client.busy)
 	if res.get("ok", false):

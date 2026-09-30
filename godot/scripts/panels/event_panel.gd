@@ -195,8 +195,8 @@ func confirm_event() -> void:
 		return
 	transaction = true
 	orchestrator._on_busy(true)
-	# execute 签名（删 event/religious/diplomatic/asset_commit 布尔后）：economic 单布尔 + committing。
-	var res: Dictionary = await orchestrator.execute("eventChoose", p.params, false, self)
+	# execute 签名（7 个 commit 布尔全部删除后）：仅剩 committing（提交方控制器）。
+	var res: Dictionary = await orchestrator.execute("eventChoose", p.params, self)
 	if res.get("ok", false):
 		orchestrator.message.text = "事件已处置。"
 	transaction = false

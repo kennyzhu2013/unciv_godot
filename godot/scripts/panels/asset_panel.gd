@@ -102,8 +102,8 @@ func confirm_asset() -> void:
 		return
 	transaction = true
 	orchestrator._on_busy(true)
-	# execute 签名（删 asset_commit 布尔后）：economic 单布尔 + committing。
-	await orchestrator.execute("assetDecision", p.params, false, self)
+	# execute 签名（7 个 commit 布尔全部删除后）：仅剩 committing（提交方控制器）。
+	await orchestrator.execute("assetDecision", p.params, self)
 	transaction = false
 	orchestrator._on_busy(orchestrator.client.busy)
 
