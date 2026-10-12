@@ -9,6 +9,7 @@ const ReligionPanelScript = preload("res://scripts/panels/religion_panel.gd")
 const DiplomacyPanelScript = preload("res://scripts/panels/diplomacy_panel.gd")
 const AssetPanelScript = preload("res://scripts/panels/asset_panel.gd")
 const EconomyPanelScript = preload("res://scripts/panels/economy_panel.gd")
+const CityDevelopmentPanelScript = preload("res://scripts/panels/city_development_panel.gd")
 var client = ClientScript.new()
 var map = MapScript.new()
 var top_status := Label.new()
@@ -18,7 +19,6 @@ var pending := Label.new()
 var map_area := Control.new()
 var unit_picker := OptionButton.new()
 var city_picker := OptionButton.new()
-var production_picker := OptionButton.new()
 var research_picker := OptionButton.new()
 var policy_picker := OptionButton.new()
 var file_dialog := FileDialog.new()
@@ -35,7 +35,6 @@ var panels: Array = []
 var founding_button: Button
 var move_button: Button
 var turn_button: Button
-var production_button: Button
 var confirmation := ConfirmationDialog.new()
 var unit_actions := VBoxContainer.new()
 var combat_panel := VBoxContainer.new()
@@ -50,27 +49,58 @@ var raze_revision := -1
 # 资产处置沿用占城显示区域 capture_panel（与 cityCapture 共享，仍归 main 持有），但确认、票据和事务独立。
 # 资产事务域已迁移至 panels/asset_panel.gd（TransactionController 子类）；main 仅持有实例引用。
 var asset_panel_inst = AssetPanelScript.new()
-# 工人与城市发展（dev5）：面板容器按需重建，动态按钮统一走 button() 进入 buttons 以复用 busy 管理。
+# 工人施工区仍在 main。城市发展（概况／人口／队列）在 city_development_panel.gd。
+# 下列属性转发同一批节点，smoke 与 busy 继续通过 main 访问。
 var worker_panel := VBoxContainer.new()
-var city_panel := VBoxContainer.new()
-var citizen_actions := VBoxContainer.new()
-var queue_box := VBoxContainer.new()
-var city_overview := Label.new()
-var city_growth := Label.new()
-var focus_box := VBoxContainer.new()
-var specialist_box := VBoxContainer.new()
+var city_dev = CityDevelopmentPanelScript.new()
 var city_data: Dictionary = {}
 var city_mode := false
 var citizen_tile: Dictionary = {}
-var citizen_toggle: Button
-var citizen_yields_toggle: CheckBox
+var city_panel: VBoxContainer:
+	get:
+		return city_dev.city_panel
+var citizen_actions: VBoxContainer:
+	get:
+		return city_dev.citizen_actions
+var queue_box: VBoxContainer:
+	get:
+		return city_dev.queue_box
+var focus_box: VBoxContainer:
+	get:
+		return city_dev.focus_box
+var specialist_box: VBoxContainer:
+	get:
+		return city_dev.specialist_box
+var citizen_toggle: Button:
+	get:
+		return city_dev.citizen_toggle
+var city_tabs: TabContainer:
+	get:
+		return city_dev.city_tabs
+var city_summary: Label:
+	get:
+		return city_dev.city_summary
+var breakdown_box: VBoxContainer:
+	get:
+		return city_dev.breakdown_box
+var production_filter: LineEdit:
+	get:
+		return city_dev.production_filter
+var production_picker: OptionButton:
+	get:
+		return city_dev.production_picker
+var production_button: Button:
+	get:
+		return city_dev.production_button
+var focus_option: OptionButton:
+	get:
+		return city_dev.focus_option
 # 工人施工预览-执行分离：候选下拉、详情文本、执行按钮与当前候选 DTO 列表。
 var worker_option: OptionButton = null
 var worker_detail: Label = null
 var worker_start: Button = null
 var worker_options: Array = []
 # 城市焦点紧凑选项控件（保留 DTO 中所有启用项，选中即应用）。
-var focus_option: OptionButton = null
 # 界面与交互完善：三级信息分区（一级页签／城市子页／详情）＋选择状态机。
 # 一级页签固定为 单位／城市／事项；城市页二级子页固定为 概况／人口／队列。
 const TAB_UNIT := 0
@@ -82,17 +112,9 @@ const CTAB_OVERVIEW := 0
 const CTAB_POPULATION := 1
 const CTAB_QUEUE := 2
 var tabs: TabContainer
-var city_tabs: TabContainer
-var city_summary := Label.new()
 var unit_scroll: ScrollContainer
 var matters_scroll: ScrollContainer
-var overview_scroll: ScrollContainer
-var population_scroll: ScrollContainer
-var queue_scroll: ScrollContainer
 var bottom_pending := Label.new()
-var breakdown_toggle: Button
-var breakdown_box := VBoxContainer.new()
-var production_filter := LineEdit.new()   # 候选项目本地文本筛选（不改变内核候选或排序）
 var _updating_pickers := false            # 重建下拉时抑制 item_selected 回调，避免误触发重新选择
 # 前端本地选择状态（不写入存档）：活动上下文、页签、选择代际与重载纪元。
 var active_context := ""        # "" | "unit" | "city" | "tile"
@@ -144,6 +166,7 @@ func _ready() -> void:
 	panels.append(asset_panel_inst)
 	economy_panel_inst.orchestrator = self
 	panels.append(economy_panel_inst)
+	city_dev.orchestrator = self
 	var system_font := SystemFont.new()
 	system_font.font_names = PackedStringArray(["Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC"])
 	theme = Theme.new()
@@ -329,79 +352,7 @@ func _build_city_tab() -> void:
 	city_picker.item_selected.connect(func(index):
 		if not _updating_pickers:
 			await _activate_city(str(city_picker.get_item_metadata(index))))
-	city_summary.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	city_summary.text = "选择一座己方城市进行管理。"
-	city_page.add_child(city_summary)
-	city_panel.hide()
-	# city_panel 直接位于城市页（非滚动容器），必须纵向 EXPAND_FILL 才能让内部 city_tabs
-	# 及其滚动子页获得真实高度；否则容器塌陷为页签栏高度，子页内容被裁剪到不可见/不可点击。
-	city_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	city_panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	city_page.add_child(city_panel)
-	city_tabs = TabContainer.new()
-	city_tabs.name = "CityTabs"
-	city_tabs.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	city_tabs.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	city_tabs.tab_selected.connect(_on_city_tab_selected)
-	city_panel.add_child(city_tabs)
-	# 概况子页：产出、粮食、增长／饥荒，来源明细可折叠。
-	var overview := _city_sub_page("概况")
-	overview_scroll = overview.get_parent()
-	city_overview.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	overview.add_child(city_overview)
-	city_growth.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	overview.add_child(city_growth)
-	breakdown_toggle = button(overview, "产出来源明细", func(): breakdown_box.visible = not breakdown_box.visible)
-	breakdown_box.visible = false
-	overview.add_child(breakdown_box)
-	# 人口子页：焦点、避免增长、Reset、地块操作与专家。
-	var population := _city_sub_page("人口")
-	population_scroll = population.get_parent()
-	population.add_child(focus_box)
-	citizen_toggle = button(population, "管理城市地块", _toggle_city_mode)
-	citizen_toggle.name = "ManageCitizenTiles"
-	# 人口模式图例与“显示产出”开关：图例说明地图标记，开关控制地块产出数值叠加。
-	var legend := Label.new()
-	legend.name = "CitizenLegend"
-	legend.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	legend.add_theme_color_override("font_color", Color("9fb2c0"))
-	legend.text = "地图图例：绿点＝已工作 · 青圈＝可工作 · 金标＝锁定 · 红框＝封锁"
-	population.add_child(legend)
-	citizen_yields_toggle = CheckBox.new()
-	citizen_yields_toggle.name = "CitizenYieldsToggle"
-	citizen_yields_toggle.text = "显示地块产出"
-	citizen_yields_toggle.button_pressed = true
-	citizen_yields_toggle.toggled.connect(func(on: bool): map.set_show_citizen_yields(on))
-	population.add_child(citizen_yields_toggle)
-	population.add_child(citizen_actions)
-	label(population, "专家")
-	population.add_child(specialist_box)
-	# 队列子页：已有队列 + 候选生产。
-	var queue_page := _city_sub_page("队列")
-	queue_scroll = queue_page.get_parent()
-	label(queue_page, "生产队列")
-	queue_page.add_child(queue_box)
-	label(queue_page, "可加入项目")
-	queue_page.add_child(production_filter)
-	production_filter.placeholder_text = "筛选候选项目…"
-	production_filter.text_changed.connect(func(_text): _populate_constructions())
-	queue_page.add_child(production_picker)
-	production_picker.name = "ProductionPicker"
-	production_picker.item_selected.connect(func(_index): _on_busy(client.busy))
-	var production_row := HBoxContainer.new()
-	production_row.add_theme_constant_override("separation", 6)
-	queue_page.add_child(production_row)
-	# “设为当前生产”仅用于旧协议支持的普通项目；持续项目只能用“加入队列”。
-	production_button = button(production_row, "设为当前生产", func():
-		var pname := _production_selected_name()
-		if not pname.is_empty():
-			await execute("production", {"cityId": city_id, "name": pname}))
-	production_button.name = "SetCurrentProduction"
-	var enqueue := button(production_row, "加入队列", func():
-		var pname := _production_selected_name()
-		if not pname.is_empty():
-			await _city_queue("add", pname, -1))
-	enqueue.name = "EnqueueProduction"
+	city_dev.build(city_page)
 	economy_panel_inst.build_tab()
 
 func _diplomacy_text(parent: Node, text: String) -> void:
@@ -417,17 +368,7 @@ func _religion_text(parent: Node, text: String) -> void:
 	parent.add_child(line)
 
 func _city_sub_page(sub_name: String) -> VBoxContainer:
-	var scroll := ScrollContainer.new()
-	scroll.name = sub_name
-	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	city_tabs.add_child(scroll)
-	var page := VBoxContainer.new()
-	page.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	page.add_theme_constant_override("separation", 8)
-	scroll.add_child(page)
-	return page
+	return city_dev.sub_page(sub_name)
 
 func _build_matters_tab() -> void:
 	var page := _page_scroll("事项")
@@ -1056,448 +997,19 @@ func _format_stats(stats) -> String:
 	return " ".join(parts) if not parts.is_empty() else "—"
 
 func _populate_city() -> void:
-	var editable: bool = city_data.get("editable", false)
-	# 城市页顶部固定摘要：名称／人口／可管理状态（不随子页滚动）。
-	city_summary.text = "%s · 人口 %s%s" % [str(city_data.get("name", "")), _num(city_data.get("population"), true),
-		("" if editable else "（不可管理：%s）" % str(city_data.get("reason", "")))]
-	city_overview.text = "每回合产出：%s" % _format_stats(city_data.get("stats", {}))
-	var growth: Dictionary = city_data.get("growth", {})
-	var state := "停滞"
-	if growth.get("isStarving", false):
-		state = "饥荒中"
-	elif growth.get("isGrowing", false):
-		state = "增长中"
-	city_growth.text = "粮食 %s/%s（%s/回合）· %s" % [
-		_num(growth.get("foodStored"), true), _num(growth.get("foodToNext"), true), _num(growth.get("foodPerTurn"), true), state]
-	_populate_breakdown()
-	_populate_focus(editable)
-	_populate_specialists(editable)
-	_populate_queue(editable)
-	_populate_citizen(editable)
-	_populate_constructions()
-	economy_panel_inst.populate_economy()
-
-# 产出来源明细填入可折叠容器，默认折叠；无明细时禁用切换按钮，避免概况页过长。
-func _populate_breakdown() -> void:
-	_clear_dynamic(breakdown_box)
-	var breakdown: Dictionary = city_data.get("statsBreakdown", {})
-	if breakdown.is_empty():
-		breakdown_toggle.disabled = true
-		breakdown_box.visible = false
-		return
-	breakdown_toggle.disabled = false
-	for source in breakdown:
-		var line := Label.new()
-		line.text = "· %s：%s" % [str(source), _format_stats(breakdown[source])]
-		line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		breakdown_box.add_child(line)
-
-func _populate_focus(editable: bool) -> void:
-	_clear_dynamic(focus_box)
-	focus_option = null
-	var options: Array = city_data.get("focusOptions", [])
-	if not options.is_empty():
-		var picker_row := HBoxContainer.new()
-		picker_row.add_theme_constant_override("separation", 6)
-		focus_box.add_child(picker_row)
-		var caption := Label.new()
-		caption.text = "焦点"
-		picker_row.add_child(caption)
-		focus_option = OptionButton.new()
-		focus_option.name = "FocusPicker"
-		focus_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		var current := -1
-		for index in range(options.size()):
-			var option: Dictionary = options[index]
-			focus_option.add_item(str(option.get("label", option.get("id"))))
-			focus_option.set_item_metadata(index, str(option.get("id")))
-			if option.get("current", false):
-				current = index
-		focus_option.item_selected.connect(_city_focus_selected)
-		picker_row.add_child(focus_option)
-		if current >= 0:
-			focus_option.select(current)
-		focus_option.disabled = not editable
-		focus_option.tooltip_text = "" if editable else str(city_data.get("reason", ""))
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 6)
-	focus_box.add_child(row)
-	var avoid := button(row, "避免增长：开" if city_data.get("avoidGrowth", false) else "避免增长：关",
-		func(): await _run_city("cityAvoidGrowth", {"enabled": not city_data.get("avoidGrowth", false)}))
-	avoid.set_meta("allowed", editable)
-	avoid.name = "AvoidGrowth"
-	var reset := button(row, "重置人口分配", func(): await _run_city("cityResetCitizens", {}))
-	reset.set_meta("allowed", editable)
-	reset.name = "ResetCitizens"
-
-func _city_focus_selected(index: int) -> void:
-	if focus_option == null:
-		return
-	await _city_focus(str(focus_option.get_item_metadata(index)))
-
-func _populate_specialists(editable: bool) -> void:
-	_clear_dynamic(specialist_box)
-	var specialists: Dictionary = city_data.get("specialists", {})
-	var manual: bool = specialists.get("manual", false)
-	var header := Label.new()
-	header.text = "空闲人口 %s · 专家模式：%s" % [_num(specialists.get("freePopulation"), true), "手动" if manual else "自动"]
-	specialist_box.add_child(header)
-	var toggle := button(specialist_box, "切换为自动专家" if manual else "切换为手动专家",
-		_city_specialist.bind("setManual", "", not manual))
-	toggle.name = "SpecialistManualToggle"
-	toggle.set_meta("allowed", editable)
-	for slot in specialists.get("slots", []):
-		var row := HBoxContainer.new()
-		row.add_theme_constant_override("separation", 6)
-		specialist_box.add_child(row)
-		var lbl := Label.new()
-		lbl.text = "%s %s/%s · %s" % [str(slot.get("name")), _num(slot.get("assigned"), true), _num(slot.get("max"), true),
-			_format_stats(slot.get("stats", {}))]
-		lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		row.add_child(lbl)
-		var minus := button(row, "−", _city_specialist.bind("unassign", str(slot.get("name")), false))
-		minus.name = "SpecialistUnassign"
-		minus.set_meta("slot", str(slot.get("name")))
-		minus.set_meta("allowed", editable and slot.get("canUnassign", false))
-		var plus := button(row, "＋", _city_specialist.bind("assign", str(slot.get("name")), false))
-		plus.name = "SpecialistAssign"
-		plus.set_meta("slot", str(slot.get("name")))
-		plus.set_meta("allowed", editable and slot.get("canAssign", false))
-
-func _populate_queue(editable: bool) -> void:
-	_clear_dynamic(queue_box)
-	var entries: Array = city_data.get("queueEntries", [])
-	if entries.is_empty():
-		var empty := Label.new()
-		empty.text = "（空队列）"
-		queue_box.add_child(empty)
-		return
-	var revision: int = int(client.revision)
-	for entry in entries:
-		var idx := int(entry.get("index", 0))
-		var row := VBoxContainer.new()
-		row.name = "QueueEntry"
-		# 队列条目按 index＋revision 定位，供自动化稳定识别，不靠中文文本或 child 下标。
-		row.set_meta("queueIndex", idx)
-		row.set_meta("revision", revision)
-		queue_box.add_child(row)
-		var line := Label.new()
-		var progress: String
-		if entry.get("perpetual", false):
-			progress = "持续"
-		else:
-			var done = entry.get("workDone")
-			var cost = entry.get("cost")
-			var turns = entry.get("turns")
-			progress = "%s/%s 锤 · %s 回合" % [_num(done, true) if done != null else "0",
-				_num(cost, true) if cost != null else "?", _num(turns, true) if turns != null else "?"]
-		# 显示序号从 1 起；协议仍传零基 index。
-		line.text = "%d. %s%s · %s" % [idx + 1, str(entry.get("name")),
-			("（当前）" if entry.get("current", false) else ""), progress]
-		line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		row.add_child(line)
-		var controls := HBoxContainer.new()
-		controls.add_theme_constant_override("separation", 6)
-		row.add_child(controls)
-		var up := button(controls, "上移", _city_queue.bind("raise", "", idx))
-		up.name = "QueueRaise"
-		up.set_meta("allowed", editable and entry.get("canRaise", false))
-		up.set_meta("role", "raise")
-		up.set_meta("queueIndex", idx)
-		up.set_meta("revision", revision)
-		var down := button(controls, "下移", _city_queue.bind("lower", "", idx))
-		down.name = "QueueLower"
-		down.set_meta("allowed", editable and entry.get("canLower", false))
-		down.set_meta("role", "lower")
-		down.set_meta("queueIndex", idx)
-		down.set_meta("revision", revision)
-		var remove := button(controls, "删除", _city_queue.bind("remove", "", idx))
-		remove.name = "QueueRemove"
-		remove.set_meta("allowed", editable and entry.get("canRemove", false))
-		remove.set_meta("role", "remove")
-		remove.set_meta("queueIndex", idx)
-		remove.set_meta("revision", revision)
-		if not entry.get("perpetual", false):
-			for item in _economy().get("queuePurchases", []):
-				if int(item.index) != idx:
-					continue
-				var payload: Dictionary = economy_panel_inst.economy_request("cityPurchase", {"name": str(item.name), "stat": "Gold", "queueIndex": idx}, item.get("goldCost"))
-				var buy := button(row, "金币购买此项 · %s" % _num(item.get("goldCost"), true), economy_panel_inst.open_economy.bind(payload))
-				buy.name = "QueuePurchase"
-				economy_panel_inst.economy_button_metadata(buy, item, idx)
-
-func _populate_constructions() -> void:
-	# 记住刷新前的选中项目名，重建后按名称恢复；本地筛选只影响展示，不改变内核候选或排序。
-	var previous := _production_selected_name()
-	var filter := production_filter.text.strip_edges().to_lower()
-	production_picker.clear()
-	# 按单位／建筑／持续／其他分类，用分隔符分组展示。
-	for category in PRODUCTION_CATEGORIES:
-		var added := false
-		for construction in city_data.get("constructions", []):
-			var ctype := str(construction.get("type", "other"))
-			if ctype != str(category[0]):
-				continue
-			var cname := str(construction.get("name"))
-			if not filter.is_empty() and not cname.to_lower().contains(filter):
-				continue
-			if not added:
-				production_picker.add_separator(str(category[1]))
-				added = true
-			production_picker.add_item(cname)
-			var index := production_picker.item_count - 1
-			production_picker.set_item_metadata(index, {"name": cname, "type": ctype})
-			production_picker.set_item_disabled(index, not construction.get("enabled", false))
-			production_picker.set_item_tooltip(index, str(construction.get("reason", "")))
-	# 恢复选择：按名称找回；项目失效后明确清空，不悄悄选第一项。
-	var restored := _production_index_by_name(previous)
-	if restored >= 0:
-		production_picker.select(restored)
-	elif previous.is_empty():
-		var first := _first_enabled_production()
-		if first >= 0:
-			production_picker.select(first)
-	_on_busy(client.busy)
-
-func _production_selected_name() -> String:
-	if production_picker.selected < 0:
-		return ""
-	var meta = production_picker.get_item_metadata(production_picker.selected)
-	return str(meta.get("name", "")) if meta is Dictionary else ""
-
-func _production_selected_type() -> String:
-	if production_picker.selected < 0:
-		return ""
-	var meta = production_picker.get_item_metadata(production_picker.selected)
-	return str(meta.get("type", "")) if meta is Dictionary else ""
-
-func _production_index_by_name(wanted: String) -> int:
-	if wanted.is_empty():
-		return -1
-	for index in range(production_picker.item_count):
-		var meta = production_picker.get_item_metadata(index)
-		if meta is Dictionary and str(meta.get("name", "")) == wanted:
-			return index
-	return -1
-
-func _first_enabled_production() -> int:
-	for index in range(production_picker.item_count):
-		var meta = production_picker.get_item_metadata(index)
-		if meta is Dictionary and not production_picker.is_item_disabled(index):
-			return index
-	return -1
+	city_dev._populate_city()
 
 func _populate_citizen(editable: bool) -> void:
-	_clear_dynamic(citizen_actions)
-	if not city_mode:
-		map.set_citizen_tiles([])
-		return
-	map.set_citizen_tiles(city_data.get("citizenTiles", []))
-	if citizen_tile.is_empty():
-		var hint := Label.new()
-		hint.text = "地块管理已开启：左键点击地图中带标记的地块，再用下方按钮分配／撤回／锁定／解锁。此模式下右键不触发移动或攻击。"
-		hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		citizen_actions.add_child(hint)
-		return
-	var header := Label.new()
-	header.text = "地块 (%s, %s)%s%s · 产出 %s" % [_num(citizen_tile.get("x"), true), _num(citizen_tile.get("y"), true),
-		(" · 已工作" if citizen_tile.get("worked", false) else ""),
-		(" · 锁定" if citizen_tile.get("locked", false) else ""),
-		_format_stats(citizen_tile.get("yields", {}))]
-	header.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	citizen_actions.add_child(header)
-	var row := GridContainer.new()
-	row.columns = 2
-	row.add_theme_constant_override("h_separation", 6)
-	row.add_theme_constant_override("v_separation", 6)
-	citizen_actions.add_child(row)
-	_citizen_button(row, "分配人口", "work", editable, citizen_tile.get("canWork", false))
-	_citizen_button(row, "撤回人口", "unwork", editable, citizen_tile.get("canUnwork", false))
-	_citizen_button(row, "锁定", "lock", editable, citizen_tile.get("canLock", false))
-	_citizen_button(row, "解锁", "unlock", editable, citizen_tile.get("canUnlock", false))
-
-func _citizen_button(parent: Node, text: String, type: String, editable: bool, allowed: bool) -> void:
-	var control := button(parent, text, _city_citizen.bind(type))
-	control.name = "Citizen" + type.capitalize()
-	control.set_meta("role", type)
-	control.set_meta("allowed", editable and allowed)
-
-func _populate_worker(worker: Dictionary, _id: int) -> void:
-	_clear_dynamic(worker_panel)
-	worker_options = []
-	worker_option = null
-	worker_detail = null
-	worker_start = null
-	if worker.is_empty():
-		worker_panel.hide()
-		return
-	worker_panel.show()
-	# 当前工程卡：supported=false 时保留状态与原因，不直接隐藏（非施工单位也走此分支，不按名称硬编码）。
-	var card := Label.new()
-	card.name = "WorkerCard"
-	card.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	worker_panel.add_child(card)
-	if not worker.get("supported", false):
-		var reason := str(worker.get("reason", ""))
-		card.text = "不支持施工%s" % (("：" + reason) if not reason.is_empty() else "。")
-		return
-	var in_progress = worker.get("inProgress")
-	var block := str(worker.get("reason", ""))
-	if in_progress is Dictionary:
-		card.text = "当前工程：%s · 剩余 %s 工作回合%s" % [in_progress.get("name"),
-			_num(in_progress.get("turnsLeft"), true), "（修复）" if in_progress.get("isRepair", false) else ""]
-		if not block.is_empty():
-			card.text += "\n暂不能推进：%s" % block
-	elif not block.is_empty():
-		card.text = "当前无工程：%s" % block
-	else:
-		card.text = "当前无工程：选择下方候选改良并预览后开始施工。"
-	# 候选选择 + 详情 + 执行按钮（预览-执行分离，不再用拥挤长按钮同时承担说明与执行）。
-	worker_options = worker.get("improvements", [])
-	if not worker_options.is_empty():
-		label(worker_panel, "候选改良（先预览再施工）")
-		worker_option = OptionButton.new()
-		worker_option.name = "WorkerCandidates"
-		for index in range(worker_options.size()):
-			var option: Dictionary = worker_options[index]
-			var suffix := "（进行中）" if option.get("current", false) else ""
-			worker_option.add_item("%s · %s回合%s" % [str(option.get("name")), _num(option.get("turns"), true), suffix])
-			worker_option.set_item_metadata(index, index)
-			worker_option.set_item_disabled(index, not option.get("enabled", false))
-			worker_option.set_item_tooltip(index, str(option.get("reason", "")))
-		worker_option.item_selected.connect(_preview_worker_option)
-		worker_panel.add_child(worker_option)
-		worker_detail = Label.new()
-		worker_detail.name = "WorkerDetail"
-		worker_detail.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		worker_panel.add_child(worker_detail)
-		worker_start = button(worker_panel, "开始施工", _start_worker)
-		worker_start.name = "WorkerStart"
-		var first := _first_enabled_worker_option()
-		if first >= 0:
-			worker_option.select(first)
-			_preview_worker_option(first)
-		else:
-			worker_start.set_meta("allowed", false)
-			worker_detail.text = "当前没有可施工的候选改良。"
-	# 修复与取消保持独立按钮与原规则权限。
-	var repair: Dictionary = worker.get("repair", {})
-	if repair.get("available", false) or not str(repair.get("reason", "")).is_empty():
-		var repair_button := button(worker_panel, "修复受损设施 · %s回合" % _num(repair.get("turns", 0), true), _worker_order.bind("repair", ""))
-		repair_button.name = "WorkerRepair"
-		repair_button.set_meta("allowed", repair.get("available", false))
-		repair_button.tooltip_text = str(repair.get("reason", ""))
-	var cancel: Dictionary = worker.get("cancel", {})
-	if cancel.get("available", false) or not str(cancel.get("reason", "")).is_empty():
-		var cancel_button := button(worker_panel, "取消当前工程", _worker_order.bind("cancel", ""))
-		cancel_button.name = "WorkerCancel"
-		cancel_button.set_meta("allowed", cancel.get("available", false))
-		cancel_button.tooltip_text = str(cancel.get("reason", ""))
-	_on_busy(client.busy)
-
-func _first_enabled_worker_option() -> int:
-	for index in range(worker_options.size()):
-		if worker_options[index].get("enabled", false):
-			return index
-	return -1
-
-# 预览候选：分别展示原生 yieldDelta、维护费与可见资源提示，不把维护费误称城市净产出。
-func _preview_worker_option(index: int) -> void:
-	if index < 0 or index >= worker_options.size() or worker_detail == null:
-		return
-	var option: Dictionary = worker_options[index]
-	var lines := PackedStringArray()
-	lines.append("工期：%s 工作回合" % _num(option.get("turns"), true))
-	lines.append("产出变化：%s" % _format_stats(option.get("yieldDelta", {})))
-	lines.append("维护费：%s" % _format_stats(option.get("maintenance", {})))
-	if option.get("providesResource") != null:
-		lines.append("接通资源：%s" % str(option.get("providesResource")))
-	var reason := str(option.get("reason", ""))
-	if not option.get("enabled", false) and not reason.is_empty():
-		lines.append("不可施工：%s" % reason)
-	worker_detail.text = "\n".join(lines)
-	if worker_start:
-		worker_start.text = "继续施工" if option.get("current", false) else "开始施工"
-		worker_start.set_meta("allowed", option.get("enabled", false))
-		worker_start.tooltip_text = reason
-	_on_busy(client.busy)
-
-func _start_worker() -> void:
-	if worker_option == null or worker_option.selected < 0:
-		return
-	var index := worker_option.selected
-	if index < 0 or index >= worker_options.size():
-		return
-	var option: Dictionary = worker_options[index]
-	if not option.get("enabled", false):
-		return
-	await _worker_order("start", str(option.get("name")))
-
-
-func _worker_order(type: String, name: String) -> void:
-	if _input_locked() or unit_id < 0:
-		return
-	var params := {"unitId": unit_id, "type": type}
-	if type == "start":
-		params["name"] = name
-	# 成功后由 execute → _refresh_active_context 统一重解析单位面板（含工人施工区），
-	# 无需在此显式重选，避免二次查询。
-	await execute("workerOrder", params)
-
-# 城市写命令统一入口：写命令返回快照后由 execute → _refresh_active_context 重解析城市面板，
-# 保留地块管理模式与选中地块，无需在此显式重选（避免二次查询）。
-func _run_city(action: String, extra: Dictionary = {}) -> void:
-	if _input_locked() or city_id.is_empty():
-		return
-	var params := {"cityId": city_id}
-	params.merge(extra, true)
-	await execute(action, params)
-
-func _city_focus(focus_id: String) -> void:
-	await _run_city("cityFocus", {"focus": focus_id})
-
-func _city_citizen(type: String) -> void:
-	if citizen_tile.is_empty():
-		return
-	await _run_city("cityCitizen", {"x": int(citizen_tile.get("x")), "y": int(citizen_tile.get("y")), "type": type})
-
-func _city_specialist(type: String, name: String, enabled: bool) -> void:
-	var extra := {"type": type, "name": name}
-	if type == "setManual":
-		extra["enabled"] = enabled
-	await _run_city("citySpecialists", extra)
-
-func _city_queue(type: String, name: String, index: int) -> void:
-	var extra := {"type": type}
-	if type == "add":
-		extra["name"] = name
-	else:
-		extra["index"] = index
-	await _run_city("cityQueue", extra)
-
-func _toggle_city_mode() -> void:
-	_set_city_mode(not city_mode)
+	city_dev._populate_citizen(editable)
 
 func _set_city_mode(enabled: bool) -> void:
-	if enabled:
-		_set_buy_tile_mode(false)
-	city_mode = enabled and not city_id.is_empty() and city_data.get("editable", false)
-	if citizen_toggle:
-		citizen_toggle.text = "退出地块管理" if city_mode else "管理城市地块"
-	# 进出城市地块管理都清除路径／可达／攻击目标及起点，避免残留交互标记误导；
-	# 退出后由单位查询（_resolve_unit）重建操作范围。
-	map.reachable.clear()
-	map.attack_targets.clear()
-	map.attack_from.clear()
-	map.route.clear()
-	if not city_mode:
-		citizen_tile = {}
-		map.set_citizen_tiles([])
-		_clear_dynamic(citizen_actions)
-	elif not city_data.is_empty():
-		_populate_citizen(true)
-	map.queue_redraw()
+	city_dev._set_city_mode(enabled)
 
+func _production_selected_name() -> String:
+	return city_dev._production_selected_name()
+
+func _production_selected_type() -> String:
+	return city_dev._production_selected_type()
 
 func _preview_move(tile: Dictionary) -> void:
 	if _input_locked() or unit_id < 0:

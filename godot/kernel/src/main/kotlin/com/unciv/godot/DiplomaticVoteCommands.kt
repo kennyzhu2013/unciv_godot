@@ -129,8 +129,11 @@ internal class DiplomaticVoteCommands(private val game: GameInfo, private val se
             "supported" to status.boolean("supported"), "enabled" to status.boolean("enabled"), "reason" to reason,
             "message" to reason.ifEmpty { if (mode == "acknowledge") "请到事项页查看并确认外交投票结果" else "请到事项页投票或明确弃权" })
     }
-    fun prepare(request: JsonObject): () -> Unit = when (request.text("action")) {
-        "diplomaticVoteCast" -> {
+    fun prepare(request: JsonObject): () -> Unit {
+        val action = DiplomaticVoteWire.fromWire(request.text("action"))
+            ?: throw GatewayError("UNKNOWN_COMMAND", "未实现的外交投票命令")
+        return when (action) {
+        DiplomaticVoteWire.Cast -> {
             val choice = text(request, "choice")
             ensure(choice == "civilization" || choice == "abstain", "INVALID_ARGUMENT", "choice 必须为 civilization 或 abstain")
             checkKeys(request, if (choice == "civilization") setOf("choice", "decisionToken", "civId") else setOf("choice", "decisionToken"))
@@ -141,7 +144,7 @@ internal class DiplomaticVoteCommands(private val game: GameInfo, private val se
             ensure(target == null || candidates().any { it.civID == target }, "DIPLOMATIC_VOTE_CHOICE", "此目标不是当前可选文明")
             ({ player.diplomaticVoteForCiv(target) })
         }
-        "diplomaticVoteAcknowledge" -> {
+        DiplomaticVoteWire.Acknowledge -> {
             checkKeys(request, setOf("resultToken"))
             val suppliedToken = text(request, "resultToken")
             scope()
@@ -150,10 +153,31 @@ internal class DiplomaticVoteCommands(private val game: GameInfo, private val se
             ensure(suppliedToken == token("acknowledge"), "DIPLOMATIC_VOTE_RESULT", "投票结果已变化，请刷新后重新确认")
             ({ player.addFlag(CivFlags.ShowDiplomaticVotingResults.name, -1) })
         }
-        else -> throw GatewayError("UNKNOWN_COMMAND", "未实现的外交投票命令")
+        }
     }
     companion object {
         private val envelope = setOf("protocol", "session", "revision", "requestId", "action")
         private val voteFlags = listOf(CivFlags.TurnsTillNextDiplomaticVote, CivFlags.ShowDiplomaticVotingResults, CivFlags.ShouldResetDiplomaticVotes)
+    }
+}
+
+/** 外交投票写命令的唯一名单。未知 action 仍返回 UNKNOWN_COMMAND，与原先 prepare 的 else 分支一致。 */
+internal enum class DiplomaticVoteWire(val wireName: String) {
+    Cast("diplomaticVoteCast"),
+    Acknowledge("diplomaticVoteAcknowledge"),
+    ;
+
+    companion object {
+        fun fromWire(name: String) = entries.firstOrNull { it.wireName == name }
+        fun contribute(registry: CommandRegistry, session: GameSession) {
+            registry.query("diplomaticVoteOptions") {
+                DiplomaticVoteCommands(session.requireGame(), it.sessionId, it.revision).options(it.request)
+            }
+            for (action in entries) {
+                registry.effect(action.wireName) { ctx ->
+                    DiplomaticVoteCommands(session.requireGame(), ctx.sessionId, ctx.revision).prepare(ctx.request)
+                }
+            }
+        }
     }
 }

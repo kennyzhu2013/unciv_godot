@@ -125,3 +125,24 @@ internal class CombatCommands(private val game: GameInfo) {
         }
     }
 }
+
+internal fun contributeCombat(registry: CommandRegistry, session: GameSession) {
+    registry.query("combatPreview") {
+        val current = session.requireGame()
+        GameSession.validateGame(current)
+        CombatCommands(current).prepareAttack(it.request.integer("unitId"), HexCoord(it.request.integer("x"), it.request.integer("y"))).preview()
+    }
+    registry.effect("attack") { ctx ->
+        val current = session.requireGame()
+        GameSession.validateGame(current)
+        val combat = CombatCommands(current)
+        combat.ensureNoBlockingBattleDecision()
+        val preparedAttack = combat.prepareAttack(ctx.request.integer("unitId"), HexCoord(ctx.request.integer("x"), ctx.request.integer("y")))
+        val thunk: () -> Unit = { ctx.battleResult = preparedAttack.execute() }
+        thunk
+    }
+    registry.effect("unitAction") {
+        GameSession.validateGame(session.requireGame())
+        CombatCommands(session.requireGame()).prepareAction(it.request.integer("unitId"), it.request.text("type"))
+    }
+}

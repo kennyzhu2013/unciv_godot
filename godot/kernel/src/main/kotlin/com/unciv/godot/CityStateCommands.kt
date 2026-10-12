@@ -194,18 +194,12 @@ internal class CityStateCommands(private val game: GameInfo, private val session
 
     fun prepare(request: JsonObject): () -> Unit {
         GameSession.validateGame(game)
-        val action = request.text("action")
-        val keys = when (action) {
-            "cityStateGiftGold" -> setOf("civId", "amount", "cityStateToken")
-            "cityStatePledgeProtection", "cityStateRevokeProtection", "cityStateDeclareWar", "cityStateNegotiatePeace" -> setOf("civId")
-            "cityStateDemandTribute" -> setOf("civId", "kind", "cityStateToken")
-            "cityStateMarriage" -> setOf("civId", "cityStateToken")
-            else -> throw problem("UNSUPPORTED", "未接入的城邦命令")
-        }
-        ensure((request.keys - envelope - keys).isEmpty(), "INVALID_ARGUMENT", "含未支持的城邦参数")
+        val action = CityStateWire.fromWire(request.text("action"))
+            ?: throw problem("UNSUPPORTED", "未接入的城邦命令")
+        ensure((request.keys - envelope - action.keys).isEmpty(), "INVALID_ARGUMENT", "含未支持的城邦参数")
         val other = cityState(request.requiredCityStateText("civId"))
         when (action) {
-            "cityStateGiftGold" -> {
+            CityStateWire.GiftGold -> {
                 val amount = request.requiredCityStateInt("amount")
                 ensure(amount in giftAmounts, "INVALID_ARGUMENT", "赠金金额仅支持 250／500／1000")
                 ensure(request.requiredCityStateText("cityStateToken") == giftToken(other, amount),
@@ -213,15 +207,15 @@ internal class CityStateCommands(private val game: GameInfo, private val session
                 giftProblem(other, amount)?.let { throw it }
                 return { other.cityStateFunctions.receiveGoldGift(player, amount) }
             }
-            "cityStatePledgeProtection" -> {
+            CityStateWire.PledgeProtection -> {
                 pledgeProblem(other)?.let { throw it }
                 return { other.cityStateFunctions.addProtectorCiv(player) }
             }
-            "cityStateRevokeProtection" -> {
+            CityStateWire.RevokeProtection -> {
                 revokeProblem(other)?.let { throw it }
                 return { other.cityStateFunctions.removeProtectorCiv(player) }
             }
-            "cityStateDemandTribute" -> {
+            CityStateWire.DemandTribute -> {
                 val kind = request.requiredCityStateText("kind")
                 val worker = when (kind) {
                     "gold" -> false
@@ -233,11 +227,11 @@ internal class CityStateCommands(private val game: GameInfo, private val session
                 tributeProblem(other, worker)?.let { throw it }
                 return { if (worker) other.cityStateFunctions.tributeWorker(player) else other.cityStateFunctions.tributeGold(player) }
             }
-            "cityStateDeclareWar" -> {
+            CityStateWire.DeclareWar -> {
                 declareWarProblem(other)?.let { throw it }
                 return { player.getDiplomacyManager(other)!!.declareWar() }
             }
-            "cityStateNegotiatePeace" -> {
+            CityStateWire.NegotiatePeace -> {
                 peaceProblem(other)?.let { throw it }
                 return {
                     // 与原生 Negotiate Peace 按钮一致：纯和平条约经 TradeLogic 立即成交，不发送提案。
@@ -247,7 +241,7 @@ internal class CityStateCommands(private val game: GameInfo, private val session
                     logic.acceptTrade()
                 }
             }
-            "cityStateMarriage" -> {
+            CityStateWire.Marriage -> {
                 marriageProblem(other)?.let { throw it }
                 ensure(request.requiredCityStateText("cityStateToken") == marriageToken(other),
                     "CITY_STATE_TOKEN", "报价已变化，请刷新后重新确认")
@@ -258,7 +252,6 @@ internal class CityStateCommands(private val game: GameInfo, private val session
                     cities.forEach { player.popupAlerts.add(PopupAlert(AlertType.DiplomaticMarriage, it.id)) }
                 }
             }
-            else -> throw problem("UNSUPPORTED", "未接入的城邦命令")
         }
     }
 
@@ -274,3 +267,26 @@ private fun JsonObject.requiredCityStateText(key: String): String = (this[key] a
 private fun JsonObject.requiredCityStateInt(key: String): Int = (this[key] as? JsonPrimitive)
     ?.takeIf { !it.isString }?.intOrNull
     ?: throw GatewayError("INVALID_ARGUMENT", "缺少 JSON 整数参数：$key")
+
+/** 城邦写命令的唯一名单。新增命令时加一个枚举项，并在 [CityStateCommands.prepare] 补上对应分支（when 穷尽，漏分支无法编译）。 */
+internal enum class CityStateWire(val wireName: String, val keys: Set<String>) {
+    GiftGold("cityStateGiftGold", setOf("civId", "amount", "cityStateToken")),
+    PledgeProtection("cityStatePledgeProtection", setOf("civId")),
+    RevokeProtection("cityStateRevokeProtection", setOf("civId")),
+    DeclareWar("cityStateDeclareWar", setOf("civId")),
+    NegotiatePeace("cityStateNegotiatePeace", setOf("civId")),
+    DemandTribute("cityStateDemandTribute", setOf("civId", "kind", "cityStateToken")),
+    Marriage("cityStateMarriage", setOf("civId", "cityStateToken")),
+    ;
+
+    companion object {
+        fun fromWire(name: String) = entries.firstOrNull { it.wireName == name }
+        fun contribute(registry: CommandRegistry, session: GameSession) {
+            for (action in entries) {
+                registry.effect(action.wireName) { ctx ->
+                    CityStateCommands(session.requireGame(), ctx.sessionId, ctx.revision).prepare(ctx.request)
+                }
+            }
+        }
+    }
+}

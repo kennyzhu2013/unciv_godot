@@ -8,7 +8,7 @@ internal enum class CandidateSource { CURRENT, CLONE_TURN, LOADED }
 
 /**
  * 命令执行上下文：请求、会话标识、候选对局与输出槽。
- * 命令以 GameSession 内 lambda 形式定义，直接捕获 this 调用其私有助手，故此处只需携带数据。
+ * 领域命令在各自的 contribute 里登记；仍留在 GameSession 的少数命令会捕获会话私有助手。
  */
 internal class CommandContext(
     val request: JsonObject,
@@ -29,7 +29,14 @@ internal interface QueryCommand : GatewayCommand {
     fun data(ctx: CommandContext): JsonObject
 }
 
-/** 推进 revision 并回传 snapshot 的命令（mutation 与 lifecycle）。 */
+/**
+ * 推进 revision 并回传 snapshot 的命令（mutation 与 lifecycle）。
+ *
+ * prepare 在取备份之前运行，必须无副作用：只校验当前局，并返回稍后要执行的闭包。
+ * execute 在候选对局上运行，默认调用该闭包，所以多数命令只写 prepare。
+ * nextTurn 与 acknowledge 同时实现两段，因为校验必须发生在克隆或备份之前，
+ * 而推进回合、移除弹窗必须发生在候选对局上。这是唯一有意保留的双阶段。
+ */
 internal interface EffectCommand : GatewayCommand {
     /** 候选对局来源。 */
     val source: CandidateSource get() = CandidateSource.CURRENT
@@ -39,4 +46,10 @@ internal interface EffectCommand : GatewayCommand {
     fun prepare(ctx: CommandContext): () -> Unit = { }
     /** 执行阶段（作用于 candidate）。默认调用 prepare 返回的闭包。 */
     fun execute(ctx: CommandContext, prepared: () -> Unit) { prepared() }
+    /**
+     * 仅 [CandidateSource.LOADED] 覆盖：在备份决策之后、validateGame 之前打开候选对局。
+     * 返回 null 时由 GameSession 按 [source] 取当前局或回合副本。
+     * load／demo 因此不再在注册表之外按 action 字符串二次分发。
+     */
+    fun openCandidate(ctx: CommandContext): GameInfo? = null
 }

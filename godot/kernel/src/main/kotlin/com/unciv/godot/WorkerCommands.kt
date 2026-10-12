@@ -207,6 +207,13 @@ internal class WorkerCommands(private val game: GameInfo) {
     }
 }
 
+internal fun contributeWorker(registry: CommandRegistry, session: GameSession) {
+    registry.effect("workerOrder") {
+        GameSession.validateGame(session.requireGame())
+        WorkerCommands(session.requireGame()).prepareOrder(it.request.integer("unitId"), it.request.text("type"), it.request.text("name"))
+    }
+}
+
 /** 只发送非零项，保留一位小数；不写 NaN/Infinity。 */
 private fun statsDto(stats: Stats): JsonObject {
     val entries = ArrayList<Pair<String, Any?>>()

@@ -286,20 +286,15 @@ internal class ReligionCommands(private val game: GameInfo, private val session:
     // ---- 写命令 ----
     fun prepare(request: JsonObject): () -> Unit {
         GameSession.validateGame(game)
-        val action = request.text("action")
-        val keys = when (action) {
-            "religionUseProphet" -> setOf("unitId", "mode", "actionToken")
-            "religionChooseBeliefs" -> setOf("decisionToken", "beliefs")
-            "religionFound" -> setOf("decisionToken", "religionId", "displayName", "beliefs")
-            else -> throw problem("UNSUPPORTED", "未接入的宗教命令")
-        }
-        ensure((request.keys - envelope - keys).isEmpty(), "INVALID_ARGUMENT", "含未支持的宗教参数")
+        val action = ReligionWire.fromWire(request.text("action"))
+            ?: throw problem("UNSUPPORTED", "未接入的宗教命令")
+        ensure((request.keys - envelope - action.keys).isEmpty(), "INVALID_ARGUMENT", "含未支持的宗教参数")
         ordinary()
         ensure(religionEnabled(), "UNSUPPORTED", "本局未启用宗教")
         return when (action) {
-            "religionUseProphet" -> prepareUseProphet(request)
-            "religionChooseBeliefs" -> prepareChooseBeliefs(request)
-            else -> prepareFound(request)
+            ReligionWire.UseProphet -> prepareUseProphet(request)
+            ReligionWire.ChooseBeliefs -> prepareChooseBeliefs(request)
+            ReligionWire.Found -> prepareFound(request)
         }
     }
 
@@ -383,6 +378,28 @@ private fun JsonObject.requiredString(key: String): String = (this[key] as? Json
 private fun JsonObject.requiredInt(key: String): Int = (this[key] as? JsonPrimitive)
     ?.takeIf { !it.isString }?.intOrNull
     ?: throw GatewayError("INVALID_ARGUMENT", "整数不接受字符串／小数／越界值：$key")
+/** 宗教写命令的唯一名单。查询 religionOptions 与这些写命令一起由 [contribute] 登记。 */
+internal enum class ReligionWire(val wireName: String, val keys: Set<String>) {
+    UseProphet("religionUseProphet", setOf("unitId", "mode", "actionToken")),
+    ChooseBeliefs("religionChooseBeliefs", setOf("decisionToken", "beliefs")),
+    Found("religionFound", setOf("decisionToken", "religionId", "displayName", "beliefs")),
+    ;
+
+    companion object {
+        fun fromWire(name: String) = entries.firstOrNull { it.wireName == name }
+        fun contribute(registry: CommandRegistry, session: GameSession) {
+            registry.query("religionOptions") {
+                ReligionCommands(session.requireGame(), it.sessionId, it.revision).options()
+            }
+            for (action in entries) {
+                registry.effect(action.wireName) { ctx ->
+                    ReligionCommands(session.requireGame(), ctx.sessionId, ctx.revision).prepare(ctx.request)
+                }
+            }
+        }
+    }
+}
+
 private fun JsonObject.requiredStringArray(key: String): List<String> {
     val array = this[key] as? JsonArray ?: throw GatewayError("INVALID_ARGUMENT", "缺少数组参数：$key")
     return array.map { element ->

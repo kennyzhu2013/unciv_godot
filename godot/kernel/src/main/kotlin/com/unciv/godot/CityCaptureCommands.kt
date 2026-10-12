@@ -51,3 +51,10 @@ internal class CityCaptureCommands(private val game: GameInfo) {
         }
     }
 }
+
+internal fun contributeCityCapture(registry: CommandRegistry, session: GameSession) {
+    registry.effect("cityDecision") {
+        GameSession.validateGame(session.requireGame())
+        CityCaptureCommands(session.requireGame()).prepare(it.request.text("cityId"), it.request.text("choice"))
+    }
+}

@@ -12,7 +12,7 @@ import com.unciv.models.stats.Stats
 import com.unciv.view.CityView
 import com.unciv.view.GameView
 import com.unciv.view.TileView
-import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.*
 import kotlin.math.roundToInt
 
 /**
@@ -356,6 +356,36 @@ internal class CityDevelopmentCommands(private val game: GameInfo) {
 
     private fun ensure(condition: Boolean, code: String, message: String) {
         if (!condition) throw GatewayError(code, message)
+    }
+}
+
+internal fun contributeCityDevelopment(registry: CommandRegistry, session: GameSession) {
+    registry.effect("cityCitizen") {
+        GameSession.validateGame(session.requireGame())
+        CityDevelopmentCommands(session.requireGame()).prepareCitizen(
+            it.request.text("cityId"), it.request.integer("x"), it.request.integer("y"), it.request.text("type"))
+    }
+    registry.effect("cityFocus") {
+        GameSession.validateGame(session.requireGame())
+        CityDevelopmentCommands(session.requireGame()).prepareFocus(it.request.text("cityId"), it.request.text("focus"))
+    }
+    registry.effect("cityAvoidGrowth") {
+        GameSession.validateGame(session.requireGame())
+        CityDevelopmentCommands(session.requireGame()).prepareAvoidGrowth(it.request.text("cityId"), it.request.boolean("enabled"))
+    }
+    registry.effect("cityResetCitizens") {
+        GameSession.validateGame(session.requireGame())
+        CityDevelopmentCommands(session.requireGame()).prepareReset(it.request.text("cityId"))
+    }
+    registry.effect("citySpecialists") {
+        GameSession.validateGame(session.requireGame())
+        CityDevelopmentCommands(session.requireGame()).prepareSpecialists(
+            it.request.text("cityId"), it.request.text("type"), it.request.text("name"), it.request["enabled"]?.jsonPrimitive?.booleanOrNull)
+    }
+    registry.effect("cityQueue") {
+        GameSession.validateGame(session.requireGame())
+        CityDevelopmentCommands(session.requireGame()).prepareQueue(
+            it.request.text("cityId"), it.request.text("type"), it.request.text("name"), it.request["index"]?.jsonPrimitive?.intOrNull)
     }
 }
 

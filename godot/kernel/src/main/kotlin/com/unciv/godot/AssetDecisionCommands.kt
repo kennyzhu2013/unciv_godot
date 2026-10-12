@@ -173,3 +173,12 @@ internal class AssetDecisionCommands(private val game: GameInfo, private val ses
         val alertTypes = setOf(AlertType.RecapturedCivilian, AlertType.CityTraded, AlertType.DiplomaticMarriage)
     }
 }
+
+internal fun contributeAssetDecisions(registry: CommandRegistry, session: GameSession) {
+    registry.query("assetDecisionOptions") {
+        AssetDecisionCommands(session.requireGame(), it.sessionId, it.revision).options(it.request)
+    }
+    registry.effect("assetDecision") {
+        AssetDecisionCommands(session.requireGame(), it.sessionId, it.revision).prepare(it.request)
+    }
+}

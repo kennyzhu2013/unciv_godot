@@ -93,3 +93,14 @@ internal class GreatPersonCommands(private val game: GameInfo, private val sessi
         private val envelope = setOf("protocol", "session", "revision", "requestId", "action")
     }
 }
+
+internal fun contributeGreatPeople(registry: CommandRegistry, session: GameSession) {
+    registry.query("greatPersonOptions") {
+        GreatPersonCommands(session.requireGame(), it.sessionId, it.revision).options(it.request)
+    }
+    registry.effect("greatPersonChoose") { ctx ->
+        val prepared = GreatPersonCommands(session.requireGame(), ctx.sessionId, ctx.revision).prepare(ctx.request)
+        val thunk: () -> Unit = { ctx.greatPersonResult = prepared.invoke() }
+        thunk
+    }
+}

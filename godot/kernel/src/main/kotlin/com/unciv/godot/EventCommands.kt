@@ -161,3 +161,19 @@ internal class EventCommands(private val game: GameInfo, private val session: St
         private val envelope = setOf("protocol", "session", "revision", "requestId", "action")
     }
 }
+
+internal fun contributeEvents(registry: CommandRegistry, session: GameSession) {
+    registry.query("eventOptions") {
+        EventCommands(session.requireGame(), it.sessionId, it.revision).options(it.request)
+    }
+    registry.effect("eventChoose") {
+        EventCommands(session.requireGame(), it.sessionId, it.revision).prepare(it.request)
+    }
+    // 门控在执行闭包内，与原先一致：非冒烟环境在 execute 阶段才抛 UNKNOWN_COMMAND，从而走备份回滚。
+    registry.effect("debugInjectEvent") { ctx ->
+        {
+            if (!session.smokeEnabled) throw GatewayError("UNKNOWN_COMMAND", "未实现命令：debugInjectEvent")
+            EventCommands(ctx.candidate).injectSmokeEvent(ctx.request.text("kind"))
+        }
+    }
+}
