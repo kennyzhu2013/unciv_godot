@@ -180,24 +180,17 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
 
     fun prepare(request: JsonObject): () -> Unit {
         GameSession.validateGame(game)
-        val action = request.text("action")
-        val keys = when (action) {
-            "diplomacyDeclareWar" -> setOf("civId")
-            "diplomacyProposePeace" -> setOf("civId", "ourGold", "theirGold")
-            "diplomacyRetractPeace" -> setOf("civId", "tradeToken")
-            "diplomacyTradeDecision" -> setOf("tradeToken", "choice")
-            "diplomacyAlertDecision" -> setOf("alertToken", "choice")
-            else -> throw problem("UNSUPPORTED", "未接入的外交命令")
-        }
-        ensure((request.keys - envelope - keys).isEmpty(), "INVALID_ARGUMENT", "含未支持的外交参数")
+        val action = DiplomacyWire.fromWire(request.text("action"))
+            ?: throw problem("UNSUPPORTED", "未接入的外交命令")
+        ensure((request.keys - envelope - action.keys).isEmpty(), "INVALID_ARGUMENT", "含未支持的外交参数")
         when (action) {
-            "diplomacyDeclareWar" -> {
+            DiplomacyWire.DeclareWar -> {
                 val other = major(request.requiredDiplomacyText("civId"))
                 ordinary()
                 warCheck(other)
                 return { player.getDiplomacyManager(other)!!.declareWar() }
             }
-            "diplomacyProposePeace" -> {
+            DiplomacyWire.ProposePeace -> {
                 val id = request.requiredDiplomacyText("civId")
                 val ours = request.requiredGold("ourGold")
                 val theirs = request.requiredGold("theirGold")
@@ -210,7 +203,7 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
                     check(view.tryProposeStagedTrade())
                 }
             }
-            "diplomacyRetractPeace" -> {
+            DiplomacyWire.RetractPeace -> {
                 val id = request.requiredDiplomacyText("civId")
                 val token = request.requiredDiplomacyText("tradeToken")
                 val other = major(id)
@@ -220,7 +213,7 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
                 retractProblem(other, entry.value)?.let { throw it }
                 return { check(TradeView(player, other, GameView(game, player)).tryRetractOffer()) }
             }
-            "diplomacyTradeDecision" -> {
+            DiplomacyWire.TradeDecision -> {
                 val token = request.requiredDiplomacyText("tradeToken")
                 val choice = request.requiredDiplomacyText("choice")
                 val pending = player.tradeRequests.firstOrNull() ?: throw problem("DIPLOMACY_REQUEST", "没有当前交易提案")
@@ -238,7 +231,7 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
                         NotificationCategory.Trade, player.civName, NotificationIcon.Trade)
                 }
             }
-            else -> {
+            DiplomacyWire.AlertDecision -> {
                 val token = request.requiredDiplomacyText("alertToken")
                 val choice = request.requiredDiplomacyText("choice")
                 val alert = player.popupAlerts.firstOrNull() ?: throw problem("DIPLOMACY_REQUEST", "没有当前外交事件")
@@ -395,3 +388,27 @@ private fun JsonObject.requiredDiplomacyText(key: String): String = (this[key] a
 private fun JsonObject.requiredGold(key: String): Int = (this[key] as? JsonPrimitive)
     ?.takeIf { !it.isString }?.intOrNull?.takeIf { it >= 0 }
     ?: throw GatewayError("INVALID_ARGUMENT", "金额必须为非负 JSON 整数：$key")
+
+/** 主要文明外交命令的唯一名单。declineTrade 不在此列，它仍是会话核心命令。 */
+internal enum class DiplomacyWire(val wireName: String, val keys: Set<String>) {
+    DeclareWar("diplomacyDeclareWar", setOf("civId")),
+    ProposePeace("diplomacyProposePeace", setOf("civId", "ourGold", "theirGold")),
+    RetractPeace("diplomacyRetractPeace", setOf("civId", "tradeToken")),
+    TradeDecision("diplomacyTradeDecision", setOf("tradeToken", "choice")),
+    AlertDecision("diplomacyAlertDecision", setOf("alertToken", "choice")),
+    ;
+
+    companion object {
+        fun fromWire(name: String) = entries.firstOrNull { it.wireName == name }
+        fun contribute(registry: CommandRegistry, session: GameSession) {
+            registry.query("diplomacyOptions") {
+                DiplomacyCommands(session.requireGame(), it.sessionId, it.revision).options(it.request)
+            }
+            for (action in entries) {
+                registry.effect(action.wireName) { ctx ->
+                    DiplomacyCommands(session.requireGame(), ctx.sessionId, ctx.revision).prepare(ctx.request)
+                }
+            }
+        }
+    }
+}

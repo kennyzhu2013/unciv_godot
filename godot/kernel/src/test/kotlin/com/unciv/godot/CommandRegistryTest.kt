@@ -1,0 +1,65 @@
+package com.unciv.godot
+
+import kotlinx.serialization.json.*
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.io.File
+
+/** 注册表是唯一分发点：命令名、候选来源和是否就地备份都来自同一次登记。 */
+class CommandRegistryTest {
+    @Test fun duplicateNameFailsAtRegistration() {
+        val registry = CommandRegistry()
+        registry.query("path") { _ -> dto() }
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            registry.query("path") { _ -> dto() }
+        }
+        assertTrue(failure.message!!.contains("path"))
+    }
+
+    @Test fun catalogIsTheOnlyDispatchTable() {
+        val root = File(System.getProperty("java.io.tmpdir"), "unciv-command-registry")
+        val session = GameSession(root)
+        val catalog = session.catalog()
+
+        assertFalse(catalog.containsKey("hello"))
+        assertFalse(catalog.containsKey("snapshot"))
+
+        val queries = catalog.filterValues { it is QueryCommand }.keys
+        assertEquals(setOf(
+            "eventOptions", "greatPersonOptions", "assetDecisionOptions", "diplomaticVoteOptions",
+            "religionOptions", "combatPreview", "diplomacyOptions", "unitOptions", "cityOptions", "path"),
+            queries)
+
+        fun effect(name: String) = catalog[name] as EffectCommand
+        assertEquals(setOf("load", "demo"), catalog.filterValues { it is EffectCommand && it.source == CandidateSource.LOADED }.keys)
+        assertEquals(setOf("nextTurn"), catalog.filterValues { it is EffectCommand && it.source == CandidateSource.CLONE_TURN }.keys)
+        assertEquals(setOf("load", "demo", "save", "nextTurn"), catalog.filterValues { it is EffectCommand && !it.inPlace }.keys)
+        assertEquals(CandidateSource.CURRENT, effect("save").source)
+        assertEquals(CandidateSource.CURRENT, effect("acknowledge").source)
+        assertTrue(effect("acknowledge").inPlace)
+        assertTrue(effect("debugInjectEvent").inPlace)
+        assertTrue(effect("move").inPlace)
+        assertTrue(effect("attack").inPlace)
+
+        val domainWires = CityStateWire.entries.map { it.wireName } +
+            DiplomacyWire.entries.map { it.wireName } +
+            ReligionWire.entries.map { it.wireName } +
+            DiplomaticVoteWire.entries.map { it.wireName }
+        assertEquals(domainWires.size, domainWires.toSet().size)
+        for (name in domainWires) {
+            val command = effect(name)
+            assertEquals(CandidateSource.CURRENT, command.source)
+            assertTrue(command.inPlace)
+        }
+
+        val response = session.handle(dto(
+            "protocol" to 1, "session" to session.sessionId, "revision" to session.revision,
+            "requestId" to "registry-unknown", "action" to "notACommand"))
+        assertEquals(false, response["ok"]!!.jsonPrimitive.boolean)
+        assertEquals("UNKNOWN_COMMAND", response["error"]!!.jsonObject.text("code"))
+        assertEquals(0, session.revision)
+    }
+}

@@ -184,6 +184,12 @@ internal class CityEconomyCommands(private val game: GameInfo) {
     }
 }
 
+internal fun contributeCityEconomy(registry: CommandRegistry, session: GameSession) {
+    registry.effect("cityBuyTile") { CityEconomyCommands(session.requireGame()).prepareBuyTile(it.request) }
+    registry.effect("cityPurchase") { CityEconomyCommands(session.requireGame()).preparePurchase(it.request) }
+    registry.effect("citySellBuilding") { CityEconomyCommands(session.requireGame()).prepareSellBuilding(it.request) }
+}
+
 /** 经济业务参数严格区分 JSON 字符串与数字，数组／null／小数在备份前拒绝。 */
 private fun JsonObject.requiredText(key: String): String = (this[key] as? JsonPrimitive)
     ?.takeIf { it.isString && it.content.isNotEmpty() }?.content
