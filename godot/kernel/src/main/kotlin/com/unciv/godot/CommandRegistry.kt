@@ -29,12 +29,13 @@ internal class CommandRegistry {
         // 最后一个函数参数，这样 registry.effect("name") { ... } 写的是 prepare，而不是打开候选对局。
         prepareFn: (CommandContext) -> (() -> Unit) = { {} },
     ) {
+        val openLoaded = openCandidate
         put(name, object : EffectCommand {
             override val source: CandidateSource = source
             override val inPlace: Boolean = inPlace
             override fun prepare(ctx: CommandContext): () -> Unit = prepareFn(ctx)
             override fun execute(ctx: CommandContext, prepared: () -> Unit) = executeFn(ctx, prepared)
-            override fun openCandidate(ctx: CommandContext): GameInfo? = openCandidate?.invoke(ctx)
+            override fun openCandidate(ctx: CommandContext): GameInfo? = openLoaded?.invoke(ctx)
         })
     }
 
