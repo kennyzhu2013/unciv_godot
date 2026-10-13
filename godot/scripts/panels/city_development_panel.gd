@@ -97,7 +97,7 @@ func build(city_page: VBoxContainer) -> void:
 		if not pname.is_empty():
 			await orchestrator.execute("production", {"cityId": orchestrator.city_id, "name": pname}))
 	production_button.name = "SetCurrentProduction"
-	var enqueue := orchestrator.button(production_row, "加入队列", func():
+	var enqueue : Button = orchestrator.button(production_row, "加入队列", func():
 		var pname := _production_selected_name()
 		if not pname.is_empty():
 			await _city_queue("add", pname, -1))
@@ -184,11 +184,11 @@ func _populate_focus(editable: bool) -> void:
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 6)
 	focus_box.add_child(row)
-	var avoid := orchestrator.button(row, "避免增长：开" if orchestrator.city_data.get("avoidGrowth", false) else "避免增长：关",
+	var avoid : Button = orchestrator.button(row, "避免增长：开" if orchestrator.city_data.get("avoidGrowth", false) else "避免增长：关",
 		func(): await _run_city("cityAvoidGrowth", {"enabled": not orchestrator.city_data.get("avoidGrowth", false)}))
 	avoid.set_meta("allowed", editable)
 	avoid.name = "AvoidGrowth"
-	var reset := orchestrator.button(row, "重置人口分配", func(): await _run_city("cityResetCitizens", {}))
+	var reset : Button = orchestrator.button(row, "重置人口分配", func(): await _run_city("cityResetCitizens", {}))
 	reset.set_meta("allowed", editable)
 	reset.name = "ResetCitizens"
 
@@ -204,7 +204,7 @@ func _populate_specialists(editable: bool) -> void:
 	var header := Label.new()
 	header.text = "空闲人口 %s · 专家模式：%s" % [orchestrator._num(specialists.get("freePopulation"), true), "手动" if manual else "自动"]
 	specialist_box.add_child(header)
-	var toggle := orchestrator.button(specialist_box, "切换为自动专家" if manual else "切换为手动专家",
+	var toggle : Button = orchestrator.button(specialist_box, "切换为自动专家" if manual else "切换为手动专家",
 		_city_specialist.bind("setManual", "", not manual))
 	toggle.name = "SpecialistManualToggle"
 	toggle.set_meta("allowed", editable)
@@ -217,11 +217,11 @@ func _populate_specialists(editable: bool) -> void:
 			orchestrator._format_stats(slot.get("stats", {}))]
 		lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		row.add_child(lbl)
-		var minus := orchestrator.button(row, "−", _city_specialist.bind("unassign", str(slot.get("name")), false))
+		var minus : Button = orchestrator.button(row, "−", _city_specialist.bind("unassign", str(slot.get("name")), false))
 		minus.name = "SpecialistUnassign"
 		minus.set_meta("slot", str(slot.get("name")))
 		minus.set_meta("allowed", editable and slot.get("canUnassign", false))
-		var plus := orchestrator.button(row, "＋", _city_specialist.bind("assign", str(slot.get("name")), false))
+		var plus : Button = orchestrator.button(row, "＋", _city_specialist.bind("assign", str(slot.get("name")), false))
 		plus.name = "SpecialistAssign"
 		plus.set_meta("slot", str(slot.get("name")))
 		plus.set_meta("allowed", editable and slot.get("canAssign", false))
@@ -261,19 +261,19 @@ func _populate_queue(editable: bool) -> void:
 		var controls := HBoxContainer.new()
 		controls.add_theme_constant_override("separation", 6)
 		row.add_child(controls)
-		var up := orchestrator.button(controls, "上移", _city_queue.bind("raise", "", idx))
+		var up : Button = orchestrator.button(controls, "上移", _city_queue.bind("raise", "", idx))
 		up.name = "QueueRaise"
 		up.set_meta("allowed", editable and entry.get("canRaise", false))
 		up.set_meta("role", "raise")
 		up.set_meta("queueIndex", idx)
 		up.set_meta("revision", revision)
-		var down := orchestrator.button(controls, "下移", _city_queue.bind("lower", "", idx))
+		var down : Button = orchestrator.button(controls, "下移", _city_queue.bind("lower", "", idx))
 		down.name = "QueueLower"
 		down.set_meta("allowed", editable and entry.get("canLower", false))
 		down.set_meta("role", "lower")
 		down.set_meta("queueIndex", idx)
 		down.set_meta("revision", revision)
-		var remove := orchestrator.button(controls, "删除", _city_queue.bind("remove", "", idx))
+		var remove : Button = orchestrator.button(controls, "删除", _city_queue.bind("remove", "", idx))
 		remove.name = "QueueRemove"
 		remove.set_meta("allowed", editable and entry.get("canRemove", false))
 		remove.set_meta("role", "remove")
@@ -284,7 +284,7 @@ func _populate_queue(editable: bool) -> void:
 				if int(item.index) != idx:
 					continue
 				var payload: Dictionary = orchestrator.economy_panel_inst.economy_request("cityPurchase", {"name": str(item.name), "stat": "Gold", "queueIndex": idx}, item.get("goldCost"))
-				var buy := orchestrator.button(row, "金币购买此项 · %s" % orchestrator._num(item.get("goldCost"), true), orchestrator.economy_panel_inst.open_economy.bind(payload))
+				var buy : Button = orchestrator.button(row, "金币购买此项 · %s" % orchestrator._num(item.get("goldCost"), true), orchestrator.economy_panel_inst.open_economy.bind(payload))
 				buy.name = "QueuePurchase"
 				orchestrator.economy_panel_inst.economy_button_metadata(buy, item, idx)
 
@@ -379,7 +379,7 @@ func _populate_citizen(editable: bool) -> void:
 	_citizen_button(row, "解锁", "unlock", editable, orchestrator.citizen_tile.get("canUnlock", false))
 
 func _citizen_button(parent: Node, text: String, type: String, editable: bool, allowed: bool) -> void:
-	var control := orchestrator.button(parent, text, _city_citizen.bind(type))
+	var control : Button = orchestrator.button(parent, text, _city_citizen.bind(type))
 	control.name = "Citizen" + type.capitalize()
 	control.set_meta("role", type)
 	control.set_meta("allowed", editable and allowed)

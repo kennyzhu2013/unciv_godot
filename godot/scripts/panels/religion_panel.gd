@@ -353,7 +353,7 @@ func open_religion_confirmation(p: Dictionary) -> void:
 func confirm_religion() -> void:
 	var p := payload.duplicate(true)
 	cancel()
-	if orchestrator.client.busy or orchestrator.economy_transaction or orchestrator.diplomacy_panel_inst.transaction or transaction or orchestrator.great_person_panel_inst.busy_active() or orchestrator.vote_panel_inst.busy_active() or p.is_empty():
+	if orchestrator.client.busy or orchestrator.economy_panel_inst.transaction or orchestrator.diplomacy_panel_inst.transaction or transaction or orchestrator.great_person_panel_inst.busy_active() or orchestrator.vote_panel_inst.busy_active() or p.is_empty():
 		return
 	if not stamp_valid(p.get("stamp", {})):
 		await refresh()

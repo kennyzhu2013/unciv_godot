@@ -1,3 +1,4 @@
 .godot/
 .local/
 kernel/build/
+kernel/bin/

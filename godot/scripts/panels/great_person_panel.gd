@@ -203,7 +203,7 @@ func confirm_great_person() -> void:
 	var p := payload.duplicate(true)
 	payload = {}
 	confirmation.hide()
-	if orchestrator.client.busy or orchestrator.economy_transaction or orchestrator.diplomacy_panel_inst.transaction or orchestrator.religion_panel_inst.transaction or transaction or orchestrator.vote_panel_inst.busy_active() or p.is_empty():
+	if orchestrator.client.busy or orchestrator.economy_panel_inst.transaction or orchestrator.diplomacy_panel_inst.transaction or orchestrator.religion_panel_inst.transaction or transaction or orchestrator.vote_panel_inst.busy_active() or p.is_empty():
 		return
 	if not stamp_valid(p.get("stamp", {})):
 		await refresh()

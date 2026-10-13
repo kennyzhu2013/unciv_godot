@@ -2408,7 +2408,7 @@ func verify_economy_flow() -> bool:
 		return false
 	if not await click_control(economy_control(app.economy_panel_inst.economy_buildings, "SellBuilding", "Market")):
 		return false
-	if not check(app.economy_confirmation.dialog_text.contains("不可撤销"), "出售确认提示不可撤销"):
+	if not check(app.economy_panel_inst.confirmation.dialog_text.contains("不可撤销"), "出售确认提示不可撤销"):
 		return false
 	if not await click_economy_dialog(true) or not economy_matches("sell"):
 		return false
@@ -2559,7 +2559,7 @@ func verify_economy_stamps(fixture: String) -> bool:
 	var stamp: Dictionary = app.economy_panel_inst.payload.stamp.duplicate(true)
 	var revision: int = app.client.revision
 	await press_economy_escape()
-	if not check(not app.economy_confirmation.visible and app.economy_panel_inst.payload.is_empty()
+	if not check(not app.economy_panel_inst.confirmation.visible and app.economy_panel_inst.payload.is_empty()
 			and app.buy_tile_mode and app.client.revision == revision, "Esc 仅取消经济确认且零写入"):
 		return false
 	if not await click_control(app.economy_panel_inst.buy_tile_button):
@@ -3599,7 +3599,7 @@ func click_control(control) -> bool:
 		control.gui_input.disconnect(on_input)
 		if control is BaseButton:
 			control.pressed.disconnect(on_pressed)
-	trace["dialog"] = app.economy_confirmation.visible
+	trace["dialog"] = app.economy_panel_inst.confirmation.visible
 	trace["message"] = app.message.text
 	input_trace.append(trace)
 	if input_trace.size() > 20:

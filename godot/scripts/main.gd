@@ -94,7 +94,10 @@ var production_button: Button:
 		return city_dev.production_button
 var focus_option: OptionButton:
 	get:
-		return city_dev.focus_option
+		# 转发的是会被 _clear_dynamic 释放重建的动态节点：失效时返回 null，
+		# 让 is_instance_valid 守卫像拆分前（直接成员变量）一样安全跳过已释放实例。
+		var option = city_dev.focus_option
+		return option if is_instance_valid(option) else null
 # 工人施工预览-执行分离：候选下拉、详情文本、执行按钮与当前候选 DTO 列表。
 var worker_option: OptionButton = null
 var worker_detail: Label = null
@@ -882,6 +885,128 @@ func _resolve_unit(id: int, generation: int) -> void:
 				map.queue_redraw()
 				break
 	_on_busy(false)
+
+func _populate_worker(worker: Dictionary, _id: int) -> void:
+	_clear_dynamic(worker_panel)
+	worker_options = []
+	worker_option = null
+	worker_detail = null
+	worker_start = null
+	if worker.is_empty():
+		worker_panel.hide()
+		return
+	worker_panel.show()
+	# 当前工程卡：supported=false 时保留状态与原因，不直接隐藏（非施工单位也走此分支，不按名称硬编码）。
+	var card := Label.new()
+	card.name = "WorkerCard"
+	card.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	worker_panel.add_child(card)
+	if not worker.get("supported", false):
+		var reason := str(worker.get("reason", ""))
+		card.text = "不支持施工%s" % (("：" + reason) if not reason.is_empty() else "。")
+		return
+	var in_progress = worker.get("inProgress")
+	var block := str(worker.get("reason", ""))
+	if in_progress is Dictionary:
+		card.text = "当前工程：%s · 剩余 %s 工作回合%s" % [in_progress.get("name"),
+			_num(in_progress.get("turnsLeft"), true), "（修复）" if in_progress.get("isRepair", false) else ""]
+		if not block.is_empty():
+			card.text += "\n暂不能推进：%s" % block
+	elif not block.is_empty():
+		card.text = "当前无工程：%s" % block
+	else:
+		card.text = "当前无工程：选择下方候选改良并预览后开始施工。"
+	# 候选选择 + 详情 + 执行按钮（预览-执行分离，不再用拥挤长按钮同时承担说明与执行）。
+	worker_options = worker.get("improvements", [])
+	if not worker_options.is_empty():
+		label(worker_panel, "候选改良（先预览再施工）")
+		worker_option = OptionButton.new()
+		worker_option.name = "WorkerCandidates"
+		for index in range(worker_options.size()):
+			var option: Dictionary = worker_options[index]
+			var suffix := "（进行中）" if option.get("current", false) else ""
+			worker_option.add_item("%s · %s回合%s" % [str(option.get("name")), _num(option.get("turns"), true), suffix])
+			worker_option.set_item_metadata(index, index)
+			worker_option.set_item_disabled(index, not option.get("enabled", false))
+			worker_option.set_item_tooltip(index, str(option.get("reason", "")))
+		worker_option.item_selected.connect(_preview_worker_option)
+		worker_panel.add_child(worker_option)
+		worker_detail = Label.new()
+		worker_detail.name = "WorkerDetail"
+		worker_detail.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		worker_panel.add_child(worker_detail)
+		worker_start = button(worker_panel, "开始施工", _start_worker)
+		worker_start.name = "WorkerStart"
+		var first := _first_enabled_worker_option()
+		if first >= 0:
+			worker_option.select(first)
+			_preview_worker_option(first)
+		else:
+			worker_start.set_meta("allowed", false)
+			worker_detail.text = "当前没有可施工的候选改良。"
+	# 修复与取消保持独立按钮与原规则权限。
+	var repair: Dictionary = worker.get("repair", {})
+	if repair.get("available", false) or not str(repair.get("reason", "")).is_empty():
+		var repair_button := button(worker_panel, "修复受损设施 · %s回合" % _num(repair.get("turns", 0), true), _worker_order.bind("repair", ""))
+		repair_button.name = "WorkerRepair"
+		repair_button.set_meta("allowed", repair.get("available", false))
+		repair_button.tooltip_text = str(repair.get("reason", ""))
+	var cancel: Dictionary = worker.get("cancel", {})
+	if cancel.get("available", false) or not str(cancel.get("reason", "")).is_empty():
+		var cancel_button := button(worker_panel, "取消当前工程", _worker_order.bind("cancel", ""))
+		cancel_button.name = "WorkerCancel"
+		cancel_button.set_meta("allowed", cancel.get("available", false))
+		cancel_button.tooltip_text = str(cancel.get("reason", ""))
+	_on_busy(client.busy)
+
+func _first_enabled_worker_option() -> int:
+	for index in range(worker_options.size()):
+		if worker_options[index].get("enabled", false):
+			return index
+	return -1
+
+# 预览候选：分别展示原生 yieldDelta、维护费与可见资源提示，不把维护费误称城市净产出。
+func _preview_worker_option(index: int) -> void:
+	if index < 0 or index >= worker_options.size() or worker_detail == null:
+		return
+	var option: Dictionary = worker_options[index]
+	var lines := PackedStringArray()
+	lines.append("工期：%s 工作回合" % _num(option.get("turns"), true))
+	lines.append("产出变化：%s" % _format_stats(option.get("yieldDelta", {})))
+	lines.append("维护费：%s" % _format_stats(option.get("maintenance", {})))
+	if option.get("providesResource") != null:
+		lines.append("接通资源：%s" % str(option.get("providesResource")))
+	var reason := str(option.get("reason", ""))
+	if not option.get("enabled", false) and not reason.is_empty():
+		lines.append("不可施工：%s" % reason)
+	worker_detail.text = "\n".join(lines)
+	if worker_start:
+		worker_start.text = "继续施工" if option.get("current", false) else "开始施工"
+		worker_start.set_meta("allowed", option.get("enabled", false))
+		worker_start.tooltip_text = reason
+	_on_busy(client.busy)
+
+func _start_worker() -> void:
+	if worker_option == null or worker_option.selected < 0:
+		return
+	var index := worker_option.selected
+	if index < 0 or index >= worker_options.size():
+		return
+	var option: Dictionary = worker_options[index]
+	if not option.get("enabled", false):
+		return
+	await _worker_order("start", str(option.get("name")))
+
+
+func _worker_order(type: String, name: String) -> void:
+	if _input_locked() or unit_id < 0:
+		return
+	var params := {"unitId": unit_id, "type": type}
+	if type == "start":
+		params["name"] = name
+	# 成功后由 execute → _refresh_active_context 统一重解析单位面板（含工人施工区），
+	# 无需在此显式重选，避免二次查询。
+	await execute("workerOrder", params)
 
 # 用户选择城市：设定活动上下文并自增代际，切到城市页后解析（保留旧 _select_city 名称供兼容）。
 func _select_city(id: String) -> void:
