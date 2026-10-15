@@ -172,6 +172,8 @@ internal class GreatPersonCommandsTest {
         val decision = options(session)["decision"]!!.jsonObject
         assertTrue(decision.boolean("supported"))
         assertFalse(decision.boolean("enabled"))
+        reject(session, body(session, "Great Scientist"), "PENDING_DECISION")
+        run(session, "victoryContinue", "resultToken" to run(session, "victoryOptions")["data"]!!.jsonObject["continue"]!!.jsonObject.text("token"))
         reject(session, body(session, "Great Scientist"), "NO_CITY")
         reject(session, request(session, "nextTurn"), "PENDING_DECISION")
     }

@@ -3,6 +3,7 @@ extends Control
 const ClientScript = preload("res://scripts/kernel_client.gd")
 const MapScript = preload("res://scripts/hex_map.gd")
 const VotePanelScript = preload("res://scripts/panels/vote_panel.gd")
+const VictoryPanelScript = preload("res://scripts/panels/victory_panel.gd")
 const GreatPersonPanelScript = preload("res://scripts/panels/great_person_panel.gd")
 const EventPanelScript = preload("res://scripts/panels/event_panel.gd")
 const ReligionPanelScript = preload("res://scripts/panels/religion_panel.gd")
@@ -144,6 +145,8 @@ var religion_panel_inst = ReligionPanelScript.new()
 var great_person_panel_inst = GreatPersonPanelScript.new()
 # 外交投票事务域已迁移至 panels/vote_panel.gd（TransactionController 子类）；main 仅持有实例引用。
 var vote_panel_inst = VotePanelScript.new()
+var victory_panel_inst = VictoryPanelScript.new()
+var _execute_depth := 0
 # 通用事件对话框事务域已迁移至 panels/event_panel.gd（TransactionController 子类）；main 仅持有实例引用。
 # pending kind=="event" 时在事项页处置；选项按钮动态构建，选择走 eventChoose。
 var event_panel_inst = EventPanelScript.new()
@@ -154,7 +157,16 @@ const CAPTURE_NAMES := {"annex": "吞并", "puppet": "傀儡", "raze": "焚城",
 # 候选生产分类展示顺序（对应内核 constructionType）：单位／建筑／持续／其他。
 const PRODUCTION_CATEGORIES := [["unit", "单位"], ["building", "建筑"], ["perpetual", "持续"], ["other", "其他"]]
 
+func _process(_delta: float) -> void:
+	if _execute_depth == 0 and is_instance_valid(victory_panel_inst.open_button):
+		victory_panel_inst.guide_if_needed()
+
+func _victory_pending() -> bool:
+	return client.snapshot.get("victory", {}).get("requiresAcknowledgement", false)
+
 func _ready() -> void:
+	victory_panel_inst.orchestrator = self
+	panels.append(victory_panel_inst)
 	vote_panel_inst.orchestrator = self
 	panels.append(vote_panel_inst)
 	great_person_panel_inst.orchestrator = self
@@ -186,6 +198,7 @@ func _ready() -> void:
 	client.state_invalidated.connect(religion_panel_inst.invalidate)
 	client.state_invalidated.connect(great_person_panel_inst.invalidate)
 	client.state_invalidated.connect(vote_panel_inst.invalidate)
+	client.state_invalidated.connect(victory_panel_inst.invalidate)
 	client.state_invalidated.connect(asset_panel_inst.invalidate)
 	map.tile_selected.connect(_select_tile)
 	map.move_requested.connect(_preview_target)
@@ -224,15 +237,15 @@ func _build_ui() -> void:
 	var toolbar := HBoxContainer.new()
 	toolbar.add_theme_constant_override("separation", 6)
 	layout.add_child(toolbar)
-	button(toolbar, "读取存档", func(): file_dialog.popup_centered_ratio(0.75))
-	button(toolbar, "验证开局", _demo)
+	button(toolbar, "读取存档", func(): file_dialog.popup_centered_ratio(0.75), false)
+	button(toolbar, "验证开局", _demo, false)
 	save_name.text = "godot-save"
 	save_name.custom_minimum_size.x = 150
 	toolbar.add_child(save_name)
-	button(toolbar, "保存副本", _save)
-	button(toolbar, "重载副本", _reload)
-	button(toolbar, "刷新", func(): await execute("snapshot"))
-	button(toolbar, "定位", _locate)
+	button(toolbar, "保存副本", _save, false)
+	button(toolbar, "重载副本", _reload, false)
+	button(toolbar, "刷新", func(): await execute("snapshot"), false)
+	button(toolbar, "定位", _locate, false)
 	# 主体：地图 + 右栏一级页签（页签不滚动，各页内容独立纵向滚动）。
 	var body := HBoxContainer.new()
 	body.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -337,7 +350,7 @@ func _build_unit_tab() -> void:
 	combat_panel.add_child(combat_details)
 	attack_button = button(combat_panel, "确认攻击", _commit_attack)
 	attack_button.name = "ConfirmAttack"
-	button(combat_panel, "取消攻击预览", _cancel_attack)
+	button(combat_panel, "取消攻击预览", _cancel_attack, false)
 	combat_panel.hide()
 	page.add_child(capture_panel)
 	capture_panel.hide()
@@ -379,6 +392,7 @@ func _build_matters_tab() -> void:
 	label(page, "待处理事项")
 	pending.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	page.add_child(pending)
+	victory_panel_inst.build(page)
 	button(page, "消息已阅", func(): await execute("acknowledge"))
 	diplomacy_panel_inst.build_open_button(page)
 	religion_panel_inst.build_open_button(page)
@@ -417,7 +431,9 @@ func _on_tab_selected(index: int) -> void:
 		_clear_combat()
 		await religion_panel_inst.refresh()
 
-	if index == TAB_MATTERS:
+	if index == TAB_MATTERS and not victory_panel_inst.guide_active:
+		if victory_panel_inst.panel.visible:
+			await victory_panel_inst.refresh()
 		if great_person_panel_inst.panel.visible:
 			await great_person_panel_inst.refresh()
 		if vote_panel_inst.panel.visible:
@@ -478,8 +494,9 @@ func _unhandled_key_input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 
 
-func button(parent: Node, text: String, action: Callable) -> Button:
+func button(parent: Node, text: String, action: Callable, gameplay := true) -> Button:
 	var result := Button.new()
+	result.set_meta("gameplay", gameplay)
 	result.text = text
 	result.custom_minimum_size.y = 34
 	result.pressed.connect(action)
@@ -505,7 +522,8 @@ func _on_busy(is_busy: bool) -> void:
 		tabs.get_tab_bar().focus_mode = Control.FOCUS_NONE if is_busy else Control.FOCUS_ALL
 		city_tabs.get_tab_bar().focus_mode = Control.FOCUS_NONE if is_busy else Control.FOCUS_ALL
 	for control in buttons:
-		control.disabled = is_busy or not control.get_meta("allowed", true)
+		if is_instance_valid(control):
+			control.disabled = is_busy or not control.get_meta("allowed", true)
 	attack_button.disabled = is_busy or combat_preview.is_empty() or preview_revision != client.revision
 	for control in unit_actions.get_children():
 		if control is Button:
@@ -525,9 +543,19 @@ func _on_busy(is_busy: bool) -> void:
 		turn_button.disabled = client.snapshot.is_empty() or not client.snapshot.get("pending", []).is_empty()
 	else:
 		message.text = "内核处理中……界面仍可拖动和缩放"
+	# 结束状态门禁必须在特殊按钮的最终 busy 赋值之后应用。
+	if _victory_pending():
+		for control in buttons:
+			if is_instance_valid(control) and control.get_meta("gameplay", true):
+				control.disabled = true
+		if is_instance_valid(focus_option):
+			focus_option.disabled = true
 
 func execute(action: String, params: Dictionary = {}, committing = null) -> Dictionary:
-	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "assetDecisionOptions", "eventOptions", "snapshot"]
+	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "victoryOptions", "assetDecisionOptions", "eventOptions", "combatPreview", "path", "snapshot", "hello"]
+	if _victory_pending() and not query and action not in ["load", "demo", "save", "diplomaticVoteAcknowledge", "victoryContinue"]:
+		message.text = "请先查看胜负结算并选择是否继续游戏。"
+		return {"ok": false, "error": {"code": "PENDING_DECISION", "message": message.text}}
 	# 已迁移面板的事务锁/确认框门禁；提交方自身豁免事务锁检查。
 	if not query:
 		for p in panels:
@@ -535,6 +563,7 @@ func execute(action: String, params: Dictionary = {}, committing = null) -> Dict
 				return {"ok": false, "error": {"code": "BUSY", "message": p.busy_transaction_message()}}
 			if p.gates_on_confirmation_visible() and p.confirmation != null and p.confirmation.visible and action not in ["load", "demo"]:
 				return {"ok": false, "error": {"code": "BUSY", "message": p.busy_confirmation_message()}}
+	_execute_depth += 1
 	if action == "snapshot":
 		for p in panels:
 			p.on_execute_snapshot()
@@ -553,7 +582,7 @@ func execute(action: String, params: Dictionary = {}, committing = null) -> Dict
 			confirmation.confirmed.connect(_confirm_founding, CONNECT_ONE_SHOT)
 		if committing != null and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
 			await committing.on_transport_failure()
-		elif failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST", "GREAT_PERSON_DECISION", "DIPLOMATIC_VOTE_DECISION", "DIPLOMATIC_VOTE_RESULT", "ASSET_DECISION", "EVENT", "EVENT_INVALID"]:
+		elif failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST", "GREAT_PERSON_DECISION", "DIPLOMATIC_VOTE_DECISION", "DIPLOMATIC_VOTE_RESULT", "VICTORY_RESULT", "ASSET_DECISION", "EVENT", "EVENT_INVALID"]:
 			for p in panels:
 				p.on_stale_state()
 			await client.command("snapshot")
@@ -570,6 +599,7 @@ func execute(action: String, params: Dictionary = {}, committing = null) -> Dict
 		# 只读查询（unitOptions／cityOptions／path 等）不返回快照，不触发重解析，避免递归。
 		if result.get("snapshot") is Dictionary:
 			await _refresh_active_context()
+	_execute_depth -= 1
 	return result
 
 func _confirm_founding() -> void:
@@ -665,6 +695,7 @@ func _rebuild_pending(data: Dictionary) -> void:
 
 # 本地选择状态：用户切换选择或重载时自增代际；异步详情回填前比对，任一不符即丢弃。
 func _reset_selection() -> void:
+	victory_panel_inst.reset_selection()
 	asset_panel_inst.invalidate()
 	event_panel_inst.invalidate()
 	vote_panel_inst.reset_selection()
@@ -1076,7 +1107,7 @@ func _stamp_valid(stamp: Dictionary) -> bool:
 	return not stamp.is_empty() and stamp == _state_stamp() and _own_city_exists(city_id)
 
 func _input_locked() -> bool:
-	return client.busy or asset_panel_inst.busy_active() or vote_panel_inst.busy_active() or event_panel_inst.busy_active() or religion_panel_inst.busy_active() or economy_panel_inst.busy_active() or diplomacy_panel_inst.busy_active() or great_person_panel_inst.busy_active()
+	return client.busy or panels.any(func(p): return p.busy_active())
 
 func _economy() -> Dictionary:
 	return city_data.get("economy", {})

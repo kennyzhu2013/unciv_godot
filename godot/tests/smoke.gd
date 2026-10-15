@@ -34,6 +34,11 @@ var great_person_lock_handoffs := 0
 var great_person_lock_valid := true
 var great_person_pan_checked := false
 var great_person_evidence: Array[Dictionary] = []
+var victory_steps := 0
+var victory_expected: Dictionary = {}
+var victory_evidence: Array[Dictionary] = []
+var victory_lock_valid := true
+var victory_lock_handoffs := 0
 var vote_steps := 0
 var vote_expected: Dictionary = {}
 var vote_evidence: Array[Dictionary] = []
@@ -80,6 +85,27 @@ class AssetFaultClient extends "res://scripts/kernel_client.gd":
 		if payload.action == "assetDecision" and drop_writes > 0:
 			drop_writes -= 1
 			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：真实资产写入后丢弃响应"}}
+		return answer
+
+class VictoryFaultClient extends "res://scripts/kernel_client.gd":
+	var drop_writes := 0
+	var fail_query := ""
+	var trace: Array[Dictionary] = []
+	func _send(payload: Dictionary) -> Dictionary:
+		var entry := {"request": payload.duplicate(true), "injected": false}
+		if payload.action == fail_query:
+			entry.injected = true
+			trace.append(entry)
+			await get_tree().process_frame
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：胜利恢复查询失败"}}
+		var answer: Dictionary = await super._send(payload)
+		entry["answer"] = answer.duplicate(true)
+		if payload.action == "victoryContinue" and drop_writes > 0:
+			drop_writes -= 1
+			entry.injected = true
+			trace.append(entry)
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：真实继续写入后丢弃响应"}}
+		trace.append(entry)
 		return answer
 
 class VoteFaultClient extends "res://scripts/kernel_client.gd":
@@ -231,6 +257,8 @@ func run(frontend) -> void:
 		return
 	if not await verify_vote_flow():
 		return
+	if not await verify_victory_flow():
+		return
 	if not await verify_asset_flow():
 		return
 	if not await verify_city_state_flow():
@@ -247,7 +275,8 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "asset-decisions", "city-state", "event"],
+		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event"],
+		"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -1164,6 +1193,298 @@ func verify_great_person_sizes() -> bool:
 	await settle()
 	return true
 
+func victory_scenario(name: String) -> Dictionary:
+	for scenario in victory_expected.scenarios:
+		if scenario.name == name:
+			return scenario
+	return {}
+
+func open_victory() -> bool:
+	if not await click_tab(app.tabs, app.TAB_MATTERS):
+		return false
+	return await click_control(app.victory_panel_inst.open_button)
+
+func click_victory_dialog(confirm: bool, twice := false) -> bool:
+	var dialog: ConfirmationDialog = app.victory_panel_inst.confirmation
+	if not check(dialog.visible, "胜利继续确认可见"):
+		return false
+	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
+	await get_tree().process_frame
+	var pos := control.get_global_rect().get_center()
+	if not check(dialog.get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34, "胜利确认按钮完整可达"):
+		return false
+	await window_motion(dialog, pos)
+	if not check(dialog.gui_get_hovered_control() == control, "胜利确认真实鼠标命中"):
+		return false
+	# 双击坐标必须在第一次提交关窗前换算至父视口。
+	var viewport: Viewport = dialog
+	while viewport is Window and viewport.is_embedded():
+		pos = Vector2(viewport.position) + viewport.get_final_transform() * pos
+		viewport = viewport.get_parent().get_viewport()
+	await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false)
+	if twice:
+		await window_mouse(viewport, MOUSE_BUTTON_LEFT, pos, false, true)
+	await settle()
+	return check(not dialog.visible and app.victory_panel_inst.payload.is_empty(), "胜利确认载荷清空")
+
+func continue_victory() -> bool:
+	var panel = app.victory_panel_inst
+	if not panel.panel.is_visible_in_tree() and not await open_victory():
+		return false
+	var revision: int = app.client.revision
+	var turn: int = app.client.snapshot.turn
+	var pending: Array = app.client.snapshot.pending.filter(func(p): return p.kind != "victory")
+	var record = app.client.snapshot.victory.recorded
+	if not await click_control(panel.continue_button) or not await click_victory_dialog(true, true):
+		return false
+	return check(app.client.revision == revision + 1 and app.client.snapshot.turn == turn and app.client.snapshot.victory.oneMoreTurnMode and app.client.snapshot.victory.recorded == record and app.client.snapshot.pending == pending and app.tabs.current_tab == app.TAB_UNIT, "继续仅一次写入、保留记录与其他待决、返回地图不自动回合")
+
+func victory_matches(name: String, step: String) -> bool:
+	await settle()
+	if not check(not app.victory_panel_inst.transaction and not app.client.busy, "胜利事务解锁：" + step):
+		return false
+	if not await perform("save", {"name": run_id + "-victory-" + str(victory_steps)}):
+		return false
+	var zipped := Marshalls.base64_to_raw(FileAccess.get_file_as_string(app.last_saved_path).strip_edges())
+	var raw := zipped.decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_GZIP).get_string_from_utf8()
+	var files: Dictionary = victory_scenario(name).states[step]
+	var native_raw := FileAccess.get_file_as_string(files.raw)
+	var expected = normalize_great_person(JSON.parse_string(FileAccess.get_file_as_string(files.normalized)))
+	var actual := great_person_state(raw)
+	var evidence := {"scenario": name, "step": step, "savedPath": app.last_saved_path, "states": [], "matched": false}
+	victory_evidence.append(evidence)
+	for side in [["actual-raw", raw], ["native-raw", native_raw], ["actual-normalized", JSON.stringify(actual)], ["native-normalized", JSON.stringify(expected)]]:
+		var path: String = "res://.local/" + run_id + "-victory-" + str(victory_steps) + "-" + side[0] + ".json"
+		var file := FileAccess.open(path, FileAccess.WRITE)
+		file.store_string(side[1])
+		file.close()
+		evidence.states.append(ProjectSettings.globalize_path(path))
+	if not equal_persisted(great_person_state(native_raw), expected, "胜利比较器校准 " + step) or not equal_persisted(actual, expected, "胜利完整存档 " + name + "/" + step):
+		return false
+	evidence.matched = true
+	victory_steps += 1
+	return true
+
+func observe_victory_lock(busy: bool) -> void:
+	if not app.victory_panel_inst.transaction:
+		return
+	victory_lock_valid = victory_lock_valid and app._input_locked()
+	for control in app.buttons:
+		if is_instance_valid(control):
+			victory_lock_valid = victory_lock_valid and control.disabled
+	if not busy:
+		victory_lock_handoffs += 1
+
+func verify_victory_stamps() -> bool:
+	if not await perform("load", {"path": victory_scenario("won").fixture}):
+		return false
+	var panel = app.victory_panel_inst
+	var revision: int = app.client.revision
+	for escape in [false, true]:
+		if not await click_control(panel.continue_button):
+			return false
+		if escape:
+			await diplomacy_key(KEY_ESCAPE)
+			await settle()
+		elif not await click_victory_dialog(false):
+			return false
+		if not check(app.client.revision == revision and panel.payload.is_empty() and not panel.confirmation.visible, "胜利取消与 Escape 零写入"):
+			return false
+	for key in ["session", "revision", "gameId", "player", "loadEpoch", "generation", "ticket"]:
+		if not await click_control(panel.continue_button):
+			return false
+		var old = panel.payload.stamp[key]
+		panel.payload.stamp[key] = int(old) - 1 if old is int or old is float else "expired-" + str(old)
+		if not await click_victory_dialog(true) or not check(app.client.revision == revision, "本地旧胜利确认拒绝：" + key):
+			return false
+	var old_stamp: Dictionary = panel.stamp.duplicate(true)
+	if not await click_control(panel.continue_button) or not await perform("snapshot"):
+		return false
+	if not check(not panel.confirmation.visible and panel.payload.is_empty() and not panel.stamp_valid(old_stamp), "刷新废弃旧胜利确认"):
+		return false
+	if not await click_control(panel.continue_button):
+		return false
+	panel.payload.params.resultToken = "forged-victory-ticket"
+	if not await click_victory_dialog(true) or not check(app.client.revision == revision and not app.client.snapshot.victory.oneMoreTurnMode, "内核旧票据拒绝只恢复、不重交"):
+		return false
+	var rejected: Dictionary = await app.client.command("nextTurn")
+	if not check(rejected.get("error", {}).get("code") == "PENDING_DECISION" and app.client.revision == revision, "绕过前端的玩法写入仍被内核门禁拒绝"):
+		return false
+	if not await click_control(panel.back_button) or not await perform("snapshot"):
+		return false
+	if not await victory_matches("won", "initial") or not check(app.tabs.current_tab == app.TAB_UNIT and not panel.panel.visible and app.turn_button.disabled, "返回地图、刷新与保存不解除结算、不抢回焦点"):
+		return false
+	if not await open_victory() or not await click_control(panel.continue_button):
+		return false
+	old_stamp = panel.payload.stamp.duplicate(true)
+	if not await perform("load", {"path": victory_scenario("won").fixture}):
+		return false
+	return check(panel.panel.is_visible_in_tree() and panel.payload.is_empty() and not panel.stamp_valid(old_stamp), "同局重载重新引导并废弃旧确认")
+
+func verify_victory_sequence(scenario: Dictionary) -> bool:
+	var name: String = scenario.name
+	var original := FileAccess.get_file_as_string(scenario.fixture)
+	if not await perform("load", {"path": scenario.fixture}):
+		return false
+	var panel = app.victory_panel_inst
+	if name in ["won", "lost", "defeated"]:
+		if not check(panel.panel.is_visible_in_tree() and panel.data.outcome == name and not panel.continue_button.disabled, "新结算自动引导：" + name):
+			return false
+		for control in app.buttons:
+			if is_instance_valid(control) and control.get_meta("gameplay", true) and not check(control.disabled, "待结算玩法按钮禁用：" + str(control.name)):
+				return false
+		await screenshot("smoke-victory-" + name + ".png")
+	if not await victory_matches(name, scenario.initial):
+		return false
+	for step in scenario.steps:
+		var params: Dictionary = step.params
+		match str(step.action):
+			"victoryContinue":
+				if not await continue_victory():
+					return false
+			"reload":
+				if not await perform("load", {"path": app.last_saved_path}):
+					return false
+				if app.client.snapshot.victory.oneMoreTurnMode and not check(not panel.panel.visible, "继续标志重载后不再次结算"):
+					return false
+			"nextTurn":
+				var turn: int = app.client.snapshot.turn
+				if not await click_control(app.turn_button) or not check(app.client.snapshot.turn == turn + 1, "继续后显式推进原生 AI 回合：" + name):
+					return false
+			"attack":
+				app.map.center_on(Vector2i(-5, 0))
+				if not await click_map(Vector2i(-5, 0)) or not await click_map(Vector2i(params.x, params.y), MOUSE_BUTTON_RIGHT):
+					return false
+				if not await click_control(app.attack_button) or not check(app.client.snapshot.victory.outcome == "ongoing", "攻击后待处置尚未转移首都"):
+					return false
+			"cityDecision":
+				var puppet: Button = null
+				for control in app.capture_panel.get_children():
+					if control is Button and control.text == "傀儡":
+						puppet = control
+				if not await click_control(puppet) or not check(panel.panel.is_visible_in_tree() and panel.data.outcome == "won", "真实首都处置触发征服结算"):
+					return false
+			_:
+				return check(false, "未定义胜利原生脚本动作：" + str(step.action))
+		if not await victory_matches(name, step.step):
+			return false
+	return check(FileAccess.get_file_as_string(scenario.fixture) == original, "胜利导入原始文件未改动：" + name)
+
+func verify_victory_transport() -> bool:
+	for mode in ["retry", "recover", "snapshot", "victoryOptions"]:
+		if not await perform("load", {"path": victory_scenario("lost").fixture}):
+			return false
+		var panel = app.victory_panel_inst
+		if not await click_control(panel.continue_button):
+			return false
+		var original = app.client
+		var revision: int = original.revision
+		var fault := VictoryFaultClient.new()
+		app.add_child(fault)
+		fault.drop_writes = 1 if mode == "retry" else 2
+		fault.fail_query = mode if mode in ["snapshot", "victoryOptions"] else ""
+		swap_great_person_test_client(fault)
+		var clicked := await click_victory_dialog(true, true)
+		var writes: Array = fault.trace.filter(func(e): return e.request.action == "victoryContinue")
+		var queries: Array = fault.trace.filter(func(e): return e.request.action != "victoryContinue").map(func(e): return e.request.action)
+		var expected_queries: Array = ["victoryOptions"] if mode == "retry" else ["snapshot", "victoryOptions"]
+		if mode == "snapshot":
+			expected_queries = ["snapshot", "snapshot"]
+		elif mode == "victoryOptions":
+			expected_queries = ["snapshot", "victoryOptions", "victoryOptions"]
+		var guarded: bool = panel.continue_button.disabled and not panel.transaction and panel.uncertain == (not fault.fail_query.is_empty())
+		var path: String = "res://.local/" + run_id + "-victory-transport-" + mode + ".json"
+		var file := FileAccess.open(path, FileAccess.WRITE)
+		file.store_string(JSON.stringify({"method": "客户端边界故障注入，真实 HTTP 写入后丢弃响应", "trace": fault.trace, "guarded": guarded}))
+		file.close()
+		victory_evidence.append({"fault": mode, "path": ProjectSettings.globalize_path(path)})
+		swap_great_person_test_client(original)
+		fault.queue_free()
+		if not clicked or not check(writes.size() == 2 and writes[0].request == writes[1].request and writes[0].answer == writes[1].answer and writes[0].answer.ok and queries == expected_queries and guarded, "胜利重试使用同请求、恢复仅查询：" + mode):
+			return false
+		if panel.uncertain:
+			await screenshot("smoke-victory-uncertain-" + mode + ".png")
+			var requests: int = original.request_counter
+			scroll_into_view(panel.continue_button)
+			await settle()
+			await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, panel.continue_button.get_global_rect().get_center())
+			if not check(original.request_counter == requests, "胜利不确定状态真实点击零请求"):
+				return false
+			if not await click_control(panel.open_button):
+				return false
+		if not check(original.revision == revision + 1 and not panel.uncertain, "胜利断线恢复后只提交一次、不自动重交") or not await victory_matches("lost", "1-victoryContinue"):
+			return false
+	return true
+
+func verify_victory_sizes() -> bool:
+	var original := get_window().size
+	for target_size in [Vector2i(1024, 720), Vector2i(1280, 800), Vector2i(1600, 900)]:
+		get_window().size = target_size
+		await settle()
+		var size_name := "%dx%d" % [target_size.x, target_size.y]
+		if not await perform("load", {"path": victory_scenario("won").fixture}):
+			return false
+		var panel = app.victory_panel_inst
+		await screenshot("smoke-victory-" + size_name + "-result.png")
+		if not await click_control(panel.continue_button):
+			return false
+		await screenshot("smoke-victory-" + size_name + "-confirm.png")
+		if not await click_victory_dialog(false):
+			return false
+		var injected: Dictionary = panel.data.duplicate(true)
+		injected.description = "仅布局注入：胜利记录由原内核判定，继续游戏不会清除其他待决事项。".repeat(12)
+		if not check(panel.apply_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": injected}, panel.stamp), "胜利长文案布局注入"):
+			return false
+		await settle()
+		scroll_into_view(panel.result_text)
+		await settle()
+		await screenshot("smoke-victory-" + size_name + "-long.png")
+		if not check(panel.result_text.size.x <= app.tabs.size.x, "胜利长文本自动换行、不横向溢出") or not await click_control(panel.continue_button) or not await click_victory_dialog(false):
+			return false
+		if not await click_control(panel.open_button):
+			return false
+		var scroll: ScrollContainer = panel.progress.get_parent()
+		scroll_into_view(scroll)
+		await settle()
+		var pos := scroll.get_global_rect().get_center()
+		for i in range(8):
+			await window_mouse(get_viewport(), MOUSE_BUTTON_WHEEL_DOWN, pos)
+		await settle()
+		# 嵌套滚动会把外层事项页一并下移；截图前仅恢复进度区可见，不改变内层真实滚动结果。
+		scroll_into_view(scroll)
+		await settle()
+		if not check(scroll.scroll_vertical > 0 and panel.progress.size.x <= app.tabs.size.x and app.matters_scroll.get_global_rect().encloses(scroll.get_global_rect()), "胜利进度真实滚动、完整入镜且宽度受限"):
+			return false
+		await screenshot("smoke-victory-" + size_name + "-progress.png")
+		window_sizes_checked.append("victory-" + size_name)
+	get_window().size = original
+	await settle()
+	return true
+
+func verify_victory_flow() -> bool:
+	victory_expected = JSON.parse_string(FileAccess.get_file_as_string("res://.local/tests/victory-expected.json"))
+	if not check(victory_expected.setFields == great_person_expected.setFields and victory_expected.mapOfSetFields == great_person_expected.mapOfSetFields, "胜利完整比较器不增加归一化豁免"):
+		return false
+	app.client.busy_changed.connect(observe_victory_lock)
+	if not await perform("load", {"path": victory_scenario("progress").fixture}):
+		return false
+	var revision: int = app.client.revision
+	if not await open_victory() or not await open_victory():
+		return false
+	if not check(app.client.revision == revision and app.victory_panel_inst.data.outcome == "ongoing" and app.victory_panel_inst.continue_button.disabled and not app.victory_panel_inst.data.progress.is_empty(), "己方进度重复查看只读、进行中不可继续"):
+		return false
+	if not await verify_victory_stamps() or not await verify_victory_transport():
+		return false
+	for scenario in victory_expected.scenarios:
+		if not await verify_victory_sequence(scenario):
+			return false
+	if not await verify_victory_sizes():
+		return false
+	if not check(victory_lock_valid and victory_lock_handoffs > 10, "胜利 HTTP 至恢复查询的事务锁完整"):
+		return false
+	steps.append("胜利闭环：进度、三类结算、外交优先、真实征服、继续与保存重载、每步独立差分、取消／旧票据／断线恢复及三尺寸截图")
+	return true
+
 func vote_scenario(name: String) -> Dictionary:
 	for scenario in vote_expected.scenarios:
 		if scenario.name == name:
@@ -1393,8 +1714,24 @@ func verify_vote_sequence(scenario: Dictionary) -> bool:
 				await settle()
 				if not check(app.client.revision == revision + 1 and app.vote_panel_inst.submit.disabled and app.vote_panel_inst.abstain.disabled and app.vote_panel_inst.data.get("results") == null, "明确投票／弃权一次提交，未公布前无票数"):
 					return false
+			"victoryContinue":
+				if not check(app.victory_panel_inst.panel.is_visible_in_tree() and not app.vote_panel_inst.panel.visible, "外交结果确认后自动引导胜负结算") or not await continue_victory():
+					return false
+			"religionChooseBeliefs":
+				if not await click_tab(app.tabs, app.TAB_RELIGION):
+					return false
+				for index in range(params.beliefs.size()):
+					var picker: OptionButton = app.religion_panel_inst.slot_pickers[index]
+					var selected := -1
+					for i in range(picker.item_count):
+						if picker.get_item_metadata(i) == params.beliefs[index]:
+							selected = i
+					if not await click_option(picker, selected):
+						return false
+				if not await click_control(find_by_name(app, "ReligionSubmit")) or not await click_religion_dialog(true):
+					return false
 			"diplomaticVoteAcknowledge":
-				if not await open_vote():
+				if not check(app.vote_panel_inst.panel.is_visible_in_tree() and not app.victory_panel_inst.panel.visible, "外交结果优先于胜负结算自动引导") or not await open_vote():
 					return false
 				if not await click_control(find_by_name(app, "DiplomaticVoteBack")) or not check(app.turn_button.disabled, "返回地图保留结果待决") or not await open_vote():
 					return false
@@ -2690,6 +3027,7 @@ func perform(action: String, params: Dictionary = {}) -> bool:
 	if not result.get("ok", false):
 		_fail(action + "：" + str(result.get("error")))
 		return false
+	await settle()
 	return true
 
 func check(condition: bool, message: String) -> bool:
@@ -2706,6 +3044,7 @@ func _fail(message: String) -> void:
 		report.store_string(JSON.stringify({"ok": false, "runId": run_id, "startedAt": started_at,
 			"finishedAt": Time.get_datetime_string_from_system(true), "error": message,
 			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
+			"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
@@ -3481,7 +3820,7 @@ func settle() -> void:
 	var guard := 0
 	while idle < 3 and guard < 900:
 		guard += 1
-		if app.client.busy or app.economy_panel_inst.transaction or app.diplomacy_panel_inst.transaction or app.religion_panel_inst.transaction or app.great_person_panel_inst.transaction or app.vote_panel_inst.transaction or app.asset_panel_inst.transaction or app.event_panel_inst.transaction:
+		if app.client.busy or app._execute_depth > 0 or app.victory_panel_inst.guide_active or app.panels.any(func(p): return p.transaction):
 			idle = 0
 		else:
 			idle += 1

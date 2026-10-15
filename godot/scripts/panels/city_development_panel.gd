@@ -51,7 +51,7 @@ func build(city_page: VBoxContainer) -> void:
 	overview.add_child(city_overview)
 	city_growth.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	overview.add_child(city_growth)
-	breakdown_toggle = orchestrator.button(overview, "产出来源明细", func(): breakdown_box.visible = not breakdown_box.visible)
+	breakdown_toggle = orchestrator.button(overview, "产出来源明细", func(): breakdown_box.visible = not breakdown_box.visible, false)
 	breakdown_box.visible = false
 	overview.add_child(breakdown_box)
 	# 人口子页：焦点、避免增长、Reset、地块操作与专家。

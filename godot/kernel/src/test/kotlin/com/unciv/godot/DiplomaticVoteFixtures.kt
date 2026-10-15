@@ -142,8 +142,9 @@ internal object DiplomaticVoteFixtures {
     fun apply(game: GameInfo, action: String, params: JsonObject = dto()): GameInfo = native(game) {
         val player = game.currentPlayerCiv
         when (action) {
-            "nextTurn" -> return@native nextTurn(game)
-            "reload" -> return@native copy(game)
+            "nextTurn" -> return@native nextTurn(game).also { VictoryFixtures.screenUpdate(it) }
+            "reload" -> return@native copy(game).also { VictoryFixtures.screenUpdate(it) }
+            "victoryContinue" -> game.oneMoreTurnMode = true
             "diplomaticVoteCast" -> player.diplomaticVoteForCiv(if (params.text("choice") == "abstain") null else params.text("civId"))
             "diplomaticVoteAcknowledge" -> acknowledge(game)
             "acknowledge" -> {
@@ -152,6 +153,8 @@ internal object DiplomaticVoteFixtures {
                 player.popupAlerts.removeAt(0)
             }
             "diplomacyTradeDecision" -> DiplomacyFixtures.tradeDecision(game, params.text("choice"))
+            "religionChooseBeliefs" -> ReligionFixtures.chooseBeliefs(game,
+                params["beliefs"]!!.jsonArray.map { it.jsonPrimitive.content }, player.religionManager.usingFreeBeliefs())
             "deferPolicy" -> GameView(game, player).civView.tryDismissPolicyPicker()
             "research" -> player.tech.techsToResearch = arrayListOf(params.text("name"))
             "production" -> {
@@ -176,6 +179,7 @@ internal object DiplomaticVoteFixtures {
             }
             else -> error("未知原生脚本动作：$action")
         }
+        VictoryFixtures.screenUpdate(game)
         game
     }
 
@@ -204,6 +208,7 @@ internal object DiplomaticVoteFixtures {
             while (player.popupAlerts.isNotEmpty()) step("acknowledge")
             while (player.tradeRequests.isNotEmpty()) step("diplomacyTradeDecision", dto("choice" to "decline"))
             val cv = GameView(game, player).civView
+            if (cv.canFoundPantheon()) step("religionChooseBeliefs", dto("beliefs" to listOf(ReligionFixtures.firstPantheon(game))))
             if (cv.shouldShowPolicyPicker()) step("deferPolicy")
             if (cv.shouldOpenTechPicker()) step("research", dto("name" to "Future Tech"))
             for (city in player.cities) if (city.cityConstructions.currentConstructionName().isEmpty())
@@ -234,12 +239,13 @@ internal object DiplomaticVoteFixtures {
         check(game.getCivilization(winner).victoryManager.hasEverWonDiplomaticVote) {
             "原生 AI 投票未当选：${game.diplomaticVictoryVotesCast}"
         }
-        // AI 的 updateWinningCiv 已在本轮计票前运行；结果确认不代它写 victoryData。
+        // AI 本轮计票前已完成胜利检查；确认结果后的原生画面更新才补记其胜利。
         if (!playerWins) check(game.victoryData == null)
         step("diplomaticVoteAcknowledge"); step("reload")
-        if (!playerWins) { settlePrompts(); step("nextTurn"); step("reload") }
         check(game.victoryData?.winningCiv == winner)
         check(game.victoryData?.victoryType == "Diplomatic")
+        step("victoryContinue"); step("reload")
+        settlePrompts(); step("nextTurn"); step("reload")
     }
 
     fun abstainSequence(initial: GameInfo): Sequence = Sequence(initial, "abstain").apply {

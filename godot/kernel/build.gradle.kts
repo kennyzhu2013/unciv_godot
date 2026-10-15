@@ -52,5 +52,7 @@ tasks.test {
         .map { rootProject.file("godot/.local/tests/diplomatic-vote-$it.json") })
     outputs.files(listOf("expected", "civilian-worker", "civilian-settler", "civilian-city-state", "traded", "marriage", "marriage-occ", "expired", "queue")
         .map { rootProject.file("godot/.local/tests/asset-$it.json") })
+    outputs.files(listOf("expected", "progress", "won", "lost", "defeated", "conquest")
+        .map { rootProject.file("godot/.local/tests/victory-$it.json") })
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = true }
 }

@@ -32,7 +32,7 @@ func query_command() -> String:
 
 # --- 构建（逐字搬运 _build_great_person）---
 func build(page: Node) -> void:
-	open_button = orchestrator.button(page, "选择免费伟人", open_great_person)
+	open_button = orchestrator.button(page, "选择免费伟人", open_great_person, false)
 	open_button.name = "OpenGreatPerson"
 	page.add_child(panel)
 	panel.hide()
@@ -50,10 +50,10 @@ func build(page: Node) -> void:
 	submit.name = "GreatPersonSubmit"
 	submit.set_meta("allowed", false)
 	panel.add_child(result)
-	locate = orchestrator.button(panel, "定位新单位", locate_great_person)
+	locate = orchestrator.button(panel, "定位新单位", locate_great_person, false)
 	locate.name = "GreatPersonLocate"
 	locate.hide()
-	orchestrator.button(panel, "返回地图（保留额度）", back_great_person).name = "GreatPersonBack"
+	orchestrator.button(panel, "返回地图（保留额度）", back_great_person, false).name = "GreatPersonBack"
 	confirmation.name = "GreatPersonConfirmation"
 	confirmation.title = "确认免费伟人选择"
 	confirmation.dialog_autowrap = true

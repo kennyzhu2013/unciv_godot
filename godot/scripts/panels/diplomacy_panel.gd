@@ -81,7 +81,7 @@ func build_tab() -> void:
 
 # --- 构建事项页的「打开外交处理」入口（逐字搬运 _build_matters_tab 中两行）---
 func build_open_button(page: Node) -> void:
-	open_button = orchestrator.button(page, "打开外交处理", open_diplomacy)
+	open_button = orchestrator.button(page, "打开外交处理", open_diplomacy, false)
 	open_button.name = "OpenDiplomacy"
 
 # --- 打开外交页（逐字搬运 _open_diplomacy）---

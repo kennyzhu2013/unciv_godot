@@ -19,13 +19,13 @@ internal class DiplomaticVoteCommands(private val game: GameInfo, private val se
     private fun candidates() = player.diplomacyFunctions.getKnownCivsSorted(false).sortedBy { it.civID }.toList()
     private fun ensure(ok: Boolean, code: String, message: String) { if (!ok) throw GatewayError(code, message) }
     private fun checked(block: () -> Unit): GatewayError? = try { block(); null } catch (error: GatewayError) { error }
-    private fun scope() {
+    private fun scope(requireAlive: Boolean = false) {
         GameSession.validateGame(game)
         ensure(BaseRuleset.entries.any { it.fullName == game.gameParameters.baseRuleset }, "UNSUPPORTED", "外交投票仅验证 Vanilla 与 G&K 基础规则")
-        ensure(player.isMajorCiv() && !player.isDefeated(), "UNSUPPORTED", "外交投票仅支持存活的主要文明玩家")
+        ensure(player.isMajorCiv() && (!requireAlive || !player.isDefeated()), "UNSUPPORTED", "外交投票提交仅支持存活的主要文明玩家")
     }
     private fun castCheck() {
-        scope()
+        scope(requireAlive = true)
         ensure(!resultPending(), "DIPLOMATIC_VOTE_RESULT_PENDING", "请先查看并确认本轮外交投票结果")
         ensure(!hasVoted(), "DIPLOMATIC_VOTE_ALREADY_CAST", "本轮已经投票或弃权，不能改票")
         ensure(player.mayVoteForDiplomaticVictory(), "NO_DIPLOMATIC_VOTE", "当前没有可提交的外交投票")
@@ -174,7 +174,7 @@ internal enum class DiplomaticVoteWire(val wireName: String) {
                 DiplomaticVoteCommands(session.requireGame(), it.sessionId, it.revision).options(it.request)
             }
             for (action in entries) {
-                registry.effect(action.wireName) { ctx ->
+                registry.effect(action.wireName, allowedDuringVictory = action == Acknowledge) { ctx ->
                     DiplomaticVoteCommands(session.requireGame(), ctx.sessionId, ctx.revision).prepare(ctx.request)
                 }
             }

@@ -91,6 +91,7 @@ internal class DiplomaticVoteCommandsTest {
         assertTrue(response.toString(), response["ok"]!!.jsonPrimitive.boolean)
         assertSame(current, session.game)
         assertEquals(revision + 1, session.revision)
+        VictoryFixtures.screenUpdate(expected)
         assertGameplayEquals(body.text("action"), expected, current)
         val after = UncivFiles.gameInfoToString(current, false)
         assertEquals(response, session.handle(body))
@@ -126,6 +127,8 @@ internal class DiplomaticVoteCommandsTest {
                 when (action) {
                     "diplomaticVoteCast" -> params = JsonObject(params + ("decisionToken" to options(session)["decision"]!!.jsonObject["token"]!!))
                     "diplomaticVoteAcknowledge" -> params = dto("resultToken" to options(session)["decision"]!!.jsonObject["token"])
+                    "victoryContinue" -> params = dto("resultToken" to run(session, "victoryOptions")["data"]!!.jsonObject["continue"]!!.jsonObject["token"])
+                    "religionChooseBeliefs" -> params = JsonObject(params + ("decisionToken" to run(session, "religionOptions")["data"]!!.jsonObject["decision"]!!.jsonObject["token"]!!))
                     "diplomacyTradeDecision" -> params = JsonObject(params + ("tradeToken" to run(session, "diplomacyOptions")["data"]!!.jsonObject["incomingTrade"]!!.jsonObject["tradeToken"]!!))
                 }
                 val result = session.handle(JsonObject(request(session, action) + params))
@@ -454,7 +457,7 @@ internal class DiplomaticVoteCommandsTest {
         assertFalse(PlayerSnapshot(game).build()["diplomaticVote"]!!.jsonObject.boolean("resultsReadable"))
     }
     @Test fun unsupportedScopeRejectsQueriesAndBothWritesBeforeBackup() {
-        for (result in listOf(false, true)) for (mode in listOf("online", "mods", "player", "multiple", "dead")) {
+        for (result in listOf(false, true)) for (mode in listOf("online", "mods", "player", "multiple")) {
             val (session, _) = scenario(if (result) results() else voting())
             val body = if (result) ackRequest(session) else castRequest(session, null)
             val game = session.game!!

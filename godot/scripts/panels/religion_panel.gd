@@ -62,7 +62,7 @@ func build_tab() -> void:
 
 # --- 构建事项页的「打开宗教处理」入口（逐字搬运 _build_matters_tab 中两行）---
 func build_open_button(page: Node) -> void:
-	open_button = orchestrator.button(page, "打开宗教处理", open_religion)
+	open_button = orchestrator.button(page, "打开宗教处理", open_religion, false)
 	open_button.name = "OpenReligion"
 
 # --- 宗教专用文案助手（逐字搬运 _religion_mode_label/_religion_belief_type/_religion_state_name）---

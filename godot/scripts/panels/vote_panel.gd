@@ -31,7 +31,7 @@ func build(page: Node) -> void:
 	summary.name = "DiplomaticVoteSummary"
 	summary.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	page.add_child(summary)
-	open_button = orchestrator.button(page, "打开外交投票／结果", open_vote)
+	open_button = orchestrator.button(page, "打开外交投票／结果", open_vote, false)
 	open_button.name = "OpenDiplomaticVote"
 	open_button.set_meta("allowed", false)
 	page.add_child(panel)
@@ -56,11 +56,11 @@ func build(page: Node) -> void:
 	results.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	result_scroll.add_child(results)
 	panel.add_child(result_scroll)
-	continue_button = orchestrator.button(panel, "确认结果并继续", continue_vote)
+	continue_button = orchestrator.button(panel, "确认结果并继续", continue_vote, false)
 	continue_button.name = "DiplomaticVoteContinue"
 	for control in [submit, abstain, continue_button]:
 		control.set_meta("allowed", false)
-	orchestrator.button(panel, "返回地图（保留待决）", back_vote).name = "DiplomaticVoteBack"
+	orchestrator.button(panel, "返回地图（保留待决）", back_vote, false).name = "DiplomaticVoteBack"
 	confirmation.name = "DiplomaticVoteConfirmation"
 	confirmation.title = "确认本轮外交投票"
 	confirmation.dialog_autowrap = true

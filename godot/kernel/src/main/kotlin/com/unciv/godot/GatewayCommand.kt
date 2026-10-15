@@ -38,6 +38,10 @@ internal interface QueryCommand : GatewayCommand {
  * 而推进回合、移除弹窗必须发生在候选对局上。这是唯一有意保留的双阶段。
  */
 internal interface EffectCommand : GatewayCommand {
+    /** 同一事务内补齐原生画面更新的胜利检查；存档命令不检查。 */
+    val checksVictory: Boolean get() = true
+    /** 结算期间只允许生命周期、投票结果确认与继续游戏。 */
+    val allowedDuringVictory: Boolean get() = false
     /** 候选对局来源。 */
     val source: CandidateSource get() = CandidateSource.CURRENT
     /** 执行前是否 clone 备份以便失败回滚（就地修改类为 true）。 */

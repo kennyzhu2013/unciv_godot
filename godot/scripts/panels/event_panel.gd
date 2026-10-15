@@ -27,7 +27,7 @@ func query_command() -> String:
 
 # --- 构建（逐字搬运 _build_event）---
 func build(page: Node) -> void:
-	open_button = orchestrator.button(page, "打开事件处理", open_event)
+	open_button = orchestrator.button(page, "打开事件处理", open_event, false)
 	open_button.name = "OpenEvent"
 	open_button.set_meta("allowed", false)
 	page.add_child(panel)
@@ -38,7 +38,7 @@ func build(page: Node) -> void:
 	panel.add_child(summary)
 	choices_box.name = "EventChoices"
 	panel.add_child(choices_box)
-	orchestrator.button(panel, "返回地图（保留待决）", back_event).name = "EventBack"
+	orchestrator.button(panel, "返回地图（保留待决）", back_event, false).name = "EventBack"
 	confirmation.name = "EventConfirmation"
 	confirmation.title = "确认事件选择"
 	confirmation.dialog_autowrap = true

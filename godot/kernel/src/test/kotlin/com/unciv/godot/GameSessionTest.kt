@@ -353,6 +353,7 @@ class GameSessionTest {
                 else -> error("原生对照尚未定义操作：$action")
             }
         }
+        VictoryFixtures.screenUpdate(native.game)
         run(session, action, *params)
         assertGameplayEquals("第 ${native.game.turns} 回合 $action $args", native.game, session.game!!)
     }
@@ -590,6 +591,33 @@ class GameSessionTest {
         assertEquals(response, session.handle(body))
         assertEquals(revision + 1, session.revision)
         assertGameplayEquals("religionFound 重放", expected, session.game!!)
+    }
+
+    @Test fun victoryCheckAndNotificationRollBackWhenCommitFails() {
+        val session = loadedSession(VictoryFixtures.export(VictoryFixtures.game(), "rollback"))
+        val original = session.game!!
+        original.gameParameters.maxTurns = 0
+        val winner = original.civilizations.single { it.isMajorCiv() && it.isAI() }
+        winner.tech.repeatingTechsResearched = 10000
+        assertTrue(winner.calculateTotalScore() > original.currentPlayerCiv.calculateTotalScore())
+        val before = gameplay(original)
+        val revision = session.revision
+        // 测试局部命令将写盘指向不存在的父目录；故障发生在胜利检查和快照之后。
+        val registry = CommandRegistry()
+        registry.effect("testVictoryCommitFailure", executeFn = { ctx, _ ->
+            ctx.savedPath = File(root, "godot/.local/absent-${UUID.randomUUID()}/save.json").absolutePath
+        })
+        @Suppress("UNCHECKED_CAST")
+        (session.catalog() as MutableMap<String, GatewayCommand>).putAll(registry.build())
+        val result = session.handle(request(session, "testVictoryCommitFailure"))
+        assertEquals("KERNEL_ERROR", result["error"]!!.jsonObject.text("code"))
+        assertNotNull("失败前确实已执行原生胜利检查", original.victoryData)
+        assertTrue(original.currentPlayerCiv.popupAlerts.any { it.type == AlertType.GameHasBeenWon })
+        assertEquals(revision, session.revision)
+        assertNotSame(original, session.game)
+        assertEquals(before, gameplay(session.game!!))
+        assertNull(session.game!!.victoryData)
+        assertSame(session.game, UncivGame.Current.gameInfo)
     }
 
     private fun gameplay(game: GameInfo) = GameplayAssertions.gameplay(game)

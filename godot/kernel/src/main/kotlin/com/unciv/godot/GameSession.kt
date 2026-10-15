@@ -36,6 +36,7 @@ internal class GameSession(private val root: File) {
      * 仍依赖会话私有助手的核心命令在 [registerCore]。hello／snapshot 不进表。
      */
     private val commands: Map<String, GatewayCommand> = CommandRegistry().apply {
+        VictoryCommands.contribute(this, this@GameSession)
         contributeEvents(this, this@GameSession)
         contributeGreatPeople(this, this@GameSession)
         contributeAssetDecisions(this, this@GameSession)
@@ -73,6 +74,8 @@ internal class GameSession(private val root: File) {
             if (registered is QueryCommand) return reply("data" to registered.data(ctx))
             val effect = registered as? EffectCommand
                 ?: throw GatewayError("UNKNOWN_COMMAND", "未实现命令：$action")
+            if (!effect.allowedDuringVictory && game != null)
+                ensure(!VictoryCommands(requireGame()).requiresAcknowledgement(), "PENDING_DECISION", "请先查看胜负结算并选择是否继续游戏")
             // 新命令先完成无副作用校验（prepare 作用于 current、备份前）；可预判错误不触发 setTransients 回滚。
             val prepared = effect.prepare(ctx)
 
@@ -94,6 +97,7 @@ internal class GameSession(private val root: File) {
                 ctx.candidate = candidate
                 ctx.snapshot = PlayerSnapshot(candidate)
                 effect.execute(ctx, prepared)
+                if (effect.checksVictory) VictoryCommands.updateAfterAction(candidate)
                 // 先验证快照可构造，再写盘和提交状态；不会破坏用户导入的原始存档。
                 val playerSnapshot = PlayerSnapshot(candidate).build()
                 if (ctx.savedPath != null) atomicSave(candidate, File(ctx.savedPath!!))
@@ -250,15 +254,15 @@ internal class GameSession(private val root: File) {
             requestingCiv.addNotification("[${civ.civName}] has denied your trade request",
                 NotificationCategory.Trade, civ.civName, NotificationIcon.Trade)
         })
-        registry.effect("load", source = CandidateSource.LOADED, inPlace = false, openCandidate = { ctx ->
+        registry.effect("load", source = CandidateSource.LOADED, inPlace = false, allowedDuringVictory = true, openCandidate = { ctx ->
             load(File(ctx.request.text("path")))
         })
-        registry.effect("demo", source = CandidateSource.LOADED, inPlace = false, openCandidate = {
+        registry.effect("demo", source = CandidateSource.LOADED, inPlace = false, allowedDuringVictory = true, openCandidate = {
             val demo = File(saveDirectory, "demo.json")
             if (!demo.exists()) atomicSave(KernelRuntime.createDemo(), demo)
             load(demo)
         })
-        registry.effect("save", source = CandidateSource.CURRENT, inPlace = false, executeFn = { ctx, _ ->
+        registry.effect("save", source = CandidateSource.CURRENT, inPlace = false, checksVictory = false, allowedDuringVictory = true, executeFn = { ctx, _ ->
             val name = ctx.request.text("name")
             ensure(name.matches(Regex("[A-Za-z0-9_-]{1,80}")), "SAVE_NAME", "存档名只能包含字母、数字、下划线和连字符")
             ctx.savedPath = File(saveDirectory, "$name.json").absolutePath

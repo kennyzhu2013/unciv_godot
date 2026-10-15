@@ -29,7 +29,7 @@ class CommandRegistryTest {
 
         val queries = catalog.filterValues { it is QueryCommand }.keys
         assertEquals(setOf(
-            "eventOptions", "greatPersonOptions", "assetDecisionOptions", "diplomaticVoteOptions",
+            "victoryOptions", "eventOptions", "greatPersonOptions", "assetDecisionOptions", "diplomaticVoteOptions",
             "religionOptions", "combatPreview", "diplomacyOptions", "unitOptions", "cityOptions", "path"),
             queries)
 
@@ -43,6 +43,9 @@ class CommandRegistryTest {
         assertTrue(effect("debugInjectEvent").inPlace)
         assertTrue(effect("move").inPlace)
         assertTrue(effect("attack").inPlace)
+        assertEquals(setOf("load", "demo", "save", "diplomaticVoteAcknowledge", "victoryContinue"),
+            catalog.filterValues { it is EffectCommand && it.allowedDuringVictory }.keys)
+        assertEquals(setOf("save"), catalog.filterValues { it is EffectCommand && !it.checksVictory }.keys)
 
         val domainWires = CityStateWire.entries.map { it.wireName } +
             DiplomacyWire.entries.map { it.wireName } +

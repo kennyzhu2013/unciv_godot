@@ -97,6 +97,7 @@ internal class PlayerSnapshot(private val game: GameInfo) {
         "pending" to pending(),
         "religion" to ReligionCommands(game).snapshotSummary(),
         "diplomaticVote" to DiplomaticVoteCommands(game).snapshotSummary(),
+        "victory" to VictoryCommands(game).snapshotSummary(),
         "notifications" to civ.notifications.map { it.text }
     )
 
@@ -106,6 +107,7 @@ internal class PlayerSnapshot(private val game: GameInfo) {
         }
         val vote = DiplomaticVoteCommands(game).pending()
         if (vote?.text("kind") == "voteResult") add(vote)
+        VictoryCommands(game).pending()?.let { add(it) }
         for (city in view.civView.cities())
             if (!city.isPuppet() && city.currentConstructionName().isEmpty())
                 add("production", "${city.name} 需要选择生产")
