@@ -13,6 +13,9 @@ const EconomyPanelScript = preload("res://scripts/panels/economy_panel.gd")
 const CityDevelopmentPanelScript = preload("res://scripts/panels/city_development_panel.gd")
 const UnitProgressionPanelScript = preload("res://scripts/panels/unit_progression_panel.gd")
 const CityCombatPanelScript = preload("res://scripts/panels/city_combat_panel.gd")
+const GameSetupPanelScript = preload("res://scripts/panels/game_setup_panel.gd")
+var game_setup = GameSetupPanelScript.new()
+var autosave_status := Label.new()
 var client = ClientScript.new()
 var map = MapScript.new()
 var top_status := Label.new()
@@ -180,6 +183,8 @@ func _victory_pending() -> bool:
 	return client.snapshot.get("victory", {}).get("requiresAcknowledgement", false)
 
 func _ready() -> void:
+	game_setup.orchestrator = self
+	panels.append(game_setup)
 	victory_panel_inst.orchestrator = self
 	panels.append(victory_panel_inst)
 	vote_panel_inst.orchestrator = self
@@ -225,7 +230,7 @@ func _ready() -> void:
 	var hello: Dictionary = await execute("hello")
 	if not hello.get("ok", false):
 		return
-	message.text = "内核已连接。读取现有单人存档，或打开验证开局。"
+	message.text = "内核已连接。可创建新游戏、继续最近存档或导入原版单人存档。"
 	if "--smoke" in OS.get_cmdline_user_args():
 		var smoke = load("res://tests/smoke.gd").new()
 		add_child(smoke)
@@ -251,21 +256,30 @@ func _build_ui() -> void:
 	header.add_child(title)
 	top_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	top_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	top_status.text = "陆战验证版 · Kotlin 规则内核"
+	top_status.text = "单人离线 · Kotlin 规则内核"
 	header.add_child(top_status)
 	# 存档工具栏（保留）。
 	var toolbar := HBoxContainer.new()
 	toolbar.add_theme_constant_override("separation", 6)
 	layout.add_child(toolbar)
-	button(toolbar, "读取存档", func(): file_dialog.popup_centered_ratio(0.75), false)
-	button(toolbar, "验证开局", _demo, false)
+	game_setup.build(toolbar)
+	button(toolbar, "导入存档", func(): file_dialog.popup_centered_ratio(0.75), false)
+	if "--smoke" in OS.get_cmdline_user_args():
+		button(toolbar, "验证开局", _demo, false)
+	button(toolbar, "刷新", func(): await execute("snapshot"), false).set_meta("state_recovery", true)
+	button(toolbar, "定位", _locate, false)
+	var savebar := HBoxContainer.new()
+	layout.add_child(savebar)
 	save_name.text = "godot-save"
 	save_name.custom_minimum_size.x = 150
-	toolbar.add_child(save_name)
-	button(toolbar, "保存副本", _save, false)
-	button(toolbar, "重载副本", _reload, false)
-	button(toolbar, "刷新", func(): await execute("snapshot"), false)
-	button(toolbar, "定位", _locate, false)
+	save_name.tooltip_text = "字母、数字、下划线或连字符；同名副本会被替换。"
+	savebar.add_child(save_name)
+	button(savebar, "保存副本", _save, false)
+	button(savebar, "重载副本", _reload, false)
+	autosave_status.text = "自动存档：新局、读档与回合开始（每局 5 槽）"
+	autosave_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	autosave_status.clip_text = true
+	savebar.add_child(autosave_status)
 	# 主体：地图 + 右栏一级页签（页签不滚动，各页内容独立纵向滚动）。
 	var body := HBoxContainer.new()
 	body.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -490,7 +504,7 @@ func _demo() -> void:
 	await execute("demo")
 
 func _load_path(path: String) -> void:
-	await execute("load", {"path": path})
+	await game_setup.request_switch("load", {"path": path})
 
 # Esc 优先级：关闭当前确认 → 取消当前预览 → 退出城市模式。
 # 文本输入与模态弹窗优先消费键盘事件；不绑定易误触的回合结束快捷键。
@@ -563,7 +577,7 @@ func _on_busy(is_busy: bool) -> void:
 		city_tabs.get_tab_bar().focus_mode = Control.FOCUS_NONE if is_busy else Control.FOCUS_ALL
 	for control in buttons:
 		if is_instance_valid(control):
-			control.disabled = is_busy or not control.get_meta("allowed", true)
+			control.disabled = is_busy or not control.get_meta("allowed", true) or (game_setup.uncertain and not control.get_meta("state_recovery", false))
 	attack_button.disabled = is_busy or combat_preview.is_empty() or not _unit_stamp_valid(combat_stamp)
 	for control in unit_actions.get_children():
 		if control is Button:
@@ -592,25 +606,27 @@ func _on_busy(is_busy: bool) -> void:
 			focus_option.disabled = true
 
 func execute(action: String, params: Dictionary = {}, committing = null) -> Dictionary:
-	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "victoryOptions", "assetDecisionOptions", "eventOptions", "combatPreview", "cityBombardPreview", "path", "snapshot", "hello"]
-	if _victory_pending() and not query and action not in ["load", "demo", "save", "diplomaticVoteAcknowledge", "victoryContinue"]:
+	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "victoryOptions", "assetDecisionOptions", "eventOptions", "combatPreview", "cityBombardPreview", "path", "snapshot", "hello", "newGameOptions", "listSaves"]
+	if game_setup.uncertain and not query:
+		return {"ok": false, "error": {"code": "STATE_UNCERTAIN", "message": "对局切换结果未确认，请先刷新，暂不可保存或再次切换。"}}
+	if _victory_pending() and not query and action not in ["load", "demo", "newGame", "resume", "save", "diplomaticVoteAcknowledge", "victoryContinue"]:
 		message.text = "请先查看胜负结算并选择是否继续游戏。"
 		return {"ok": false, "error": {"code": "PENDING_DECISION", "message": message.text}}
-	if unit_state_uncertain and not query and action not in ["load", "demo", "save"]:
+	if unit_state_uncertain and not query and action not in ["load", "demo", "newGame", "resume", "save"]:
 		return {"ok": false, "error": {"code": "STATE_UNCERTAIN", "message": "单位操作结果未确认，请先刷新或重载。"}}
 	# 已迁移面板的事务锁/确认框门禁；提交方自身豁免事务锁检查。
 	if not query:
 		for p in panels:
 			if p != committing and p.transaction:
 				return {"ok": false, "error": {"code": "BUSY", "message": p.busy_transaction_message()}}
-			if p.gates_on_confirmation_visible() and p.confirmation != null and p.confirmation.visible and action not in ["load", "demo"]:
+			if p.gates_on_confirmation_visible() and p.confirmation != null and p.confirmation.visible and action not in ["load", "demo", "newGame", "resume"]:
 				return {"ok": false, "error": {"code": "BUSY", "message": p.busy_confirmation_message()}}
 	_execute_depth += 1
 	if action == "snapshot":
 		_clear_combat()
 		for p in panels:
 			p.on_execute_snapshot()
-	if action in ["load", "demo"]:
+	if action in ["load", "demo", "newGame", "resume"]:
 		load_epoch += 1
 		_reset_selection()
 	var result: Dictionary = await client.command(action, params)
@@ -641,6 +657,11 @@ func execute(action: String, params: Dictionary = {}, committing = null) -> Dict
 			await _refresh_active_context()
 		message.text = str(failure.get("message", "请求失败"))
 	else:
+		# 首次开局请求可能根本未送达；内核明确返回空对局，也是一种有效的状态恢复。
+		if action == "snapshot" and result.has("snapshot") and result.snapshot == null:
+			game_setup.uncertain = false
+			unit_state_uncertain = false
+			_on_busy(client.busy)
 		message.text = "操作完成 · 状态版本 %s" % client.revision
 		if result.get("savedPath"):
 			last_saved_path = result.savedPath
@@ -649,6 +670,9 @@ func execute(action: String, params: Dictionary = {}, committing = null) -> Dict
 		# 只读查询（unitOptions／cityOptions／path 等）不返回快照，不触发重解析，避免递归。
 		if result.get("snapshot") is Dictionary:
 			await _refresh_active_context()
+		if result.get("autosavedPath"):
+			autosave_status.text = "已自动保存 · 第 %s 回合 · 每局保留 5 个回合槽" % _num(client.snapshot.turn, true)
+			autosave_status.tooltip_text = result.autosavedPath
 	_execute_depth -= 1
 	return result
 
@@ -665,10 +689,11 @@ func _apply_snapshot(data: Dictionary) -> void:
 	var changed: bool = current_game != data.gameId
 	if changed:
 		current_game = data.gameId
+		last_saved_path = ""
 		load_epoch += 1
 		_reset_selection()
 	map.set_snapshot(data, changed)
-	top_status.text = "%s  /  第 %s 回合  /  金币 %s  /  科研 %s" % [data.nation, _num(data.turn, true), _num(data.gold, true), data.get("research", "—")]
+	top_status.text = "%s  /  第 %s 回合  /  金币 %s  /  科研 %s" % [data.nation, _num(data.turn, true), _num(data.gold, true), data.research if data.get("research") != null else "—"]
 	_rebuild_pickers(data)
 	_rebuild_pending(data)
 	_on_busy(client.busy)
@@ -1447,4 +1472,4 @@ func _reload() -> void:
 	if last_saved_path.is_empty():
 		message.text = "请先保存一个副本。"
 		return
-	await execute("load", {"path": last_saved_path})
+	await game_setup.request_switch("load", {"path": last_saved_path})

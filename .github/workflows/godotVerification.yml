@@ -1,0 +1,81 @@
+name: Godot kernel and smoke
+
+on:
+  push:
+    paths:
+      - 'godot/**'
+      - 'core/**'
+      - 'android/**'
+      - 'extraImages/Screenshots/**'
+      - 'buildSrc/**'
+      - 'gradle/**'
+      - '*.gradle.kts'
+      - 'gradle.properties'
+      - 'gradlew*'
+      - '.github/workflows/godotVerification.yml'
+  pull_request:
+    paths:
+      - 'godot/**'
+      - 'core/**'
+      - 'android/**'
+      - 'extraImages/Screenshots/**'
+      - 'buildSrc/**'
+      - 'gradle/**'
+      - '*.gradle.kts'
+      - 'gradle.properties'
+      - 'gradlew*'
+      - '.github/workflows/godotVerification.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: godot-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-headless:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Install pinned Godot
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'godot.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'godot'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/godotengine/godot-builds/releases/download/4.6.2-stable/Godot_v4.6.2-stable_win64.exe.zip' -OutFile $zip
+          # 校验官方 SHA512-SUMS.txt 中的固定版本摘要。
+          $expected = '01c3bc0ede0f8771e810832fb92ce52a3a4352af7b7ac32a81a8edf05bb30760f56a6ab7e17cebc80b81c4f609a95c24c2fdbbe6929ac4e0285cb8f654b56d78'
+          if ((Get-FileHash $zip -Algorithm SHA512).Hash -ne $expected) { throw 'Godot checksum mismatch' }
+          Expand-Archive -Path $zip -DestinationPath $destination
+          "GODOT_BIN=$destination\Godot_v4.6.2-stable_win64.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build kernel and run headless smoke
+        run: |
+          # 本地与 CI 使用同一入口；不使用 SkipBuild，确保测试和场景产物属于当前源码。
+          & .\godot\run.ps1 -Smoke -Headless
+          exit $LASTEXITCODE
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-windows-headless-${{ github.sha }}
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            godot/kernel/build/reports/tests/test/
+            godot/kernel/build/test-results/test/*.xml
+            godot/.local/smoke-*.json
+            godot/.local/smoke-*.log
+            godot/.local/smoke-*.png

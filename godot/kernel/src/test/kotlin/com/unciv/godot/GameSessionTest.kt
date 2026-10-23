@@ -8,6 +8,8 @@ import com.unciv.logic.civilization.NotificationCategory
 import com.unciv.logic.civilization.NotificationIcon
 import com.unciv.logic.civilization.diplomacy.DiplomacyFlags
 import com.unciv.logic.files.UncivFiles
+import com.unciv.logic.files.FileConversions
+import com.unciv.json.json
 import com.unciv.logic.map.HexCoord
 import com.unciv.ui.screens.worldscreen.unit.actions.UnitActionsFromUniques
 import kotlinx.serialization.json.*
@@ -181,6 +183,73 @@ class GameSessionTest {
         assertNull(Gdx.gl)
         assertNull(Gdx.audio)
         println("原生／网关差分通过：移动、建城、生产队列、科研、决策、15 回合及独立保存重载")
+    }
+
+    @Test fun normalNewGameMatchesNativeForFiftyTurnsWithAutosaveResume() {
+        val directory = File(root, "godot/.local/tests/normal-fifty-${UUID.randomUUID()}")
+        var session = GameSession(root, directory)
+        val started = run(session, "newGame", "setup" to dto("nation" to "Rome", "mapSize" to "Small",
+            "aiPlayers" to 2, "cityStates" to 2, "seed" to "4602", "barbarians" to false))
+        // 原生 BarbarianManager 的随机种子含 encampments.hashCode（营地对象身份），跨实例并非确定性。
+        // 完整差分明确关闭野蛮人；启用野蛮人的长局／重载由下一个测试独立覆盖。
+        // 原版开局除地形外包含基于随机 gameId 的布置；以同一初始原格式存档建立独立对照端。
+        val native = Native(UncivFiles.gameInfoFromString(File(started.text("autosavedPath")).readText()))
+        // 原版首次相遇通知的位置取决于 HashSet<Tile> 的遍历顺序。差分夹具两端显式预先相遇，
+        // 不删除或归一化通知坐标；未预先相遇的正常开局仍由下一个连续回合测试覆盖。
+        for (game in listOf(session.game!!, native.game)) withNativeGame(game) {
+            for (civ in game.civilizations.filter { !it.isBarbarian })
+                for (other in game.civilizations.filter { !it.isBarbarian && it != civ })
+                    if (!civ.knows(other)) civ.diplomacyFunctions.makeCivilizationsMeet(other)
+        }
+        assertGameplayEquals("正常新局差分夹具：双方显式预先相遇", native.game, session.game!!)
+        val settler = native.game.currentPlayerCiv.units.getCivUnits().first { it.name == "Settler" }
+        pairedCommand(session, native, "foundCity", "unitId" to settler.id)
+        for (turn in 1..50) {
+            resolveSupportedDecisions(session, native)
+            pairedCommand(session, native, "nextTurn")
+            assertEquals(turn, session.game!!.turns)
+            if (turn % 5 == 0) {
+                val listing = run(session, "listSaves")["data"]!!.jsonObject
+                assertEquals(5, listing["saves"]!!.jsonArray.size)
+                native.game = UncivFiles.gameInfoFromString(UncivFiles.gameInfoToString(native.game, true))
+                // 新建网关会话，没有手工 save 调用，真正依赖回合自动存档继续。
+                session = GameSession(root, directory)
+                run(session, "resume", "path" to listing.text("latestPath"))
+                assertGameplayEquals("正常新局第 $turn 回合跨会话自动存档续局", native.game, session.game!!)
+            }
+        }
+        assertTrue(session.game!!.civilizations.any { it.isAI() && it.cities.isNotEmpty() })
+        assertTrue(session.game!!.gameParameters.victoryTypes.isNotEmpty())
+        assertTrue(session.game!!.gameParameters.noBarbarians)
+        println("正常开局衍生夹具 50 回合差分通过：城邦、胜利条件，关闭野蛮人并预先相遇，每 5 回合从自动存档跨会话继续")
+    }
+
+    @Test fun normalNewGameWithBarbariansSurvivesFiftyTurnsAndResume() {
+        val directory = File(root, "godot/.local/tests/barbarian-fifty-${UUID.randomUUID()}")
+        var session = GameSession(root, directory)
+        run(session, "newGame", "setup" to dto("nation" to "Rome", "mapSize" to "Small",
+            "aiPlayers" to 2, "cityStates" to 2, "seed" to "4602"))
+        val settler = session.game!!.currentPlayerCiv.units.getCivUnits().first { it.name == "Settler" }
+        run(session, "foundCity", "unitId" to settler.id)
+        for (turn in 1..50) {
+            resolveSupportedDecisions(session)
+            val response = run(session, "nextTurn")
+            assertEquals(turn, session.game!!.turns)
+            val saved = File(response.text("autosavedPath"))
+            // 先比较原始持久数据；原版 setTransients 会重新计算封锁地块并标记人口重分配。
+            val persisted = json().fromJson(GameInfo::class.java, FileConversions.unzip(saved.readText()))
+            assertGameplayEquals("启用野蛮人第 $turn 回合自动存档", session.game!!, persisted)
+            if (turn % 5 == 0) {
+                // 对照端独立序列化并按原版初始化，验证续局语义而非假定加载没有原生副作用。
+                val expected = UncivFiles.gameInfoFromString(UncivFiles.gameInfoToString(session.game!!, true))
+                session = GameSession(root, directory)
+                run(session, "resume", "path" to saved.absolutePath)
+                assertGameplayEquals("启用野蛮人第 $turn 回合跨会话继续", expected, session.game!!)
+            }
+        }
+        assertFalse(session.game!!.gameParameters.noBarbarians)
+        assertTrue("原生实际生成野蛮人营地", session.game!!.barbarians.encampments.isNotEmpty())
+        println("启用野蛮人连续 50 回合通过：逐回合自动存档完整差分，每 5 回合跨会话恢复；不声称跨实例回合随机结果一致")
     }
 
     @Test fun fiftyMixedTurnsWithNewEventsAndIndependentReloads() {

@@ -61,6 +61,7 @@ var naval_evidence: Array[Dictionary] = []
 var unitcity_steps := 0
 var unitcity_expected: Dictionary = {}
 var unitcity_evidence: Array[Dictionary] = []
+var lifecycle_evidence: Array[Dictionary] = []
 
 # 真实 HTTP 后丢弃响应／延迟只读响应，属于客户端边界故障注入。
 class NavalFaultClient extends "res://scripts/kernel_client.gd":
@@ -193,7 +194,9 @@ func run(frontend) -> void:
 		# 显式设定根视口，使命中测试与布局和图形模式一致。
 		get_viewport().size = Vector2i(1280, 800)
 		await get_tree().process_frame
-	run_id = "smoke-%d" % int(Time.get_unix_time_from_system() * 1000.0)
+	run_id = OS.get_environment("UNCIV_SMOKE_RUN_ID")
+	if run_id.is_empty():
+		run_id = "smoke-%d" % int(Time.get_unix_time_from_system() * 1000.0)
 	started_at = Time.get_datetime_string_from_system(true)
 	get_tree().create_timer(900.0).timeout.connect(func(): _fail("端到端验证超时"))
 	for x in range(-12, 13):
@@ -201,6 +204,12 @@ func run(frontend) -> void:
 			var coordinate := Vector2i(x, y)
 			if not check(app.MapScript.pixel_to_hex(app.MapScript.hex_to_pixel(coordinate)) == coordinate, "六边形坐标往返"):
 				return
+	print("Smoke 开始：game-lifecycle")
+	var lifecycle = load("res://tests/game_lifecycle_smoke.gd").new()
+	lifecycle_evidence = lifecycle.evidence
+	if not await lifecycle.run(self):
+		return
+	print("Smoke 完成：game-lifecycle")
 	if not await perform("demo"):
 		return
 	await get_tree().process_frame
@@ -269,38 +278,29 @@ func run(frontend) -> void:
 		if not check(before[key] == after[key], "重载一致性：" + key):
 			return
 	steps.append("原格式保存与重载，关键状态一致")
-	if not await verify_promise_dialog():
-		return
-	if not await verify_combat_flow():
-		return
-	if not await verify_naval_flow():
-		return
-	if not await verify_development_flow():
-		return
-	if not await verify_ui_display_flow():
-		return
-	if not await verify_economy_flow():
-		return
-	if not await verify_window_sizes():
-		return
-	if not await verify_diplomacy_flow():
-		return
-	if not await verify_religion_flow():
-		return
-	if not await verify_great_person_flow():
-		return
-	if not await verify_vote_flow():
-		return
-	if not await verify_victory_flow():
-		return
-	if not await verify_asset_flow():
-		return
-	if not await verify_city_state_flow():
-		return
-	if not await verify_event_flow():
-		return
-	if not await verify_unitcity_flow():
-		return
+	# 保持原验证次序，逐场景输出进度，使超时或异常退出也能定位最后执行的领域。
+	for scenario in [
+		["settlement-promise", verify_promise_dialog],
+		["combat", verify_combat_flow],
+		["naval", verify_naval_flow],
+		["development", verify_development_flow],
+		["ui-display", verify_ui_display_flow],
+		["city-economy", verify_economy_flow],
+		["window-sizes", verify_window_sizes],
+		["diplomacy", verify_diplomacy_flow],
+		["religion", verify_religion_flow],
+		["great-person", verify_great_person_flow],
+		["diplomatic-vote", verify_vote_flow],
+		["victory", verify_victory_flow],
+		["asset-decisions", verify_asset_flow],
+		["city-state", verify_city_state_flow],
+		["event", verify_event_flow],
+		["unit-city-actions", verify_unitcity_flow]
+	]:
+		print("Smoke 开始：", scenario[0])
+		if not await scenario[1].call():
+			return
+		print("Smoke 完成：", scenario[0])
 	await get_tree().process_frame
 	await get_tree().process_frame
 	var directory := ProjectSettings.globalize_path("res://.local")
@@ -311,10 +311,10 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat"],
+		"scenarios": ["new-game", "save-browser", "autosave-resume", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat"],
 		"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence,
+		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence,
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -3891,7 +3891,7 @@ func _fail(message: String) -> void:
 			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
 			"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence,
+			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
@@ -4664,9 +4664,12 @@ func advance_turn() -> bool:
 #  chained 命令（execute + 重新查询面板）之间可能只有一帧空闲；等待连续多帧空闲确保落定。
 func settle() -> void:
 	var idle := 0
-	var guard := 0
-	while idle < 3 and guard < 900:
-		guard += 1
+	# 空白界面的图形帧率可能极高；用真实时间限额，不能在开局生成尚未完成时耗尽帧数并继续断言。
+	var deadline := Time.get_ticks_msec() + 120000
+	while idle < 3:
+		if Time.get_ticks_msec() >= deadline:
+			_fail("等待内核与界面事务落定超时")
+			return
 		if app.client.busy or app._execute_depth > 0 or app.victory_panel_inst.guide_active or app.panels.any(func(p): return p.transaction):
 			idle = 0
 		else:

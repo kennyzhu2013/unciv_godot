@@ -27,6 +27,7 @@ tasks.named<JavaExec>("run") {
 tasks.test {
     workingDir = rootProject.file("android/assets")
     systemProperty("unciv.root", rootProject.projectDir.absolutePath)
+    systemProperty("unciv.saveDirectory", rootProject.file("godot/.local/tests/saves").absolutePath)
     // Godot 闭环会读取这些原格式场景；缺失时应重新执行测试以生成存档。
     outputs.files(rootProject.file("godot/.local/tests/start.json"),
         rootProject.file("godot/.local/tests/settlement-promise.json"),

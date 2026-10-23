@@ -19,7 +19,13 @@ fun main(args: Array<String>) {
     val token = System.getenv("UNCIV_GATEWAY_TOKEN") ?: error("请通过 godot/run.ps1 启动：缺少本机会话令牌")
     require(token.length >= 32) { "本机会话令牌长度不足" }
     KernelRuntime.initialize(root)
-    val server = startGateway(port, token, GameSession(root))
+    // 冒烟的继续游戏和自动存档不进入真实玩家目录，每轮独立保留证据。
+    val session = if (System.getenv("UNCIV_SMOKE") == "1") {
+        val runId = System.getenv("UNCIV_SMOKE_RUN_ID") ?: "standalone"
+        require(runId.matches(Regex("[A-Za-z0-9_-]{1,100}")))
+        GameSession(root, File(root, "godot/.local/smoke-saves/$runId"))
+    } else GameSession(root)
+    val server = startGateway(port, token, session)
     Runtime.getRuntime().addShutdownHook(Thread { stopGateway(server) })
     println("Godot 内核已就绪：127.0.0.1:${server.address.port}（单会话、无图形上下文）")
 }

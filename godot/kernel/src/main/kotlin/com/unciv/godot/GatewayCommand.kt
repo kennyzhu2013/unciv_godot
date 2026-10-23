@@ -18,6 +18,7 @@ internal class CommandContext(
     lateinit var candidate: GameInfo
     lateinit var snapshot: PlayerSnapshot
     var savedPath: String? = null
+    var autoSave = false
     var battleResult: JsonObject? = null
     var greatPersonResult: JsonObject? = null
 }

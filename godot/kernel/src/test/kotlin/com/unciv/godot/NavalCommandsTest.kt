@@ -11,7 +11,7 @@ import com.unciv.logic.battle.Battle
 import com.unciv.logic.battle.BattleDamage
 import com.unciv.logic.battle.MapUnitCombatant
 import com.unciv.logic.battle.TargetHelper
-import com.unciv.logic.files.UncivFiles
+import com.unciv.json.json
 import com.unciv.logic.map.HexCoord
 import com.unciv.models.metadata.BaseRuleset
 import com.unciv.models.UnitActionType
@@ -22,7 +22,20 @@ import org.junit.Test
 
 class NavalCommandsTest {
     private fun load(game: GameInfo) = BattleFixtures.load(NavalFixtures.export(game, "test"))
-    private fun state(game: GameInfo) = UncivFiles.gameInfoToString(game, false)
+    // 只读前后比较保留全部持久字段。GDX 原型默认值含当前时间，会偶发省略 currentTurnStartTime。
+    private fun state(game: GameInfo) = json().apply { setUsePrototypes(false) }.toJson(game)
+
+    @Test fun readOnlyStateRetainsDefaultsAndDetectsClockChanges() {
+        val game = GameInfo().apply { currentTurnStartTime = 0L }
+        val before = state(game)
+        val fields = Json.parseToJsonElement(before).jsonObject
+        assertEquals("默认值也必须进入只读快照", JsonPrimitive(0), fields["turns"])
+        assertEquals(JsonPrimitive(0L), fields["currentTurnStartTime"])
+        assertEquals("重复序列化不得因默认值变化而不同", before, state(game))
+        game.currentTurnStartTime = 1L
+        assertNotEquals("时间戳真实变化仍必须被检测", before, state(game))
+    }
+
     private fun reject(session: GameSession, command: JsonObject, code: String) {
         val game = session.game!!
         val before = state(game)
@@ -70,9 +83,9 @@ class NavalCommandsTest {
         assertEquals(result, session.handle(command))
         assertEquals(revision + 1, session.revision)
         reject(session, JsonObject(command + ("x" to JsonPrimitive(x + 1))), "REQUEST_REUSED")
-        run(session, "save", "name" to "naval-battle-roundtrip")
+        val savedResponse = run(session, "save", "name" to "naval-battle-roundtrip")
         val saved = state(session.game!!)
-        run(session, "load", "path" to "${NavalFixtures.root}/godot/.local/saves/naval-battle-roundtrip.json")
+        run(session, "load", "path" to savedResponse.text("savedPath"))
         assertGameplayEquals("海战重载", NavalFixtures.copy(expected), session.game!!)
         assertTrue(saved.isNotEmpty())
         return session to preview

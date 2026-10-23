@@ -30,13 +30,13 @@ class CommandRegistryTest {
         val queries = catalog.filterValues { it is QueryCommand }.keys
         assertEquals(setOf(
             "victoryOptions", "eventOptions", "greatPersonOptions", "assetDecisionOptions", "diplomaticVoteOptions",
-            "religionOptions", "combatPreview", "diplomacyOptions", "unitOptions", "cityOptions", "cityBombardPreview", "path"),
+            "religionOptions", "combatPreview", "diplomacyOptions", "unitOptions", "cityOptions", "cityBombardPreview", "path", "newGameOptions", "listSaves"),
             queries)
 
         fun effect(name: String) = catalog[name] as EffectCommand
-        assertEquals(setOf("load", "demo"), catalog.filterValues { it is EffectCommand && it.source == CandidateSource.LOADED }.keys)
+        assertEquals(setOf("load", "demo", "newGame", "resume"), catalog.filterValues { it is EffectCommand && it.source == CandidateSource.LOADED }.keys)
         assertEquals(setOf("nextTurn"), catalog.filterValues { it is EffectCommand && it.source == CandidateSource.CLONE_TURN }.keys)
-        assertEquals(setOf("load", "demo", "save", "nextTurn"), catalog.filterValues { it is EffectCommand && !it.inPlace }.keys)
+        assertEquals(setOf("load", "demo", "newGame", "resume", "save", "nextTurn"), catalog.filterValues { it is EffectCommand && !it.inPlace }.keys)
         assertEquals(CandidateSource.CURRENT, effect("save").source)
         assertEquals(CandidateSource.CURRENT, effect("acknowledge").source)
         assertTrue(effect("acknowledge").inPlace)
@@ -57,7 +57,7 @@ class CommandRegistryTest {
             assertTrue(effect(name).checksVictory)
             assertFalse(effect(name).allowedDuringVictory)
         }
-        assertEquals(setOf("load", "demo", "save", "diplomaticVoteAcknowledge", "victoryContinue"),
+        assertEquals(setOf("load", "demo", "newGame", "resume", "save", "diplomaticVoteAcknowledge", "victoryContinue"),
             catalog.filterValues { it is EffectCommand && it.allowedDuringVictory }.keys)
         assertEquals(setOf("save"), catalog.filterValues { it is EffectCommand && !it.checksVictory }.keys)
 

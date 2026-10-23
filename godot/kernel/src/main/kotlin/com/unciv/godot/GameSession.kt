@@ -2,10 +2,10 @@ package com.unciv.godot
 
 import com.unciv.UncivGame
 import com.unciv.logic.GameInfo
+import com.unciv.logic.GameStarter
 import com.unciv.logic.civilization.AlertType
 import com.unciv.logic.civilization.NotificationCategory
 import com.unciv.logic.civilization.NotificationIcon
-import com.unciv.logic.files.UncivFiles
 import com.unciv.logic.map.HexCoord
 import com.unciv.models.ruleset.Building
 import com.unciv.ui.screens.worldscreen.unit.actions.UnitActionsFromUniques
@@ -13,21 +13,20 @@ import com.unciv.view.CityView
 import com.unciv.view.MapUnitView
 import kotlinx.serialization.json.*
 import java.io.File
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.util.UUID
 
 internal class GatewayError(val code: String, override val message: String) : RuntimeException(message)
 
 /** 所有入口（包括查询）串行化；失败的动作丢弃回合副本或换回命令前备份，不暴露半完成的状态。 */
-internal class GameSession(private val root: File) {
+internal class GameSession(root: File, private val saveDirectory: File =
+    File(System.getProperty("unciv.saveDirectory") ?: File(root, "godot/.local/saves").absolutePath)) {
     val sessionId: String = UUID.randomUUID().toString()
     var revision = 0
         private set
     var game: GameInfo? = null
         private set
     private val responses = LinkedHashMap<String, Pair<JsonObject, JsonObject>>()
-    private val saveDirectory = File(root, "godot/.local/saves").apply { mkdirs() }
+    private val saves = GameSaves(saveDirectory)
     /** 仅冒烟运行时（run.ps1 -Smoke 设置 UNCIV_SMOKE=1）开启：允许 debugInjectEvent 向实时会话注入合成事件；真实游玩不设该变量即完全不存在此命令。 */
     internal val smokeEnabled: Boolean = System.getenv("UNCIV_SMOKE") == "1"
 
@@ -86,15 +85,15 @@ internal class GameSession(private val root: File) {
             // 玩家命令直接作用于当前局。setTransients 会探索地块、结识文明、发现自然奇观，若每条命令都触发，
             // 这些事件会比原客户端提前发生。玩家命令失败时用只复制数据的备份回滚，备份仅在回滚时才 setTransients。
             val backup = if (effect.inPlace) requireGame().clone() else null
-            // LOADED 命令在自己的登记项里打开候选对局；其余按 source 取当前局或回合副本。
-            val candidate = effect.openCandidate(ctx) ?: when (effect.source) {
-                CandidateSource.LOADED -> throw IllegalStateException("LOADED 命令未提供候选对局：$action")
-                CandidateSource.CLONE_TURN -> requireGame().clone().also { it.setTransients() }
-                CandidateSource.CURRENT -> requireGame()
-            }
-            UncivGame.Current.gameInfo = candidate
             val result: JsonObject
             try {
+                // 生成或反序列化候选失败也必须恢复全局引用，不能遗留半成品对局。
+                val candidate = effect.openCandidate(ctx) ?: when (effect.source) {
+                    CandidateSource.LOADED -> throw IllegalStateException("LOADED 命令未提供候选对局：$action")
+                    CandidateSource.CLONE_TURN -> requireGame().clone().also { it.setTransients() }
+                    CandidateSource.CURRENT -> requireGame()
+                }
+                UncivGame.Current.gameInfo = candidate
                 validateGame(candidate)
                 ctx.candidate = candidate
                 ctx.snapshot = PlayerSnapshot(candidate)
@@ -102,10 +101,12 @@ internal class GameSession(private val root: File) {
                 if (effect.checksVictory) VictoryCommands.updateAfterAction(candidate)
                 // 先验证快照可构造，再写盘和提交状态；不会破坏用户导入的原始存档。
                 val playerSnapshot = PlayerSnapshot(candidate).build()
-                if (ctx.savedPath != null) atomicSave(candidate, File(ctx.savedPath!!))
+                if (ctx.savedPath != null) saves.save(candidate, File(ctx.savedPath!!))
+                val autosavedPath = if (ctx.autoSave) saves.autosave(candidate) else null
                 game = candidate
                 revision++
-                val response = reply("snapshot" to playerSnapshot, "savedPath" to ctx.savedPath, "battleResult" to ctx.battleResult)
+                val response = reply("snapshot" to playerSnapshot, "savedPath" to ctx.savedPath,
+                    "autosavedPath" to autosavedPath, "battleResult" to ctx.battleResult)
                 result = if (ctx.greatPersonResult == null) response else JsonObject(response + ("greatPersonResult" to ctx.greatPersonResult!!))
             } catch (error: Exception) {
                 if (backup != null) {
@@ -129,10 +130,6 @@ internal class GameSession(private val root: File) {
 
     internal fun requireGame(): GameInfo = game ?: throw GatewayError("NO_GAME", "请先读取存档")
     internal fun catalog(): Map<String, GatewayCommand> = commands
-    private fun load(file: File): GameInfo {
-        ensure(file.isFile && file.length() in 1..32L * 1024 * 1024, "SAVE_FILE", "存档不存在、为空或超过 32 MiB")
-        return UncivFiles.gameInfoFromString(file.readText(Charsets.UTF_8))
-    }
     private fun unit(snapshot: PlayerSnapshot, id: Int): MapUnitView = snapshot.view.civView.getUnits().firstOrNull { it.id == id }
         ?: throw GatewayError("NOT_OWNED", "找不到己方单位")
     private fun city(snapshot: PlayerSnapshot, id: String): CityView {
@@ -149,15 +146,6 @@ internal class GameSession(private val root: File) {
         ensure(unit.hasMovement() && !unit.cannotMove() && unit.canMoveTo(target)
             && unit.getReachableTilesInCurrentTurn().any { it.position() == target.position() },
             "CANNOT_MOVE", "当前回合不能移动到该地块")
-    }
-    private fun atomicSave(game: GameInfo, target: File) {
-        val temporary = Files.createTempFile(saveDirectory.toPath(), "save-", ".tmp")
-        try {
-            Files.writeString(temporary, UncivFiles.gameInfoToString(game, true))
-            Files.move(temporary, target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-        } finally {
-            Files.deleteIfExists(temporary)
-        }
     }
     private fun reply(vararg fields: Pair<String, Any?>) = dto("ok" to true, "protocol" to 1, "session" to sessionId, "revision" to revision, *fields)
     private fun error(code: String, message: String) = dto("ok" to false, "protocol" to 1, "session" to sessionId,
@@ -259,13 +247,25 @@ internal class GameSession(private val root: File) {
             requestingCiv.addNotification("[${civ.civName}] has denied your trade request",
                 NotificationCategory.Trade, civ.civName, NotificationIcon.Trade)
         })
-        registry.effect("load", source = CandidateSource.LOADED, inPlace = false, allowedDuringVictory = true, openCandidate = { ctx ->
-            load(File(ctx.request.text("path")))
-        })
+        registry.query("newGameOptions") { NewGameSetup.options() }
+        registry.query("listSaves") { saves.list() }
+        registry.effect("newGame", source = CandidateSource.LOADED, inPlace = false, allowedDuringVictory = true,
+            openCandidate = { ctx -> GameStarter.startNewGame(NewGameSetup.parse(ctx.request)) },
+            executeFn = { ctx, _ -> ctx.autoSave = true })
+        registry.effect("resume", source = CandidateSource.LOADED, inPlace = false, allowedDuringVictory = true,
+            openCandidate = { ctx ->
+                val latest = saves.latest()
+                // 继续按钮确认时绑定已展示的文件，不能静默切换为外部新增的另一份存档。
+                ensure(ctx.request.text("path") == latest.absolutePath, "SAVE_CHANGED", "最新存档已变化，请重新打开存档列表")
+                saves.load(latest)
+            }, executeFn = { ctx, _ -> ctx.autoSave = true })
+        registry.effect("load", source = CandidateSource.LOADED, inPlace = false, allowedDuringVictory = true,
+            openCandidate = { ctx -> saves.load(File(ctx.request.text("path"))) },
+            executeFn = { ctx, _ -> ctx.autoSave = true })
         registry.effect("demo", source = CandidateSource.LOADED, inPlace = false, allowedDuringVictory = true, openCandidate = {
             val demo = File(saveDirectory, "demo.json")
-            if (!demo.exists()) atomicSave(KernelRuntime.createDemo(), demo)
-            load(demo)
+            if (!demo.exists()) saves.save(KernelRuntime.createDemo(), demo)
+            saves.load(demo)
         })
         registry.effect("save", source = CandidateSource.CURRENT, inPlace = false, checksVictory = false, allowedDuringVictory = true, executeFn = { ctx, _ ->
             val name = ctx.request.text("name")
@@ -285,6 +285,7 @@ internal class GameSession(private val root: File) {
                 ctx.candidate.nextTurn()
                 // 复刻 AlertPopup：无效事件（shouldOpen==false）在原生 update 中被直接移除，这里在回合推进后清理队首无效事件。
                 EventCommands(ctx.candidate).drainInvalidEventAlerts()
+                ctx.autoSave = true
             })
         registry.effect("acknowledge",
             prepareFn = { _ ->
