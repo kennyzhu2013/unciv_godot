@@ -137,11 +137,13 @@ internal class GameSession(private val root: File) {
         return snapshot.view.civView.cities().firstOrNull { it.id == id }
             ?: throw GatewayError("NOT_OWNED", "找不到己方城市")
     }
-    private fun destination(snapshot: PlayerSnapshot, request: JsonObject) =
-        snapshot.view.tileMapView.getTile(HexCoord(request.integer("x"), request.integer("y")))
+    private fun destination(snapshot: PlayerSnapshot, request: JsonObject): com.unciv.view.TileView {
+        val tile = requireGame().tileMap.getOrNull(request.integer("x"), request.integer("y"))
             ?: throw GatewayError("TARGET", "目标不在地图中")
+        return snapshot.view.getTile(tile)
+    }
     private fun validateMove(unit: MapUnitView, target: com.unciv.view.TileView) {
-        ensure(!unit.isAirUnit() && !unit.isPreparingParadrop(), "UNSUPPORTED", "空军和空降移动尚未接入")
+        ensure(!unit.isAirUnit() && !unit.isNuclearWeapon() && !unit.isPreparingParadrop(), "UNSUPPORTED", "空军、空降和核武器移动尚未接入")
         ensure(unit.hasMovement() && !unit.cannotMove() && unit.canMoveTo(target)
             && unit.getReachableTilesInCurrentTurn().any { it.position() == target.position() },
             "CANNOT_MOVE", "当前回合不能移动到该地块")
@@ -185,10 +187,11 @@ internal class GameSession(private val root: File) {
         }
         registry.effect("move") { ctx ->
             CombatCommands(requireGame()).ensureNoBlockingBattleDecision()
+            val snapshot = PlayerSnapshot(requireGame())
+            val unit = unit(snapshot, ctx.request.integer("unitId"))
+            val tile = destination(snapshot, ctx.request)
+            validateMove(unit, tile)
             val thunk: () -> Unit = {
-                val unit = unit(ctx.snapshot, ctx.request.integer("unitId"))
-                val tile = destination(ctx.snapshot, ctx.request)
-                validateMove(unit, tile)
                 unit.tryResetAction()
                 ensure(unit.tryMoveToTile(tile), "MOVE_FAILED", "移动没有完成")
             }

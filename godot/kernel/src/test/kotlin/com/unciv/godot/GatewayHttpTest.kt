@@ -69,6 +69,33 @@ class GatewayHttpTest {
         assertEquals("no-store", response.headers().firstValue("Cache-Control").get())
     }
 
+    @Test fun navalCommandsUseExistingHttpProtocolAndDeduplication() {
+        val initial = NavalFixtures.duel(health = 1)
+        var expected = NavalFixtures.copy(initial)
+        fun call(action: String, vararg params: Pair<String, Any?>): JsonObject {
+            val response = send(BattleFixtures.request(session, action, *params).toString())
+            assertEquals(200, response.statusCode())
+            return Json.parseToJsonElement(response.body()).jsonObject.also { assertTrue(it.toString(), it.boolean("ok")) }
+        }
+        call("load", "path" to NavalFixtures.export(initial, "http").absolutePath)
+        val id = initial.currentPlayerCiv.units.getCivUnits().first().id
+        call("unitOptions", "unitId" to id)
+        call("path", "unitId" to id, "x" to -1, "y" to -1)
+        call("move", "unitId" to id, "x" to -1, "y" to -1)
+        expected = NavalFixtures.apply(expected, "move", dto("unitId" to id, "x" to -1, "y" to -1))
+        GameplayAssertions.assertGameplayEquals("HTTP 舰船移动", expected, session.game!!)
+        call("combatPreview", "unitId" to id, "x" to 1, "y" to -1)
+        val command = BattleFixtures.request(session, "attack", "unitId" to id, "x" to 1, "y" to -1).toString()
+        val first = send(command)
+        assertTrue(Json.parseToJsonElement(first.body()).jsonObject.boolean("ok"))
+        assertEquals(first.body(), send(command).body())
+        expected = NavalFixtures.apply(expected, "attack", dto("unitId" to id, "x" to 1, "y" to -1))
+        GameplayAssertions.assertGameplayEquals("HTTP 海战只执行一次", expected, session.game!!)
+        val saved = call("save", "name" to "naval-http").text("savedPath")
+        call("load", "path" to saved)
+        GameplayAssertions.assertGameplayEquals("HTTP 海战重载", NavalFixtures.copy(expected), session.game!!)
+    }
+
     @Test fun validHelloIsAccepted() {
         val response = send()
         assertEquals(response.body(), 200, response.statusCode())

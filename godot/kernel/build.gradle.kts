@@ -54,5 +54,8 @@ tasks.test {
         .map { rootProject.file("godot/.local/tests/asset-$it.json") })
     outputs.files(listOf("expected", "progress", "won", "lost", "defeated", "conquest")
         .map { rootProject.file("godot/.local/tests/victory-$it.json") })
+    outputs.dir(rootProject.file("godot/.local/tests/naval-native"))
+    outputs.files(listOf("expected", "battle", "conquest", "embarkation")
+        .map { rootProject.file("godot/.local/tests/naval-$it.json") })
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = true }
 }

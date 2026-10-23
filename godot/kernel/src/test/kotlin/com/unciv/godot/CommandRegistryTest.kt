@@ -43,6 +43,13 @@ class CommandRegistryTest {
         assertTrue(effect("debugInjectEvent").inPlace)
         assertTrue(effect("move").inPlace)
         assertTrue(effect("attack").inPlace)
+        // 海军复用原命令和同一胜利事务门禁，不引入平行协议。
+        for (name in listOf("move", "attack", "unitAction", "cityDecision")) {
+            assertEquals(CandidateSource.CURRENT, effect(name).source)
+            assertTrue(effect(name).checksVictory)
+            assertFalse(effect(name).allowedDuringVictory)
+        }
+        assertFalse(catalog.keys.any { it.startsWith("naval") || it.startsWith("embark") })
         assertEquals(setOf("load", "demo", "save", "diplomaticVoteAcknowledge", "victoryContinue"),
             catalog.filterValues { it is EffectCommand && it.allowedDuringVictory }.keys)
         assertEquals(setOf("save"), catalog.filterValues { it is EffectCommand && !it.checksVictory }.keys)

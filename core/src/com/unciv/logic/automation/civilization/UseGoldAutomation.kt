@@ -127,7 +127,9 @@ object UseGoldAutomation {
                 .thenByDescending { it?.tileResource?.resourceType == ResourceType.Strategic }
                 // This is necessary, so that the map keeps Tiles with the same resource as two
                 // separate entries.
-                .thenBy { it.hashCode() }
+                // 坐标在重载和回合副本中保持一致，避免对象 hashCode 改变同优先级地块的购入顺序。
+                .thenBy { it?.position?.x }
+                .thenBy { it?.position?.y }
         )
 
         for (city in civInfo.cities.filter { !it.isPuppet && !it.isBeingRazed }) {

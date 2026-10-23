@@ -356,12 +356,22 @@ func _update_units() -> void:
 	for unit in snapshot.get("units", []):
 		var id := int(unit.id)
 		active[id] = true
+		var appearance := [unit.name, unit.get("embarked", false), unit.civilian, unit.nation, unit.innerColor, unit.outerColor]
+		if unit_nodes.has(id) and unit_nodes[id].get_meta("appearance", []) != appearance:
+			remove_child(unit_nodes[id])
+			unit_nodes[id].queue_free()
+			unit_nodes.erase(id)
 		if not unit_nodes.has(id):
 			var node := Node2D.new()
 			node.z_index = 3
-			var base := "Images.AbsoluteUnits/TileSets/AbsoluteUnits/Units/" + str(unit.name)
+			node.set_meta("appearance", appearance)
+			var art_name := str(unit.name)
+			if unit.get("embarked", false):
+				art_name = "EmbarkedUnit-Civilian" if unit.civilian else "EmbarkedUnit-Military"
+			var base := "Images.AbsoluteUnits/TileSets/AbsoluteUnits/Units/" + art_name
 			if texture(base + "-" + str(unit.nation)):
 				base += "-" + str(unit.nation)
+			node.set_meta("art", base)
 			for layer in range(3):
 				var path := base if layer == 0 else base + "-" + str(layer)
 				var art := texture(path)

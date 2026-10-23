@@ -43,6 +43,11 @@ var combat_details := Label.new()
 var attack_button: Button
 var combat_preview: Dictionary = {}
 var preview_revision := -1
+var move_stamp: Dictionary = {}
+var combat_stamp: Dictionary = {}
+var unit_read_generation := 0
+var unit_transaction := false
+var unit_state_uncertain := false
 var capture_panel := VBoxContainer.new()
 var capture_id := ""
 var raze_confirmation := ConfirmationDialog.new()
@@ -480,7 +485,7 @@ func _unhandled_key_input(event: InputEvent) -> void:
 		return
 	if _input_locked():
 		return
-	if not combat_preview.is_empty():
+	if not combat_preview.is_empty() or not target.is_empty():
 		_cancel_attack()
 		get_viewport().set_input_as_handled()
 	elif buy_tile_mode:
@@ -511,6 +516,7 @@ func label(parent: Node, text: String) -> void:
 	parent.add_child(result)
 
 func _on_busy(is_busy: bool) -> void:
+	is_busy = is_busy or unit_transaction
 	for p in panels:
 		is_busy = is_busy or p.busy_active()
 	for p in panels:
@@ -524,7 +530,7 @@ func _on_busy(is_busy: bool) -> void:
 	for control in buttons:
 		if is_instance_valid(control):
 			control.disabled = is_busy or not control.get_meta("allowed", true)
-	attack_button.disabled = is_busy or combat_preview.is_empty() or preview_revision != client.revision
+	attack_button.disabled = is_busy or combat_preview.is_empty() or not _unit_stamp_valid(combat_stamp)
 	for control in unit_actions.get_children():
 		if control is Button:
 			control.disabled = control.disabled or not capture_id.is_empty()
@@ -537,14 +543,14 @@ func _on_busy(is_busy: bool) -> void:
 		focus_option.disabled = is_busy or focus_option.item_count == 0 or not city_data.get("editable", false)
 	production_filter.editable = not is_busy
 	if not is_busy:
-		move_button.disabled = target.is_empty() or unit_id < 0 or not capture_id.is_empty()
+		move_button.disabled = target.is_empty() or not _unit_stamp_valid(move_stamp) or not capture_id.is_empty()
 		founding_button.disabled = unit_id < 0 or not capture_id.is_empty() or not founding_button.has_meta("allowed") or not founding_button.get_meta("allowed")
 		production_button.disabled = city_id.is_empty() or _production_selected_name().is_empty() or _production_selected_type() == "perpetual"
 		turn_button.disabled = client.snapshot.is_empty() or not client.snapshot.get("pending", []).is_empty()
 	else:
 		message.text = "内核处理中……界面仍可拖动和缩放"
 	# 结束状态门禁必须在特殊按钮的最终 busy 赋值之后应用。
-	if _victory_pending():
+	if _victory_pending() or unit_state_uncertain:
 		for control in buttons:
 			if is_instance_valid(control) and control.get_meta("gameplay", true):
 				control.disabled = true
@@ -556,6 +562,8 @@ func execute(action: String, params: Dictionary = {}, committing = null) -> Dict
 	if _victory_pending() and not query and action not in ["load", "demo", "save", "diplomaticVoteAcknowledge", "victoryContinue"]:
 		message.text = "请先查看胜负结算并选择是否继续游戏。"
 		return {"ok": false, "error": {"code": "PENDING_DECISION", "message": message.text}}
+	if unit_state_uncertain and not query and action not in ["load", "demo", "save"]:
+		return {"ok": false, "error": {"code": "STATE_UNCERTAIN", "message": "单位操作结果未确认，请先刷新或重载。"}}
 	# 已迁移面板的事务锁/确认框门禁；提交方自身豁免事务锁检查。
 	if not query:
 		for p in panels:
@@ -565,6 +573,7 @@ func execute(action: String, params: Dictionary = {}, committing = null) -> Dict
 				return {"ok": false, "error": {"code": "BUSY", "message": p.busy_confirmation_message()}}
 	_execute_depth += 1
 	if action == "snapshot":
+		_clear_combat()
 		for p in panels:
 			p.on_execute_snapshot()
 	if action in ["load", "demo"]:
@@ -580,8 +589,15 @@ func execute(action: String, params: Dictionary = {}, committing = null) -> Dict
 			if confirmation.confirmed.is_connected(_confirm_founding):
 				confirmation.confirmed.disconnect(_confirm_founding)
 			confirmation.confirmed.connect(_confirm_founding, CONNECT_ONE_SHOT)
-		if committing != null and failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
-			await committing.on_transport_failure()
+		if failure.get("code") in ["TRANSPORT", "PROTOCOL"]:
+			_clear_combat()
+			if committing != null:
+				await committing.on_transport_failure()
+			elif unit_transaction:
+				unit_state_uncertain = true
+				var recovered: Dictionary = await client.command("snapshot")
+				if recovered.get("ok", false):
+					await _refresh_active_context()
 		elif failure.get("code") in ["STALE_STATE", "DIPLOMACY_REQUEST", "GREAT_PERSON_DECISION", "DIPLOMATIC_VOTE_DECISION", "DIPLOMATIC_VOTE_RESULT", "VICTORY_RESULT", "ASSET_DECISION", "EVENT", "EVENT_INVALID"]:
 			for p in panels:
 				p.on_stale_state()
@@ -606,6 +622,8 @@ func _confirm_founding() -> void:
 	await execute("foundCity", {"unitId": unit_id, "confirmPromise": true})
 
 func _apply_snapshot(data: Dictionary) -> void:
+	unit_state_uncertain = false
+	_clear_combat()
 	for p in panels:
 		p.on_snapshot_applied()
 	# gameId 改变（不同存档）视为重载：自增纪元并清空本地选择与确认状态；
@@ -880,6 +898,7 @@ func _activate_unit(id: int) -> void:
 	city_panel.hide()
 	active_context = "unit"
 	unit_id = id
+	unit_picker.select(_picker_index_by_int(unit_picker, id))
 	selection_generation += 1
 	vote_panel_inst.invalidate()
 	great_person_panel_inst.invalidate()
@@ -887,13 +906,16 @@ func _activate_unit(id: int) -> void:
 	await _resolve_unit(id, selection_generation)
 
 func _resolve_unit(id: int, generation: int) -> void:
+	if generation != selection_generation or id != unit_id:
+		return
 	target.clear()
 	_clear_combat()
 	_clear_dynamic(unit_actions)
 	_clear_dynamic(worker_panel)
 	worker_panel.hide()
+	var stamp := _unit_stamp()
 	var result: Dictionary = await execute("unitOptions", {"unitId": id})
-	if generation != selection_generation:
+	if generation != selection_generation or not _unit_response_matches(result, stamp):
 		return
 	if result.get("ok", false):
 		map.set_reachable(result.data)
@@ -912,6 +934,10 @@ func _resolve_unit(id: int, generation: int) -> void:
 					unit.name, _num(unit.id, true), _num(unit.x, true), _num(unit.y, true),
 					_num(unit.health, true), _num(unit.maxHealth, true), _num(unit.movement),
 					unit.action if unit.action else "待命", "是" if unit.due else "否", _num(unit.attacksThisTurn, true)]
+				var domain := str({"water": "海军", "land": "陆地单位", "air": "空军"}.get(unit.get("domain", "land"), "未知领域"))
+				details.text += "\n%s%s" % [domain, " · 已登船" if unit.get("embarked", false) else ""]
+				if not result.data.get("combatSupported", false):
+					details.text += "\n" + str(result.data.get("combatReason", ""))
 				map.selected = Vector2i(int(unit.x), int(unit.y))
 				map.queue_redraw()
 				break
@@ -1106,8 +1132,19 @@ func _state_stamp() -> Dictionary:
 func _stamp_valid(stamp: Dictionary) -> bool:
 	return not stamp.is_empty() and stamp == _state_stamp() and _own_city_exists(city_id)
 
+func _unit_stamp() -> Dictionary:
+	return {"session": client.session, "gameId": current_game, "revision": client.revision,
+		"loadEpoch": load_epoch, "selectionGeneration": selection_generation,
+		"readGeneration": unit_read_generation, "unitId": unit_id}
+
+func _unit_stamp_valid(stamp: Dictionary) -> bool:
+	return not unit_state_uncertain and not stamp.is_empty() and stamp == _unit_stamp() and _own_unit_exists(unit_id)
+
+func _unit_response_matches(result: Dictionary, stamp: Dictionary) -> bool:
+	return _unit_stamp_valid(stamp) and result.get("ok", false) and str(result.get("session", "")) == str(stamp.session) and int(result.get("revision", -1)) == int(stamp.revision)
+
 func _input_locked() -> bool:
-	return client.busy or panels.any(func(p): return p.busy_active())
+	return client.busy or unit_transaction or unit_state_uncertain or panels.any(func(p): return p.busy_active())
 
 func _economy() -> Dictionary:
 	return city_data.get("economy", {})
@@ -1172,8 +1209,10 @@ func _preview_move(tile: Dictionary) -> void:
 		return
 	_clear_combat()
 	target.clear()
+	var stamp := _unit_stamp()
 	var result: Dictionary = await execute("path", {"unitId": unit_id, "x": int(tile.x), "y": int(tile.y)})
-	if result.get("ok", false):
+	if _unit_response_matches(result, stamp):
+		move_stamp = stamp
 		target = {"x": int(tile.x), "y": int(tile.y)}
 		map.route = result.data.path
 		map.queue_redraw()
@@ -1181,11 +1220,22 @@ func _preview_move(tile: Dictionary) -> void:
 	_on_busy(false)
 
 func _commit_move() -> void:
-	if target.is_empty() or unit_id < 0:
+	if _input_locked() or target.is_empty() or not _unit_stamp_valid(move_stamp):
 		return
 	var parameters := target.duplicate()
 	parameters.unitId = unit_id
-	await execute("move", parameters)
+	await _unit_write("move", parameters)
+
+func _unit_write(action: String, params: Dictionary) -> Dictionary:
+	unit_transaction = true
+	_clear_combat()
+	_on_busy(true)
+	var result := await execute(action, params)
+	unit_transaction = false
+	_on_busy(client.busy)
+	if unit_state_uncertain:
+		message.text = "单位操作结果未确认；旧预览已清除，请刷新或重载后再操作。"
+	return result
 
 func _clear_dynamic(container: Container) -> void:
 	for child in container.get_children():
@@ -1197,6 +1247,10 @@ func _clear_dynamic(container: Container) -> void:
 		child.queue_free()
 
 func _clear_combat() -> void:
+	unit_read_generation += 1
+	target.clear()
+	move_stamp.clear()
+	combat_stamp.clear()
 	combat_preview.clear()
 	preview_revision = -1
 	combat_panel.hide()
@@ -1215,7 +1269,7 @@ func _unit_action(type: String) -> void:
 	if _input_locked() or unit_id < 0:
 		return
 	# 成功后由 execute → _refresh_active_context 重解析单位面板，无需显式重选（避免二次查询）。
-	await execute("unitAction", {"unitId": unit_id, "type": type})
+	await _unit_write("unitAction", {"unitId": unit_id, "type": type})
 
 func _preview_target(tile: Dictionary) -> void:
 	if city_mode or buy_tile_mode or _input_locked() or tabs.current_tab == TAB_DIPLOMACY:
@@ -1230,8 +1284,10 @@ func _preview_attack(tile: Dictionary) -> void:
 		return
 	_clear_combat()
 	target.clear()
+	var stamp := _unit_stamp()
 	var result := await execute("combatPreview", {"unitId": unit_id, "x": int(tile.x), "y": int(tile.y)})
-	if result.get("ok", false):
+	if _unit_response_matches(result, stamp):
+		combat_stamp = stamp
 		combat_preview = result.data
 		preview_revision = int(result.revision)
 		var p := combat_preview
@@ -1244,6 +1300,8 @@ func _preview_attack(tile: Dictionary) -> void:
 			p.defender.name, _num(p.defender.health, true), _num(p.defender.maxHealth, true), _num(p.defender.finalStrength),
 			_num(p.damageToDefender.min, true), _num(p.damageToDefender.max, true), _num(p.damageToAttacker.min, true), _num(p.damageToAttacker.max, true),
 			_num(p.attackFrom.x, true), _num(p.attackFrom.y, true), p.path.size(), "可占城" if p.canCaptureCity else "不可占城", "\n".join(modifiers)]
+		if p.get("kind", "combat") == "captureCivilian":
+			combat_details.text = "%s → %s\n尝试俘获海上平民；归属、转化或离场由原生规则结算，不按伤害区间承诺扣血。\n攻击起点 (%s, %s)" % [p.attacker.name, p.defender.name, _num(p.attackFrom.x, true), _num(p.attackFrom.y, true)]
 		combat_panel.show()
 		map.route = p.path
 		map.attack_from = p.attackFrom
@@ -1252,17 +1310,19 @@ func _preview_attack(tile: Dictionary) -> void:
 	_on_busy(false)
 
 func _commit_attack() -> void:
-	if _input_locked() or combat_preview.is_empty() or preview_revision != client.revision:
+	if _input_locked() or combat_preview.is_empty() or not _unit_stamp_valid(combat_stamp):
 		return
 	# Godot 将响应中的 JSON 数字读成 float；命令坐标必须重新转为整数。
 	var params := {"unitId": int(combat_preview.unitId),
 		"x": int(combat_preview.target.x), "y": int(combat_preview.target.y)}
 	var before: Array = client.snapshot.get("units", []).duplicate(true)
-	var result := await execute("attack", params)
+	var result := await _unit_write("attack", params)
 	if result.get("ok", false):
 		var battle: Dictionary = result.battleResult
 		if battle.outcome == "movedOnly":
 			message.text = "仅完成移动或架设，当前未能攻击；已保留实际行动结果。"
+		elif battle.get("kind", "combat") == "captureCivilian":
+			message.text = "海上平民俘获动作已结算；请查看单位归属及待决事项。"
 		else:
 			message.text = "战斗结算：敌方损失 %s HP，我方损失 %s HP。" % [_num(battle.damageToDefender, true), _num(battle.damageToAttacker, true)]
 			var after_ids: Array = client.snapshot.units.map(func(u): return int(u.id))

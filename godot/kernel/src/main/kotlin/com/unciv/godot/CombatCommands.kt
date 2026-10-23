@@ -9,7 +9,7 @@ import com.unciv.ui.screens.worldscreen.unit.actions.UnitActions
 import com.unciv.view.*
 import kotlinx.serialization.json.JsonObject
 
-/** 只适配玩家陆战入口；校验与预览不执行移动、战斗或随机模拟。 */
+/** 适配陆海军与登船战斗；校验与预览不执行移动、战斗或随机模拟。 */
 internal class CombatCommands(private val game: GameInfo) {
     private val player = game.currentPlayerCiv
     private val view = GameView(game, player)
@@ -26,16 +26,22 @@ internal class CombatCommands(private val game: GameInfo) {
     private fun ownedUnit(id: Int): MapUnitView = view.civView.getUnits().firstOrNull { it.id == id }
         ?: throw GatewayError("NOT_OWNED", "找不到己方单位")
 
-    private fun supported(unit: MapUnitView) = unit.getBaseUnit().isLandUnit && !unit.isEmbarked()
-        && !unit.isAirUnit() && !unit.isNuclearWeapon()
+    private fun supportsBasicActions(unit: MapUnitView) = !unit.isAirUnit() && !unit.isNuclearWeapon()
+        && !unit.isPreparingParadrop() && (unit.getBaseUnit().isLandUnit || unit.getBaseUnit().isWaterUnit)
+
+    fun combatReason(unit: MapUnitView): String = when {
+        !supportsBasicActions(unit) -> "空军、空降和核武器主动操作尚未接入"
+        !unit.isMilitary() -> "平民单位不能主动攻击"
+        else -> ""
+    }
 
     fun actions(unit: MapUnitView): List<JsonObject> {
-        if (!supported(unit)) return emptyList()
+        if (!supportsBasicActions(unit)) return emptyList()
         val raw = player.units.getCivUnits().first { it.id == unit.id }
         return UnitActions.getBasicActions(raw).mapNotNull { action ->
             val id = actionTypes.entries.firstOrNull { it.value == action.type }?.key ?: return@mapNotNull null
             dto("id" to id, "enabled" to (action.action != null), "current" to action.isCurrentAction,
-                "reason" to if (action.action != null) "" else "动作已生效或行动力不足")
+                "reason" to if (action.action != null) "" else "原生规则在当前单位状态或地块上不允许执行")
         }.toList()
     }
 
@@ -43,7 +49,7 @@ internal class CombatCommands(private val game: GameInfo) {
         ensureNoBlockingBattleDecision()
         val unit = ownedUnit(id)
         val mapped = actionTypes[type] ?: throw GatewayError("UNIT_ACTION", "未接入此单位动作")
-        if (!supported(unit)) throw GatewayError("UNSUPPORTED", "本轮只接入非登船陆军动作")
+        if (!supportsBasicActions(unit)) throw GatewayError("UNSUPPORTED", combatReason(unit))
         val raw = player.units.getCivUnits().first { it.id == id }
         return UnitActions.getBasicActions(raw).firstOrNull { it.type == mapped }?.action
             ?: throw GatewayError("UNIT_ACTION", "当前不能执行此单位动作")
@@ -62,7 +68,9 @@ internal class CombatCommands(private val game: GameInfo) {
             is CityCombatantView -> defender.getCityView().getCity().civ
             is MapUnitCombatantView -> {
                 val unit = defender.getUnitView()
-                if (!unit.isMilitary() || !unit.getBaseUnit().isLandUnit || unit.isEmbarked()) return null
+                if (unit.isAirUnit() || unit.getUnit().isNuclearWeapon()) return null
+                if (!unit.isMilitary() && !tile.isLand && !unit.isEmbarked() && !unit.getBaseUnit().isWaterUnit) return null
+                if (!unit.isMilitary() && tile.isLand) return null
                 unit.getUnit().civ
             }
         }
@@ -70,7 +78,7 @@ internal class CombatCommands(private val game: GameInfo) {
     }
 
     private fun candidates(unit: MapUnitView): List<AttackableTileView> {
-        if (!supported(unit) || !unit.isMilitary() || !unit.canAttack()) return emptyList()
+        if (combatReason(unit).isNotEmpty() || !unit.canAttack()) return emptyList()
         return unit.getAttackableEnemies(unit.getDistanceToTiles()).filter { visibleEnemy(it.getTileToAttack()) != null }
     }
 
@@ -79,6 +87,7 @@ internal class CombatCommands(private val game: GameInfo) {
 
     fun prepareAttack(id: Int, target: HexCoord): PreparedAttack {
         val unit = ownedUnit(id)
+        if (!supportsBasicActions(unit)) throw GatewayError("UNSUPPORTED", combatReason(unit))
         val rawTile = game.tileMap.getOrNull(target.x, target.y) ?: cannotAttack()
         val tile = view.getTile(rawTile)
         val defender = visibleEnemy(tile) ?: cannotAttack()
@@ -102,7 +111,9 @@ internal class CombatCommands(private val game: GameInfo) {
             }
             fun damage(min: Int, max: Int, health: Int) = dto("min" to min.coerceIn(0, health), "max" to max.coerceIn(0, health))
             fun modifiers(values: Map<String, Int>) = values.map { dto("name" to it.key, "percent" to it.value) }
-            return dto("unitId" to unit.id, "target" to target.getTileToAttack().position().dto(),
+            val captureCivilian = (defender as? MapUnitCombatantView)?.getUnitView()?.isCivilian() == true && !attacker.isRanged()
+            return dto("unitId" to unit.id, "kind" to if (captureCivilian) "captureCivilian" else "combat",
+                "target" to target.getTileToAttack().position().dto(),
                 "attackFrom" to from.position().dto(), "path" to unit.getPathToTile(from).map { it.position().dto() },
                 "canCaptureCity" to (defender.isCity() && !attacker.isRanged() && !attacker.hasUnique(UniqueType.CannotCaptureCities)),
                 "attacker" to dto("name" to attacker.getCombatantName(), "health" to attacker.getHealth(), "maxHealth" to attacker.getMaxHealth(),
@@ -111,7 +122,8 @@ internal class CombatCommands(private val game: GameInfo) {
                 "defender" to dto("name" to defender.getCombatantName(), "health" to defender.getHealth(), "maxHealth" to defender.getMaxHealth(),
                     "strength" to defender.getDefendingStrength(attacker), "finalStrength" to defender.getFinalDefendingStrength(attacker, from),
                     "modifiers" to modifiers(defender.getDefenceModifiers(attacker, from))),
-                "damageToDefender" to damage(minDefender, maxDefender, defender.getHealth()),
+                "damageToDefender" to if (captureCivilian) dto("min" to 0, "max" to 0)
+                    else damage(minDefender, maxDefender, defender.getHealth()),
                 "damageToAttacker" to damage(attacker.calculateDamageToAttacker(defender, from, 0f),
                     attacker.calculateDamageToAttacker(defender, from, 1f), attacker.getHealth()))
         }
@@ -120,8 +132,10 @@ internal class CombatCommands(private val game: GameInfo) {
             // false 也可能已移动或完成架设，属于成功提交，不能回滚或强行补攻击。
             if (!unit.tryMovePreparingAttack(target, tryHealPillage = false))
                 return dto("outcome" to "movedOnly", "damageToDefender" to 0, "damageToAttacker" to 0)
+            val civilianTarget = (defender as? MapUnitCombatantView)?.getUnitView()?.isCivilian() == true && !unit.asCombatant().isRanged()
             val damage = unit.attackOrNuke(target)
-            return dto("outcome" to "attacked", "damageToDefender" to damage.attackerDealt, "damageToAttacker" to damage.defenderDealt)
+            return dto("outcome" to "attacked", "kind" to if (civilianTarget) "captureCivilian" else "combat",
+                "damageToDefender" to damage.attackerDealt, "damageToAttacker" to damage.defenderDealt)
         }
     }
 }

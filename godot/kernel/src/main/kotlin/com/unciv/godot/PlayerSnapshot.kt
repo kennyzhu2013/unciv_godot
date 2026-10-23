@@ -69,6 +69,8 @@ internal class PlayerSnapshot(private val game: GameInfo) {
                 val pos = unit.getTile().position()
                 dto("id" to unit.id, "name" to unit.name, "x" to pos.x, "y" to pos.y,
                     "own" to own, "civilian" to unit.isCivilian(), "health" to unit.unitHealth,
+                    "domain" to when { unit.isAirUnit() -> "air"; unit.getBaseUnit().isWaterUnit -> "water"; else -> "land" },
+                    "embarked" to unit.isEmbarked(),
                     "movement" to if (own) unit.currentMovement else null,
                     "action" to if (own) unit.getUnit().action else null,
                     "due" to if (own) unit.getUnit().due else null,
@@ -140,11 +142,12 @@ internal class PlayerSnapshot(private val game: GameInfo) {
         val combat = CombatCommands(game)
         return dto("unitId" to unit.id,
             "actions" to combat.actions(unit), "attackTargets" to combat.attackTargets(unit),
+            "combatSupported" to combat.combatReason(unit).isEmpty(), "combatReason" to combat.combatReason(unit),
             "worker" to WorkerCommands(game).workerDto(raw),
             "religion" to ReligionCommands(game).unitDto(raw),
             "canFound" to (founding?.action != null),
             "foundReason" to if (founding?.action != null) "" else "此单位不能在当前地块建城，或行动力不足",
-            "reachable" to if (!unit.hasMovement() || unit.cannotMove() || unit.isAirUnit() || unit.isPreparingParadrop()) emptyList<JsonObject>()
+            "reachable" to if (!unit.hasMovement() || unit.cannotMove() || unit.isAirUnit() || unit.isNuclearWeapon() || unit.isPreparingParadrop()) emptyList<JsonObject>()
                 else unit.getReachableTilesInCurrentTurn().filter { unit.canMoveTo(it) }.map { it.position().dto() })
     }
 

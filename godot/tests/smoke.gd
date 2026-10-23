@@ -54,6 +54,35 @@ var citystate_expected: Dictionary = {}
 var event_steps := 0
 var event_lock_valid := true
 var event_lock_handoffs := 0
+var naval_steps := 0
+var embarkation_steps := 0
+var naval_expected: Dictionary = {}
+var naval_evidence: Array[Dictionary] = []
+
+# 真实 HTTP 后丢弃响应／延迟只读响应，属于客户端边界故障注入。
+class NavalFaultClient extends "res://scripts/kernel_client.gd":
+	var drop_action := ""
+	var drop_writes := 0
+	var fail_snapshot := false
+	var delayed_action := ""
+	var captured := false
+	var release_response := false
+	var trace: Array[Dictionary] = []
+	func _send(payload: Dictionary) -> Dictionary:
+		if fail_snapshot and payload.action == "snapshot":
+			trace.append({"request": payload.duplicate(true), "injected": true})
+			await get_tree().process_frame
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：单位恢复快照失败"}}
+		var answer: Dictionary = await super._send(payload)
+		trace.append({"request": payload.duplicate(true), "answer": answer.duplicate(true)})
+		if payload.action == delayed_action:
+			captured = true
+			while not release_response:
+				await get_tree().process_frame
+		if payload.action == drop_action and drop_writes > 0:
+			drop_writes -= 1
+			return {"ok": false, "error": {"code": "TRANSPORT", "message": "测试注入：单位写入后丢响应"}}
+		return answer
 
 # 客户端边界故障注入：请求仍走真实 HTTP，不作为真实网络故障证据。
 class DiplomacyFaultClient extends "res://scripts/kernel_client.gd":
@@ -241,6 +270,8 @@ func run(frontend) -> void:
 		return
 	if not await verify_combat_flow():
 		return
+	if not await verify_naval_flow():
+		return
 	if not await verify_development_flow():
 		return
 	if not await verify_ui_display_flow():
@@ -275,8 +306,9 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event"],
+		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation"],
 		"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
+		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -294,6 +326,261 @@ func run(frontend) -> void:
 	archive_smoke_result()
 	print("闭环验证通过：", " → ".join(steps))
 	get_tree().quit(0)
+
+func naval_scenario(name: String) -> Dictionary:
+	for scenario in naval_expected.scenarios:
+		if scenario.name == name:
+			return scenario
+	return {}
+
+func normalize_naval(value, key := ""):
+	if value is Dictionary:
+		var result := {}
+		for field in value:
+			result[field] = normalize_naval(value[field], str(field))
+			if key in naval_expected.mapOfSetFields and result[field] is Array:
+				result[field].sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	if value is Array:
+		var result: Array = value.map(func(item): return normalize_naval(item))
+		if key in naval_expected.setFields:
+			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	return value
+
+func naval_state(raw: String) -> Dictionary:
+	var state: Dictionary = JSON.parse_string(raw)
+	state.erase("currentTurnStartTime")
+	state.erase("checksum")
+	for civ in state.civilizations:
+		civ.erase("totalTurnTimeSeconds")
+	return normalize_naval(state)
+
+func naval_matches(name: String, step: String) -> bool:
+	if not await perform("save", {"name": run_id + "-naval-" + str(naval_steps)}):
+		return false
+	var zipped := Marshalls.base64_to_raw(FileAccess.get_file_as_string(app.last_saved_path).strip_edges())
+	var raw := zipped.decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_GZIP).get_string_from_utf8()
+	var scenario := naval_scenario(name)
+	var native_raw := FileAccess.get_file_as_string(scenario.rawStates[step])
+	var expected = normalize_naval(scenario.states[step])
+	var actual := naval_state(raw)
+	var evidence := {"scenario": name, "step": step, "savedPath": app.last_saved_path, "states": [], "matched": false}
+	naval_evidence.append(evidence)
+	for side in [["actual-raw", raw], ["native-raw", native_raw], ["actual-normalized", JSON.stringify(actual)], ["native-normalized", JSON.stringify(expected)]]:
+		var path: String = "res://.local/" + run_id + "-naval-" + str(naval_steps) + "-" + side[0] + ".json"
+		var file := FileAccess.open(path, FileAccess.WRITE)
+		file.store_string(side[1])
+		file.close()
+		evidence.states.append(ProjectSettings.globalize_path(path))
+	if not equal_persisted(naval_state(native_raw), expected, "海军比较器校准 " + step) or not equal_persisted(actual, expected, "海军完整原生存档 " + name + "/" + step):
+		return false
+	evidence.matched = true
+	naval_steps += 1
+	if name == "embarkation":
+		embarkation_steps += 1
+	return true
+
+func naval_select(id: int) -> bool:
+	var units: Array = app.client.snapshot.units.filter(func(u): return int(u.id) == id and u.own)
+	if not check(units.size() == 1, "海军／登船单位仍归己方"):
+		return false
+	var unit: Dictionary = units[0]
+	app.map.center_on(Vector2i(int(unit.x), int(unit.y)))
+	await settle()
+	if not await click_map(Vector2i(int(unit.x), int(unit.y))):
+		return false
+	if app.unit_id != id:
+		if not await click_option(app.unit_picker, app._picker_index_by_int(app.unit_picker, id)):
+			return false
+	return check(app.unit_id == id and int(app.unit_picker.get_item_metadata(app.unit_picker.selected)) == id, "真实选择海军／堆叠登船单位与下拉状态一致")
+
+func naval_preview(order: Dictionary) -> bool:
+	var params: Dictionary = order.params
+	if not await naval_select(int(params.unitId)):
+		return false
+	if not await click_map(Vector2i(int(params.x), int(params.y)), MOUSE_BUTTON_RIGHT):
+		return false
+	var ready: bool = not app.target.is_empty() if order.action == "move" else not app.combat_preview.is_empty()
+	if not ready:
+		naval_evidence.append({"failedPreview": order.duplicate(true), "selected": app.unit_id, "units": app.client.snapshot.units.duplicate(true), "message": app.message.text, "turn": app.client.snapshot.turn})
+	return check(ready, "真实右键海军预览 " + str(order.action))
+
+func naval_confirm(action: String) -> bool:
+	var control: Button = app.move_button if action == "move" else app.attack_button
+	scroll_into_view(control)
+	await settle()
+	var revision: int = app.client.revision
+	if not await click_control(control, true):
+		return false
+	return check(app.client.revision == revision + 1 and app.target.is_empty() and app.combat_preview.is_empty(), "海军双击最多一次且清空预览 " + action)
+
+func verify_naval_previews() -> bool:
+	var scenario := naval_scenario("battle")
+	for action in ["move", "attack"]:
+		var order: Dictionary = scenario.steps[0 if action == "move" else 1]
+		if not await naval_preview(order):
+			return false
+		var revision: int = app.client.revision
+		await diplomacy_key(KEY_ESCAPE)
+		await settle()
+		if not check(app.target.is_empty() and app.combat_preview.is_empty() and app.client.revision == revision, "海军取消零写入 " + action):
+			return false
+		for key in ["session", "gameId", "revision", "loadEpoch", "selectionGeneration", "readGeneration", "unitId"]:
+			if not await naval_preview(order):
+				return false
+			var stamp: Dictionary = app.move_stamp if action == "move" else app.combat_stamp
+			var previous = stamp[key]
+			stamp[key] = int(previous) - 1 if previous is float or previous is int else "expired-" + str(previous)
+			var count: int = app.client.request_counter
+			if action == "move":
+				await app._commit_move()
+			else:
+				await app._commit_attack()
+			if not check(count == app.client.request_counter, "旧海军确认零请求 " + action + "/" + key):
+				return false
+		if not await naval_preview(order) or not await perform("snapshot"):
+			return false
+		if not check(app.target.is_empty() and app.combat_preview.is_empty(), "海军刷新清除全部预览"):
+			return false
+		# 在真实只读 HTTP 已返回、尚未交付主界面时切换代际，确保迟到响应被丢弃。
+		var original = app.client
+		var fault := NavalFaultClient.new()
+		app.add_child(fault)
+		fault.delayed_action = "path" if action == "move" else "combatPreview"
+		swap_great_person_test_client(fault)
+		if action == "move":
+			app._preview_move(order.params)
+		else:
+			app._preview_attack(order.params)
+		var guard := 0
+		while not fault.captured and guard < 600:
+			guard += 1
+			await get_tree().process_frame
+		app.selection_generation += 1
+		fault.release_response = true
+		await settle()
+		var ignored: bool = fault.captured and app.target.is_empty() and app.combat_preview.is_empty()
+		swap_great_person_test_client(original)
+		fault.queue_free()
+		if not check(ignored, "迟到海军查询不得回填 " + action):
+			return false
+		if not await naval_preview(order) or not await perform("load", {"path": scenario.fixture}):
+			return false
+		if not check(app.target.is_empty() and app.combat_preview.is_empty(), "重载使海军预览失效"):
+			return false
+	return await naval_matches("battle", "initial")
+
+func verify_naval_transport() -> bool:
+	var scenario := naval_scenario("battle")
+	for action in ["move", "attack"]:
+		for mode in ["retry", "recover", "snapshot"]:
+			if not await perform("load", {"path": scenario.fixture}):
+				return false
+			if action == "attack":
+				if not await naval_preview(scenario.steps[0]) or not await naval_confirm("move"):
+					return false
+			var order: Dictionary = scenario.steps[0 if action == "move" else 1]
+			if not await naval_preview(order):
+				return false
+			var original = app.client
+			var revision: int = original.revision
+			var fault := NavalFaultClient.new()
+			app.add_child(fault)
+			fault.drop_action = action
+			fault.drop_writes = 1 if mode == "retry" else 2
+			fault.fail_snapshot = mode == "snapshot"
+			swap_great_person_test_client(fault)
+			if not await click_control(app.move_button if action == "move" else app.attack_button):
+				return false
+			await settle()
+			var writes: Array = fault.trace.filter(func(e): return e.request.action == action)
+			var guarded: bool = app.target.is_empty() and app.combat_preview.is_empty() and app.move_button.disabled and app.attack_button.disabled and app.unit_state_uncertain == (mode == "snapshot")
+			var path: String = "res://.local/" + run_id + "-naval-transport-" + action + "-" + mode + ".json"
+			var file := FileAccess.open(path, FileAccess.WRITE)
+			file.store_string(JSON.stringify({"method": "客户端边界故障注入", "trace": fault.trace, "guarded": guarded}))
+			file.close()
+			naval_evidence.append({"fault": action + "/" + mode, "path": ProjectSettings.globalize_path(path)})
+			swap_great_person_test_client(original)
+			fault.queue_free()
+			if not check(guarded and writes.size() == 2 and writes[0].request == writes[1].request and writes[0].answer == writes[1].answer and writes[0].answer.ok, "海军同请求重试及不确定状态保护 " + action + "/" + mode):
+				return false
+			if app.unit_state_uncertain:
+				var count: int = app.client.request_counter
+				await app._commit_move()
+				await app._commit_attack()
+				if not check(count == app.client.request_counter, "海军断线后不可重交旧预览") or not await perform("snapshot"):
+					return false
+			if not check(original.revision == revision + 1 and not app.unit_state_uncertain, "海军恢复后仅一次写入") or not await naval_matches("battle", str(order.step)):
+				return false
+	return true
+
+func verify_naval_flow() -> bool:
+	var expected_file := "res://.local/tests/naval-expected.json"
+	if not check(FileAccess.file_exists(expected_file), "独立海军原生期望存在"):
+		return false
+	naval_expected = JSON.parse_string(FileAccess.get_file_as_string(expected_file))
+	if not await perform("load", {"path": naval_scenario("battle").fixture}) or not await verify_naval_previews() or not await verify_naval_transport():
+		return false
+	for scenario in naval_expected.scenarios:
+		if not await perform("load", {"path": scenario.fixture}) or not await naval_matches(scenario.name, "initial"):
+			return false
+		for order in scenario.steps:
+			naval_evidence.append({"order": order.duplicate(true), "scenario": scenario.name, "revision": app.client.revision, "turn": app.client.snapshot.turn})
+			var action := str(order.action)
+			if action in ["move", "attack"]:
+				if not await naval_preview(order):
+					return false
+				await screenshot("smoke-naval-" + str(scenario.name) + "-" + str(order.step) + "-preview.png")
+				if not await naval_confirm(action):
+					return false
+				if scenario.name == "embarkation":
+					var id := int(order.params.unitId)
+					var unit: Dictionary = app.client.snapshot.units.filter(func(u): return int(u.id) == id)[0]
+					var art: String = app.map.unit_nodes[id].get_meta("art")
+					if not check(bool(unit.embarked) == (int(unit.y) < 0) and art.contains("EmbarkedUnit-") == bool(unit.embarked), "同 ID 登船与登陆外观切换"):
+						return false
+					if unit.embarked and not check(art.ends_with("-Denmark"), "登船素材优先文明变体"):
+						return false
+			elif action == "cityDecision":
+				var controls: Array = app.capture_panel.get_children().filter(func(c): return c is Button and c.text == "傀儡")
+				if not check(controls.size() == 1, "沿岸占城复用处置按钮") or not await click_control(controls[0]):
+					return false
+			elif action == "victoryContinue":
+				if not await open_victory() or not await click_control(app.victory_panel_inst.continue_button) or not await click_victory_dialog(true, true):
+					return false
+			elif action == "acknowledge":
+				var controls: Array = app.buttons.filter(func(b): return b.text == "消息已阅")
+				if not check(controls.size() == 1, "征服后原生消息确认入口") or not await click_tab(app.tabs, app.TAB_MATTERS) or not await click_control(controls[0]):
+					return false
+			elif action == "reload":
+				if not await perform("load", {"path": app.last_saved_path}):
+					return false
+			elif action == "nextTurn":
+				if not await click_control(app.turn_button):
+					return false
+			else:
+				return check(false, "未接线海军窗口动作 " + action)
+			if not await naval_matches(scenario.name, str(order.step)):
+				return false
+			if scenario.name == "embarkation" and order.step == "2-move":
+				var original := get_window().size
+				for size in [Vector2i(1024, 720), Vector2i(1280, 800), Vector2i(1600, 900)]:
+					get_window().size = size
+					await settle()
+					if not await naval_select(int(order.params.unitId)):
+						return false
+					scroll_into_view(app.details)
+					await settle()
+					var label := "%dx%d" % [size.x, size.y]
+					if not check(app.details.text.contains("已登船") and app.details.size.x <= app.unit_scroll.size.x and get_viewport().get_visible_rect().encloses(app.turn_button.get_global_rect()), "海军三尺寸详情与回合入口 " + label):
+						return false
+					window_sizes_checked.append("naval-" + label)
+					await screenshot("smoke-naval-" + label + ".png")
+				get_window().size = original
+				await settle()
+	steps.append("海军与登船：真实移动／海战／沿岸占城／继续胜利／堆叠选择及外观切换；完整原生差分、预览失效、重试恢复与三尺寸截图")
+	return true
 
 func normalize_asset(value, key := ""):
 	if value is Dictionary:
@@ -3045,6 +3332,7 @@ func _fail(message: String) -> void:
 			"finishedAt": Time.get_datetime_string_from_system(true), "error": message,
 			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
 			"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
+		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
@@ -3889,7 +4177,7 @@ func scroll_into_view(control: Control) -> void:
 		node = node.get_parent()
 
 # 真实点击控件：先滚动到可见，等待布局，校验命中目标或其子节点，再分发按下+释放。
-func click_control(control) -> bool:
+func click_control(control, twice := false) -> bool:
 	if not check(control != null and is_instance_valid(control), "目标控件存在"):
 		return false
 	if control is BaseButton and control.disabled:
@@ -3933,6 +4221,8 @@ func click_control(control) -> bool:
 		await screenshot("smoke-control-hit-failure.png")
 		return check(false, "实际窗口悬停未命中目标：" + str(control.name))
 	await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, center, false)
+	if twice:
+		await window_mouse(get_viewport(), MOUSE_BUTTON_LEFT, center, false, true)
 	await settle()
 	if is_instance_valid(control):
 		control.gui_input.disconnect(on_input)
