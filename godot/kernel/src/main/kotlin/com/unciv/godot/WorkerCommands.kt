@@ -6,9 +6,12 @@ import com.unciv.logic.map.mapunit.MapUnit
 import com.unciv.logic.map.mapunit.WorkerImprovementActions
 import com.unciv.logic.map.tile.ImprovementBuildingProblem
 import com.unciv.logic.map.tile.Tile
+import com.unciv.models.UnitAction
+import com.unciv.models.UnitActionType
 import com.unciv.models.ruleset.tile.TileImprovement
 import com.unciv.models.stats.Stats
 import com.unciv.ui.screens.pickerscreens.ImprovementPickerScreen
+import com.unciv.ui.screens.worldscreen.unit.actions.UnitActions
 import com.unciv.ui.screens.worldscreen.unit.actions.UnitActionsFromUniques
 import kotlinx.serialization.json.JsonObject
 import kotlin.math.roundToInt
@@ -37,13 +40,59 @@ internal class WorkerCommands(private val game: GameInfo) {
         }
     }
 
-    /** unitOptions.worker 子对象：当前工程、保留标记、改良候选、修复与取消。 */
-    fun workerDto(unit: MapUnit): JsonObject {
+    /** unitOptions.worker 子对象：按单位能力分流为陆地工人或水上瞬建。 */
+    fun workerDto(unit: MapUnit): JsonObject =
+        if (unit.cache.hasUniqueToCreateWaterImprovements) waterDto(unit) else landDto(unit)
+
+    /** 水上工作船：当前格资源的即时改良，一次闭包完成并消耗单位；不开放伟人的通用瞬建能力。 */
+    private fun waterDto(unit: MapUnit): JsonObject {
+        val tile = unit.currentTile
+        val name = waterImprovementName(unit)
+        val action = name?.let { waterAction(unit, it) }
+        val enabled = action?.action != null
+        val improvement = name?.let { ruleset.tileImprovements[it] }
+        val reason = when {
+            enabled -> ""
+            !tile.isWater -> "工作船只能在水上资源格创建改良"
+            name == null -> "当前地块没有可改良的可见资源"
+            action == null -> "当前不能在此创建该改良"
+            !unit.hasMovement() -> "本回合行动力已耗尽"
+            else -> "当前不能创建此改良"
+        }
+        return dto(
+            "mode" to "waterInstant",
+            "supported" to enabled,
+            "enabled" to enabled,
+            "reason" to reason,
+            "consumesUnit" to true,
+            "tile" to tile.position.dto(),
+            "improvement" to name,
+            "resource" to tile.tileResource?.takeIf { player.canSeeResource(it) }?.name,
+            "yieldDelta" to (if (improvement != null) statsDto(tile.stats.getStatDiffForImprovement(improvement, player, tile.getCity())) else dto()),
+            "maintenance" to (if (improvement != null) statsDto(tile.improvementFunctions.getMaintenance(improvement, player)) else dto())
+        )
+    }
+
+    /** 当前格资源的原生改良名；资源不可见或无对应改良返回 null。 */
+    private fun waterImprovementName(unit: MapUnit): String? {
+        val tile = unit.currentTile
+        val resource = tile.tileResource ?: return null
+        if (!player.canSeeResource(resource)) return null
+        return resource.getImprovingImprovement(tile, unit.cache.state)?.name
+    }
+
+    /** 原生 CreateImprovement 映射返回的水上资源动作，以标题模板 "Create [X]" 精确匹配。 */
+    private fun waterAction(unit: MapUnit, name: String): UnitAction? =
+        UnitActions.getUnitActions(unit, UnitActionType.CreateImprovement).firstOrNull { it.title == "Create [$name]" }
+
+    /** unitOptions.worker 陆地工人子对象：当前工程、保留标记、改良候选、修复与取消。 */
+    private fun landDto(unit: MapUnit): JsonObject {
         val tile = unit.currentTile
         val blocked = blockedReason(unit)
         val reserved = tile.isMarkedForCreatesOneImprovement()
         val inProgress = tile.improvementInProgress
         return dto(
+            "mode" to "worker",
             "supported" to (blocked == null),
             "reason" to (blocked ?: ""),
             "reservedForCreatesOneImprovement" to reserved,
@@ -169,6 +218,7 @@ internal class WorkerCommands(private val game: GameInfo) {
     fun prepareOrder(id: Int, type: String, name: String): () -> Unit {
         CombatCommands(game).ensureNoBlockingBattleDecision()
         val unit = ownedUnit(id)
+        if (type == "createWaterImprovement") return prepareWaterImprovement(unit, name)
         val tile = unit.currentTile
         val blocked = blockedReason(unit)
         if (blocked != null) throw GatewayError("CANNOT_IMPROVE", blocked)
@@ -200,6 +250,16 @@ internal class WorkerCommands(private val game: GameInfo) {
             }
             else -> throw GatewayError("INVALID_ARGUMENT", "未知施工命令类型：$type")
         }
+    }
+
+    /** 水上瞬建：只处理单位当前格，名称必须匹配原生候选；执行一次原生闭包完成改良并消耗工作船。 */
+    private fun prepareWaterImprovement(unit: MapUnit, name: String): () -> Unit {
+        ensure(unit.cache.hasUniqueToCreateWaterImprovements, "CANNOT_IMPROVE", "此单位不能创建水上改良")
+        val improvementName = waterImprovementName(unit)
+            ?: throw GatewayError("CANNOT_IMPROVE", "当前地块没有可改良的可见资源")
+        ensure(name == improvementName, "INVALID_ARGUMENT", "改良名称与当前原生候选不符")
+        return waterAction(unit, name)?.action
+            ?: throw GatewayError("CANNOT_IMPROVE", if (!unit.hasMovement()) "本回合行动力已耗尽" else "当前不能创建此改良")
     }
 
     private fun ensure(condition: Boolean, code: String, message: String) {

@@ -11,6 +11,8 @@ const DiplomacyPanelScript = preload("res://scripts/panels/diplomacy_panel.gd")
 const AssetPanelScript = preload("res://scripts/panels/asset_panel.gd")
 const EconomyPanelScript = preload("res://scripts/panels/economy_panel.gd")
 const CityDevelopmentPanelScript = preload("res://scripts/panels/city_development_panel.gd")
+const UnitProgressionPanelScript = preload("res://scripts/panels/unit_progression_panel.gd")
+const CityCombatPanelScript = preload("res://scripts/panels/city_combat_panel.gd")
 var client = ClientScript.new()
 var map = MapScript.new()
 var top_status := Label.new()
@@ -59,6 +61,14 @@ var asset_panel_inst = AssetPanelScript.new()
 # 下列属性转发同一批节点，smoke 与 busy 继续通过 main 访问。
 var worker_panel := VBoxContainer.new()
 var city_dev = CityDevelopmentPanelScript.new()
+# 单位成长区（晋升／升级）与晋升／升级／工作船共用的单位动作确认；非事务域面板（不入 panels），
+# main 保留单位上下文与写入编排（沿 _unit_write），并显式将其确认框纳入 _input_locked/_on_busy 门禁。
+var unit_progression = UnitProgressionPanelScript.new()
+# 城市轰击事务域面板（TransactionController 子类，登记进 panels），挂城市概况页。
+var city_combat_inst = CityCombatPanelScript.new()
+# 城市轰击专用模式（与买地／人口地块管理／单位移动攻击互斥）；城市读取代际用于轰击 stamp 绑定。
+var bombard_mode := false
+var city_read_generation := 0
 var city_data: Dictionary = {}
 var city_mode := false
 var citizen_tile: Dictionary = {}
@@ -187,6 +197,9 @@ func _ready() -> void:
 	economy_panel_inst.orchestrator = self
 	panels.append(economy_panel_inst)
 	city_dev.orchestrator = self
+	unit_progression.orchestrator = self
+	city_combat_inst.orchestrator = self
+	panels.append(city_combat_inst)
 	var system_font := SystemFont.new()
 	system_font.font_names = PackedStringArray(["Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC"])
 	theme = Theme.new()
@@ -205,6 +218,8 @@ func _ready() -> void:
 	client.state_invalidated.connect(vote_panel_inst.invalidate)
 	client.state_invalidated.connect(victory_panel_inst.invalidate)
 	client.state_invalidated.connect(asset_panel_inst.invalidate)
+	client.state_invalidated.connect(city_combat_inst.invalidate)
+	client.state_invalidated.connect(unit_progression.cancel)
 	map.tile_selected.connect(_select_tile)
 	map.move_requested.connect(_preview_target)
 	var hello: Dictionary = await execute("hello")
@@ -349,6 +364,7 @@ func _build_unit_tab() -> void:
 	page.add_child(unit_actions)
 	page.add_child(worker_panel)
 	worker_panel.hide()
+	unit_progression.build(page)
 	page.add_child(combat_panel)
 	label(combat_panel, "战斗预览")
 	combat_details.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -374,6 +390,7 @@ func _build_city_tab() -> void:
 		if not _updating_pickers:
 			await _activate_city(str(city_picker.get_item_metadata(index))))
 	city_dev.build(city_page)
+	city_combat_inst.build(city_dev.overview_page)
 	economy_panel_inst.build_tab()
 
 func _diplomacy_text(parent: Node, text: String) -> void:
@@ -427,6 +444,8 @@ func _on_tab_selected(index: int) -> void:
 		_set_city_mode(false)
 	if index != TAB_CITY:
 		_set_buy_tile_mode(false)
+	if index != TAB_CITY and bombard_mode:
+		_set_bombard_mode(false)
 	if index == TAB_DIPLOMACY:
 		target.clear()
 		_clear_combat()
@@ -450,6 +469,9 @@ func _on_city_tab_selected(index: int) -> void:
 		_set_city_mode(false)
 	if index != CTAB_ECONOMY:
 		_set_buy_tile_mode(false)
+	# 切离概况子页即退出轰击目标选择；返回时由用户显式重新进入。
+	if index != CTAB_OVERVIEW and bombard_mode:
+		_set_bombard_mode(false)
 
 func _locate() -> void:
 	if active_context == "unit" and unit_id >= 0:
@@ -481,16 +503,25 @@ func _unhandled_key_input(event: InputEvent) -> void:
 	if focus is LineEdit or focus is TextEdit or focus is SpinBox:
 		return
 	# 模态弹窗自行处理 Esc（关闭），此处不叠加取消预览或退出城市模式。
-	if confirmation.visible or raze_confirmation.visible or file_dialog.visible:
+	if confirmation.visible or raze_confirmation.visible or file_dialog.visible or unit_progression.confirmation_visible():
 		return
 	if _input_locked():
 		return
 	if not combat_preview.is_empty() or not target.is_empty():
 		_cancel_attack()
 		get_viewport().set_input_as_handled()
+	elif city_combat_inst.has_preview():
+		city_combat_inst.cancel_preview()
+		_on_busy(false)
+		message.text = "已取消轰击预览，游戏状态未改变。"
+		get_viewport().set_input_as_handled()
 	elif buy_tile_mode:
 		_set_buy_tile_mode(false)
 		message.text = "已退出购买地块。"
+		get_viewport().set_input_as_handled()
+	elif bombard_mode:
+		_set_bombard_mode(false)
+		message.text = "已退出轰击目标选择。"
 		get_viewport().set_input_as_handled()
 	elif city_mode:
 		_set_city_mode(false)
@@ -519,8 +550,11 @@ func _on_busy(is_busy: bool) -> void:
 	is_busy = is_busy or unit_transaction
 	for p in panels:
 		is_busy = is_busy or p.busy_active()
+	# 成长区确认框可见期间同样锁入（与提交期 unit_transaction 共同构成单位动作门禁）。
+	is_busy = is_busy or unit_progression.confirmation_visible()
 	for p in panels:
 		p.apply_busy(is_busy)
+	unit_progression.apply_busy(is_busy)
 	if tabs:
 		tabs.get_tab_bar().mouse_filter = Control.MOUSE_FILTER_IGNORE if is_busy else Control.MOUSE_FILTER_STOP
 	if city_tabs:
@@ -558,7 +592,7 @@ func _on_busy(is_busy: bool) -> void:
 			focus_option.disabled = true
 
 func execute(action: String, params: Dictionary = {}, committing = null) -> Dictionary:
-	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "victoryOptions", "assetDecisionOptions", "eventOptions", "combatPreview", "path", "snapshot", "hello"]
+	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "victoryOptions", "assetDecisionOptions", "eventOptions", "combatPreview", "cityBombardPreview", "path", "snapshot", "hello"]
 	if _victory_pending() and not query and action not in ["load", "demo", "save", "diplomaticVoteAcknowledge", "victoryContinue"]:
 		message.text = "请先查看胜负结算并选择是否继续游戏。"
 		return {"ok": false, "error": {"code": "PENDING_DECISION", "message": message.text}}
@@ -721,6 +755,7 @@ func _reset_selection() -> void:
 	diplomacy_panel_inst.reset_selection()
 	religion_panel_inst.invalidate()
 	_set_buy_tile_mode(false)
+	_set_bombard_mode(false)
 	city_stamp = {}
 	active_context = ""
 	unit_id = -1
@@ -729,6 +764,7 @@ func _reset_selection() -> void:
 	citizen_tile = {}
 	city_data = {}
 	selection_generation += 1
+	city_read_generation += 1
 	vote_panel_inst.invalidate()
 	great_person_panel_inst.invalidate()
 	_set_city_mode(false)
@@ -736,6 +772,7 @@ func _reset_selection() -> void:
 	_clear_dynamic(unit_actions)
 	_clear_dynamic(worker_panel)
 	worker_panel.hide()
+	unit_progression.clear()
 	_clear_dynamic(focus_box)
 	_clear_dynamic(specialist_box)
 	_clear_dynamic(queue_box)
@@ -779,6 +816,7 @@ func _refresh_active_context() -> void:
 			_clear_dynamic(unit_actions)
 			_clear_dynamic(worker_panel)
 			worker_panel.hide()
+			unit_progression.clear()
 			details.text = "该单位已消失或不再归属己方。"
 	elif active_context == "city":
 		if _own_city_exists(city_id):
@@ -797,6 +835,9 @@ func _refresh_active_context() -> void:
 
 func _select_tile(tile: Dictionary) -> void:
 	if _input_locked():
+		return
+	# 轰击模式下左键不切换上下文（目标选择经右键预览），保持模式稳定。
+	if bombard_mode:
 		return
 	if buy_tile_mode:
 		_select_buy_tile(tile)
@@ -828,6 +869,7 @@ func _select_tile(tile: Dictionary) -> void:
 	_clear_dynamic(unit_actions)
 	_clear_dynamic(worker_panel)
 	worker_panel.hide()
+	unit_progression.clear()
 	city_panel.hide()
 	tabs.current_tab = TAB_UNIT
 	map.selected = Vector2i(cx, cy)
@@ -895,6 +937,7 @@ func _activate_unit(id: int) -> void:
 	if _input_locked():
 		return
 	_set_city_mode(false)
+	_set_bombard_mode(false)
 	city_panel.hide()
 	active_context = "unit"
 	unit_id = id
@@ -913,6 +956,7 @@ func _resolve_unit(id: int, generation: int) -> void:
 	_clear_dynamic(unit_actions)
 	_clear_dynamic(worker_panel)
 	worker_panel.hide()
+	unit_progression.clear()
 	var stamp := _unit_stamp()
 	var result: Dictionary = await execute("unitOptions", {"unitId": id})
 	if generation != selection_generation or not _unit_response_matches(result, stamp):
@@ -928,6 +972,7 @@ func _resolve_unit(id: int, generation: int) -> void:
 		founding_button.set_meta("allowed", result.data.canFound)
 		founding_button.tooltip_text = result.data.foundReason
 		_populate_worker(result.data.get("worker", {}), id)
+		unit_progression.populate(result.data.get("progression", {}), id)
 		for unit in client.snapshot.units:
 			if int(unit.id) == id:
 				details.text = "%s #%s · (%s, %s)\nHP %s/%s · 行动力 %s\n状态：%s · 待行动：%s · 本回合已攻击 %s 次" % [
@@ -943,7 +988,7 @@ func _resolve_unit(id: int, generation: int) -> void:
 				break
 	_on_busy(false)
 
-func _populate_worker(worker: Dictionary, _id: int) -> void:
+func _populate_worker(worker: Dictionary, id: int) -> void:
 	_clear_dynamic(worker_panel)
 	worker_options = []
 	worker_option = null
@@ -951,6 +996,10 @@ func _populate_worker(worker: Dictionary, _id: int) -> void:
 	worker_start = null
 	if worker.is_empty():
 		worker_panel.hide()
+		return
+	# 工作船：仅展示“立即创建并消耗单位”确认流程，不显示陆地工人的继续施工／修复／取消控件。
+	if str(worker.get("mode", "")) == "waterInstant":
+		_populate_workboat(worker, id)
 		return
 	worker_panel.show()
 	# 当前工程卡：supported=false 时保留状态与原因，不直接隐藏（非施工单位也走此分支，不按名称硬编码）。
@@ -1016,6 +1065,30 @@ func _populate_worker(worker: Dictionary, _id: int) -> void:
 		cancel_button.tooltip_text = str(cancel.get("reason", ""))
 	_on_busy(client.busy)
 
+# 工作船水上瞬建：当前格资源的即时改良，一次闭包完成并消耗单位；确认走共用单位动作确认框。
+func _populate_workboat(worker: Dictionary, id: int) -> void:
+	worker_panel.show()
+	var card := Label.new()
+	card.name = "WorkerCard"
+	card.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	worker_panel.add_child(card)
+	if not worker.get("enabled", false):
+		card.text = "工作船无法在当前地块创建改良：%s" % str(worker.get("reason", ""))
+		_on_busy(client.busy)
+		return
+	var lines := PackedStringArray()
+	lines.append("工作船 · 立即创建水上改良（消耗单位）")
+	lines.append("改良：%s" % _dash(worker.get("improvement")))
+	if worker.get("resource") != null:
+		lines.append("接通资源：%s" % str(worker.get("resource")))
+	lines.append("产出变化：%s" % _format_stats(worker.get("yieldDelta", {})))
+	lines.append("维护费：%s" % _format_stats(worker.get("maintenance", {})))
+	card.text = "\n".join(lines)
+	var confirm := button(worker_panel, "立即创建并消耗单位", unit_progression.request_workboat.bind(worker, id))
+	confirm.name = "ConfirmWorkboat"
+	confirm.set_meta("allowed", true)
+	_on_busy(client.busy)
+
 func _first_enabled_worker_option() -> int:
 	for index in range(worker_options.size()):
 		if worker_options[index].get("enabled", false):
@@ -1075,11 +1148,13 @@ func _activate_city(id: String) -> void:
 	_set_buy_tile_mode(false)
 	citizen_tile = {}
 	_set_city_mode(false)
+	_set_bombard_mode(false)
 	target.clear()
 	_clear_combat()
 	_clear_dynamic(unit_actions)
 	_clear_dynamic(worker_panel)
 	worker_panel.hide()
+	unit_progression.clear()
 	active_context = "city"
 	city_id = id
 	selection_generation += 1
@@ -1089,6 +1164,7 @@ func _activate_city(id: String) -> void:
 	await _resolve_city(id, selection_generation)
 
 func _resolve_city(id: String, generation: int) -> void:
+	city_read_generation += 1
 	var stamp := _state_stamp()
 	var result: Dictionary = await execute("cityOptions", {"cityId": id})
 	if generation != selection_generation or id != city_id or not _stamp_valid(stamp):
@@ -1132,6 +1208,14 @@ func _state_stamp() -> Dictionary:
 func _stamp_valid(stamp: Dictionary) -> bool:
 	return not stamp.is_empty() and stamp == _state_stamp() and _own_city_exists(city_id)
 
+# 城市轰击 stamp：在城市状态戳基础上加入城市读取代际与目标坐标；
+# 切换城市／模式／快照或任何写入推进 revision 后，旧预览与旧结果按此戳失效。
+func _bombard_stamp(target: Dictionary) -> Dictionary:
+	var stamp := _state_stamp()
+	stamp["readGeneration"] = city_read_generation
+	stamp["target"] = {"x": int(target.get("x", 0)), "y": int(target.get("y", 0))}
+	return stamp
+
 func _unit_stamp() -> Dictionary:
 	return {"session": client.session, "gameId": current_game, "revision": client.revision,
 		"loadEpoch": load_epoch, "selectionGeneration": selection_generation,
@@ -1144,7 +1228,7 @@ func _unit_response_matches(result: Dictionary, stamp: Dictionary) -> bool:
 	return _unit_stamp_valid(stamp) and result.get("ok", false) and str(result.get("session", "")) == str(stamp.session) and int(result.get("revision", -1)) == int(stamp.revision)
 
 func _input_locked() -> bool:
-	return client.busy or unit_transaction or unit_state_uncertain or panels.any(func(p): return p.busy_active())
+	return client.busy or unit_transaction or unit_state_uncertain or unit_progression.confirmation_visible() or panels.any(func(p): return p.busy_active())
 
 func _economy() -> Dictionary:
 	return city_data.get("economy", {})
@@ -1156,6 +1240,7 @@ func _set_buy_tile_mode(enabled: bool) -> void:
 	buy_tile_mode = enabled and not city_id.is_empty() and _stamp_valid(city_stamp)
 	if buy_tile_mode:
 		_set_city_mode(false)
+		_set_bombard_mode(false)
 	else:
 		buy_tile_target = {}
 	_clear_combat()
@@ -1191,12 +1276,19 @@ func _format_stats(stats) -> String:
 
 func _populate_city() -> void:
 	city_dev._populate_city()
+	city_combat_inst.populate_bombard()
 
 func _populate_citizen(editable: bool) -> void:
 	city_dev._populate_citizen(editable)
 
 func _set_city_mode(enabled: bool) -> void:
+	if enabled:
+		_set_bombard_mode(false)
 	city_dev._set_city_mode(enabled)
+
+# 城市轰击专用模式：与买地／人口地块管理互斥，具体高亮／预览／确认由 city_combat_inst 承担。
+func _set_bombard_mode(enabled: bool) -> void:
+	city_combat_inst.set_mode(enabled)
 
 func _production_selected_name() -> String:
 	return city_dev._production_selected_name()
@@ -1272,6 +1364,10 @@ func _unit_action(type: String) -> void:
 	await _unit_write("unitAction", {"unitId": unit_id, "type": type})
 
 func _preview_target(tile: Dictionary) -> void:
+	# 轰击模式：右键一律交给城市轰击面板（候选预览，非候选不回退为单位移动）。
+	if bombard_mode:
+		await city_combat_inst.preview_target(tile)
+		return
 	if city_mode or buy_tile_mode or _input_locked() or tabs.current_tab == TAB_DIPLOMACY:
 		return
 	if map.attack_targets.has(Vector2i(int(tile.x), int(tile.y))):

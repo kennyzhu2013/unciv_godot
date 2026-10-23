@@ -300,4 +300,92 @@ class WorkerCommandsTest {
         assertEquals(before, UncivFiles.gameInfoToString(game, false))
         assertTrue("预留标记必须保留", tileOf(game, DevelopmentFixtures.farm).isMarkedForCreatesOneImprovement("Farm"))
     }
+
+    // ===== 工作船创建水上资源改良（waterInstant 模式）=====
+    // 期望端只调用 UnitCityActionsFixtures.apply（原生 UnitActions 的 CreateImprovement 映射），网关端走 workerOrder。
+
+    private fun rejectOrder(session: GameSession, command: JsonObject, code: String) {
+        val game = session.game!!
+        val before = UncivFiles.gameInfoToString(game, false)
+        val revision = session.revision
+        val result = session.handle(command)
+        assertEquals(result.toString(), code, result["error"]!!.jsonObject.text("code"))
+        assertSame("拒绝不得触发回滚重建", game, session.game)
+        assertEquals(before, UncivFiles.gameInfoToString(game, false))
+        assertEquals(revision, session.revision)
+    }
+
+    private fun boatId(game: GameInfo) = game.currentPlayerCiv.units.getCivUnits().first { it.name == "Work Boats" }.id
+
+    @Test fun workboatCreatesWaterImprovementMatchingNative() {
+        val game = UnitCityActionsFixtures.workboat()
+        val session = BattleFixtures.load(UnitCityActionsFixtures.export(game, "diff-workboat"))
+        var expected = UnitCityActionsFixtures.copy(game)
+        val id = boatId(game)
+        // 只读 worker 查询不得改动状态或 revision，并暴露 waterInstant 立即建造语义。
+        val before = UncivFiles.gameInfoToString(session.game!!, false)
+        val revision = session.revision
+        val worker = run(session, "unitOptions", "unitId" to id)["data"]!!.jsonObject["worker"]!!.jsonObject
+        assertEquals(before, UncivFiles.gameInfoToString(session.game!!, false))
+        assertEquals(revision, session.revision)
+        assertEquals("waterInstant", worker.text("mode"))
+        assertTrue(worker.toString(), worker["enabled"]!!.jsonPrimitive.boolean)
+        assertTrue(worker["consumesUnit"]!!.jsonPrimitive.boolean)
+        assertEquals("Fishing Boats", worker.text("improvement"))
+        assertEquals("Fish", worker.text("resource"))
+        // 执行：改良落地、工作船消耗、资源接通，两端完整状态一致。
+        expected = UnitCityActionsFixtures.apply(expected, "createWaterImprovement", dto("unitId" to id, "name" to "Fishing Boats"))
+        run(session, "workerOrder", "unitId" to id, "type" to "createWaterImprovement", "name" to "Fishing Boats")
+        assertGameplayEquals("工作船改良", expected, session.game!!)
+        assertEquals("Fishing Boats", session.game!!.tileMap[HexCoord(1, -1)].improvement)
+        assertFalse("工作船应被消耗", session.game!!.currentPlayerCiv.units.getCivUnits().any { it.name == "Work Boats" })
+        // 保存重载与下一回合。
+        val saved = run(session, "save", "name" to "test-workboat").text("savedPath")
+        run(session, "load", "path" to saved)
+        assertGameplayEquals("工作船重载", UnitCityActionsFixtures.copy(expected), session.game!!)
+        expected = UnitCityActionsFixtures.apply(expected, "nextTurn")
+        run(session, "nextTurn")
+        assertGameplayEquals("工作船跨回合", expected, session.game!!)
+    }
+
+    @Test fun workboatRejectionsAndInvariants() {
+        // 己方领土内、无资源的海岸格：无可改良候选。
+        val noResource = NavalFixtures.game().also { g -> BattleFixtures.native(g) {
+            g.currentPlayerCiv.cities.first().expansion.takeOwnership(g.tileMap[HexCoord(1, -1)])
+            BattleFixtures.add(g, "Work Boats", 1, -1)
+            NavalFixtures.ready(g)
+        } }
+        val session = BattleFixtures.load(UnitCityActionsFixtures.export(noResource, "diff-workboat-empty"))
+        val id = boatId(noResource)
+        val worker = run(session, "unitOptions", "unitId" to id)["data"]!!.jsonObject["worker"]!!.jsonObject
+        assertEquals("waterInstant", worker.text("mode"))
+        assertFalse("无资源不能创建改良", worker["enabled"]!!.jsonPrimitive.boolean)
+        rejectOrder(session, request(session, "workerOrder", "unitId" to id, "type" to "createWaterImprovement", "name" to "Fishing Boats"), "CANNOT_IMPROVE")
+        // 非己方单位、未知类型、名称与原生候选不符、参数类型。
+        rejectOrder(session, request(session, "workerOrder", "unitId" to id + 999999, "type" to "createWaterImprovement", "name" to "Fishing Boats"), "NOT_OWNED")
+
+        // 带资源场景：错误名称与行动力耗尽。
+        val game = UnitCityActionsFixtures.workboat()
+        val rich = BattleFixtures.load(UnitCityActionsFixtures.export(game, "diff-workboat-reject"))
+        val richId = boatId(game)
+        rejectOrder(rich, request(rich, "workerOrder", "unitId" to richId, "type" to "createWaterImprovement", "name" to "Farm"), "INVALID_ARGUMENT")
+        rejectOrder(rich, JsonObject(request(rich, "workerOrder", "unitId" to richId, "type" to "createWaterImprovement", "name" to "Fishing Boats")
+            + ("revision" to JsonPrimitive(0))), "STALE_STATE")
+        val boat = NavalFixtures.unit(rich.game!!, richId)
+        boat.currentMovement = 0f
+        rejectOrder(rich, request(rich, "workerOrder", "unitId" to richId, "type" to "createWaterImprovement", "name" to "Fishing Boats"), "CANNOT_IMPROVE")
+        boat.currentMovement = boat.getMaxMovement().toFloat()
+        // 普通工人不能借水上改良命令越过既有施工边界。
+        val landWorker = DevelopmentFixtures.file("dev-water-overreach") { g -> DevelopmentFixtures.worker(g, DevelopmentFixtures.farm) }
+        val landSession = BattleFixtures.load(landWorker)
+        val workerUnit = workerOf(landSession.game!!)
+        rejectOrder(landSession, request(landSession, "workerOrder", "unitId" to workerUnit.id, "type" to "createWaterImprovement", "name" to "Fishing Boats"), "CANNOT_IMPROVE")
+        // 成功创建只执行一次；同 requestId 不同参数被拒。
+        val command = request(rich, "workerOrder", "unitId" to richId, "type" to "createWaterImprovement", "name" to "Fishing Boats")
+        val first = rich.handle(command)
+        assertTrue(first.toString(), first["ok"]!!.jsonPrimitive.boolean)
+        assertEquals(first, rich.handle(command))
+        val reused = rich.handle(JsonObject(command + ("name" to JsonPrimitive("Farm"))))
+        assertEquals("REQUEST_REUSED", reused["error"]!!.jsonObject.text("code"))
+    }
 }

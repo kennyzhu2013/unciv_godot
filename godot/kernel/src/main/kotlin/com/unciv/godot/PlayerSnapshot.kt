@@ -144,6 +144,7 @@ internal class PlayerSnapshot(private val game: GameInfo) {
             "actions" to combat.actions(unit), "attackTargets" to combat.attackTargets(unit),
             "combatSupported" to combat.combatReason(unit).isEmpty(), "combatReason" to combat.combatReason(unit),
             "worker" to WorkerCommands(game).workerDto(raw),
+            "progression" to UnitProgressionCommands(game).progressionDto(raw),
             "religion" to ReligionCommands(game).unitDto(raw),
             "canFound" to (founding?.action != null),
             "foundReason" to if (founding?.action != null) "" else "此单位不能在当前地块建城，或行动力不足",
@@ -153,7 +154,8 @@ internal class PlayerSnapshot(private val game: GameInfo) {
 
     /** 城市管理只读查询：人口、焦点、专家、工作地块与生产队列，全部复用原生状态与只读估算。 */
     fun cityOptions(city: CityView): JsonObject = JsonObject(CityDevelopmentCommands(game).cityDto(city) +
-            ("economy" to CityEconomyCommands(game).economyDto(city)))
+            ("economy" to CityEconomyCommands(game).economyDto(city)) +
+            ("bombard" to CityCombatCommands(game).bombardDto(city)))
 
     fun constructions(): List<IConstruction> = game.ruleset.units.values + game.ruleset.buildings.values
 }

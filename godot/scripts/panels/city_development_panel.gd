@@ -27,6 +27,8 @@ var production_button: Button
 var overview_scroll: ScrollContainer
 var population_scroll: ScrollContainer
 var queue_scroll: ScrollContainer
+# 概况子页容器：城市轰击面板挂在此页（main._build_city_tab 传入 city_combat.build）。
+var overview_page: VBoxContainer = null
 
 func build(city_page: VBoxContainer) -> void:
 	city_summary.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -47,6 +49,7 @@ func build(city_page: VBoxContainer) -> void:
 	# 概况子页：产出、粮食、增长／饥荒，来源明细可折叠。
 	var overview := sub_page("概况")
 	overview_scroll = overview.get_parent()
+	overview_page = overview
 	city_overview.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	overview.add_child(city_overview)
 	city_growth.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART

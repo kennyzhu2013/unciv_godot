@@ -96,6 +96,28 @@ class GatewayHttpTest {
         GameplayAssertions.assertGameplayEquals("HTTP 海战重载", NavalFixtures.copy(expected), session.game!!)
     }
 
+    @Test fun unitCityCommandsUseExistingHttpProtocolAndDeduplication() {
+        val initial = UnitCityActionsFixtures.promotion()
+        var expected = UnitCityActionsFixtures.copy(initial)
+        fun call(action: String, vararg params: Pair<String, Any?>): JsonObject {
+            val response = send(BattleFixtures.request(session, action, *params).toString())
+            assertEquals(200, response.statusCode())
+            return Json.parseToJsonElement(response.body()).jsonObject.also { assertTrue(it.toString(), it.boolean("ok")) }
+        }
+        call("load", "path" to UnitCityActionsFixtures.export(initial, "http").absolutePath)
+        val id = initial.currentPlayerCiv.units.getCivUnits().first { it.name == "Warrior" }.id
+        call("unitOptions", "unitId" to id)
+        expected = UnitCityActionsFixtures.apply(expected, "promote", dto("unitId" to id, "promotion" to "Shock I"))
+        val command = BattleFixtures.request(session, "unitPromote", "unitId" to id, "promotion" to "Shock I").toString()
+        val first = send(command)
+        assertTrue(Json.parseToJsonElement(first.body()).jsonObject.boolean("ok"))
+        assertEquals(first.body(), send(command).body())
+        GameplayAssertions.assertGameplayEquals("HTTP 晋升只执行一次", expected, session.game!!)
+        val saved = call("save", "name" to "unitcity-http").text("savedPath")
+        call("load", "path" to saved)
+        GameplayAssertions.assertGameplayEquals("HTTP 晋升重载", UnitCityActionsFixtures.copy(expected), session.game!!)
+    }
+
     @Test fun validHelloIsAccepted() {
         val response = send()
         assertEquals(response.body(), 200, response.statusCode())

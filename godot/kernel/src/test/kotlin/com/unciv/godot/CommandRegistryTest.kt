@@ -30,7 +30,7 @@ class CommandRegistryTest {
         val queries = catalog.filterValues { it is QueryCommand }.keys
         assertEquals(setOf(
             "victoryOptions", "eventOptions", "greatPersonOptions", "assetDecisionOptions", "diplomaticVoteOptions",
-            "religionOptions", "combatPreview", "diplomacyOptions", "unitOptions", "cityOptions", "path"),
+            "religionOptions", "combatPreview", "diplomacyOptions", "unitOptions", "cityOptions", "cityBombardPreview", "path"),
             queries)
 
         fun effect(name: String) = catalog[name] as EffectCommand
@@ -50,6 +50,13 @@ class CommandRegistryTest {
             assertFalse(effect(name).allowedDuringVictory)
         }
         assertFalse(catalog.keys.any { it.startsWith("naval") || it.startsWith("embark") })
+        // 单位成长、城市轰击与工人（含水上改良）复用同一 CURRENT／inPlace 事务与写后胜利门禁，不引入平行协议。
+        for (name in listOf("unitPromote", "unitUpgrade", "cityBombard", "workerOrder")) {
+            assertEquals(CandidateSource.CURRENT, effect(name).source)
+            assertTrue(effect(name).inPlace)
+            assertTrue(effect(name).checksVictory)
+            assertFalse(effect(name).allowedDuringVictory)
+        }
         assertEquals(setOf("load", "demo", "save", "diplomaticVoteAcknowledge", "victoryContinue"),
             catalog.filterValues { it is EffectCommand && it.allowedDuringVictory }.keys)
         assertEquals(setOf("save"), catalog.filterValues { it is EffectCommand && !it.checksVictory }.keys)

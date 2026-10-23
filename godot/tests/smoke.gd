@@ -58,6 +58,9 @@ var naval_steps := 0
 var embarkation_steps := 0
 var naval_expected: Dictionary = {}
 var naval_evidence: Array[Dictionary] = []
+var unitcity_steps := 0
+var unitcity_expected: Dictionary = {}
+var unitcity_evidence: Array[Dictionary] = []
 
 # 真实 HTTP 后丢弃响应／延迟只读响应，属于客户端边界故障注入。
 class NavalFaultClient extends "res://scripts/kernel_client.gd":
@@ -296,6 +299,8 @@ func run(frontend) -> void:
 		return
 	if not await verify_event_flow():
 		return
+	if not await verify_unitcity_flow():
+		return
 	await get_tree().process_frame
 	await get_tree().process_frame
 	var directory := ProjectSettings.globalize_path("res://.local")
@@ -306,9 +311,10 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation"],
+		"scenarios": ["hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat"],
 		"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
+		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence,
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -580,6 +586,558 @@ func verify_naval_flow() -> bool:
 				get_window().size = original
 				await settle()
 	steps.append("海军与登船：真实移动／海战／沿岸占城／继续胜利／堆叠选择及外观切换；完整原生差分、预览失效、重试恢复与三尺寸截图")
+	return true
+
+# —— 单位晋升／升级、城市轰击、工作船改良：真实窗口交互 + 完整原生差分（plan 第 4 步）——
+# 期望与独立原生 raw/normalized 状态由 :godot-kernel:test 生成的 unitcity-expected.json 提供；
+# 比较器校准（native_raw vs expected）与实际存档（actual vs expected）逐字段比较，沿用 naval 模式。
+func unitcity_scenario(name: String) -> Dictionary:
+	for scenario in unitcity_expected.scenarios:
+		if scenario.name == name:
+			return scenario
+	return {}
+
+func normalize_unitcity(value, key := ""):
+	if value is Dictionary:
+		var result := {}
+		for field in value:
+			result[field] = normalize_unitcity(value[field], str(field))
+			if key in unitcity_expected.mapOfSetFields and result[field] is Array:
+				result[field].sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	if value is Array:
+		var result: Array = value.map(func(item): return normalize_unitcity(item))
+		if key in unitcity_expected.setFields:
+			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+		return result
+	return value
+
+func unitcity_state(raw: String) -> Dictionary:
+	var state: Dictionary = JSON.parse_string(raw)
+	state.erase("currentTurnStartTime")
+	state.erase("checksum")
+	for civ in state.civilizations:
+		civ.erase("totalTurnTimeSeconds")
+	return normalize_unitcity(state)
+
+func unitcity_matches(name: String, step: String) -> bool:
+	if not await perform("save", {"name": run_id + "-unitcity-" + str(unitcity_steps)}):
+		return false
+	var zipped := Marshalls.base64_to_raw(FileAccess.get_file_as_string(app.last_saved_path).strip_edges())
+	var raw := zipped.decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_GZIP).get_string_from_utf8()
+	var scenario := unitcity_scenario(name)
+	var native_raw := FileAccess.get_file_as_string(scenario.rawStates[step])
+	var expected = normalize_unitcity(scenario.states[step])
+	var actual := unitcity_state(raw)
+	var evidence := {"scenario": name, "step": step, "savedPath": app.last_saved_path, "states": [], "matched": false}
+	unitcity_evidence.append(evidence)
+	for side in [["actual-raw", raw], ["native-raw", native_raw], ["actual-normalized", JSON.stringify(actual)], ["native-normalized", JSON.stringify(expected)]]:
+		var path: String = "res://.local/" + run_id + "-unitcity-" + str(unitcity_steps) + "-" + side[0] + ".json"
+		var file := FileAccess.open(path, FileAccess.WRITE)
+		file.store_string(side[1])
+		file.close()
+		evidence.states.append(ProjectSettings.globalize_path(path))
+	if not equal_persisted(unitcity_state(native_raw), expected, "单位城市比较器校准 " + step) or not equal_persisted(actual, expected, "单位城市完整原生存档 " + name + "/" + step):
+		return false
+	evidence.matched = true
+	unitcity_steps += 1
+	return true
+
+# 真实视口点击选中己方单位（堆叠时经单位下拉切换），并切到单位页。
+func unitcity_select(id: int) -> bool:
+	var units: Array = app.client.snapshot.units.filter(func(u): return int(u.id) == id and u.own)
+	if not check(units.size() == 1, "单位城市场景单位仍归己方"):
+		return false
+	var unit: Dictionary = units[0]
+	app.map.center_on(Vector2i(int(unit.x), int(unit.y)))
+	await settle()
+	if not await click_map(Vector2i(int(unit.x), int(unit.y))):
+		return false
+	if app.unit_id != id:
+		if not await click_option(app.unit_picker, app._picker_index_by_int(app.unit_picker, id)):
+			return false
+	return check(app.unit_id == id and app.tabs.current_tab == app.TAB_UNIT, "真实选择单位并切到单位页")
+
+# 真实视口点击选中己方城市中心（轰击 fixture 中心无己方单位），并切到城市页。
+func unitcity_select_city(city_id: String) -> bool:
+	var cities: Array = app.client.snapshot.cities.filter(func(c): return str(c.id) == city_id and c.own)
+	if not check(cities.size() == 1, "轰击城市仍归己方"):
+		return false
+	var city: Dictionary = cities[0]
+	var center := Vector2i(int(city.x), int(city.y))
+	app.map.center_on(center)
+	await settle()
+	if not await click_map(center):
+		return false
+	return check(app.city_id == city_id and app.active_context == "city" and app.tabs.current_tab == app.TAB_CITY, "真实选择己方城市并切到城市页")
+
+func promotion_index(promotion: String) -> int:
+	for index in range(app.unit_progression.promotions.size()):
+		if str(app.unit_progression.promotions[index].get("name")) == promotion:
+			return index
+	return -1
+
+func upgrade_index(target: String) -> int:
+	for index in range(app.unit_progression.upgrades.size()):
+		if str(app.unit_progression.upgrades[index].get("name")) == target:
+			return index
+	return -1
+
+# 单位动作确认对话框（晋升／升级／工作船共用）：复刻经济域真实窗口点击 OK/Cancel 与双击冻结落点。
+func click_unit_action_dialog(confirm: bool, twice := false) -> bool:
+	var dialog: ConfirmationDialog = app.unit_progression.confirmation
+	if not check(dialog != null and dialog.visible, "单位动作确认对话框可见"):
+		return false
+	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
+	await get_tree().process_frame
+	var pos := control.get_global_rect().get_center()
+	if not check(dialog.get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34,
+			"单位确认按钮在窗口内且达到最小高度"):
+		return false
+	await window_motion(dialog, pos)
+	if not check(dialog.gui_get_hovered_control() == control, "单位确认窗口鼠标命中按钮"):
+		return false
+	var click_viewport: Viewport = dialog
+	var click_pos := pos
+	while click_viewport is Window and click_viewport.is_embedded():
+		click_pos = Vector2(click_viewport.position) + click_viewport.get_final_transform() * click_pos
+		click_viewport = click_viewport.get_parent().get_viewport()
+	await window_mouse(click_viewport, MOUSE_BUTTON_LEFT, click_pos, false)
+	if twice:
+		await window_mouse(click_viewport, MOUSE_BUTTON_LEFT, click_pos, false, true)
+	await settle()
+	return check(not dialog.visible and app.unit_progression.payload.is_empty(), "单位确认关闭并清空载荷")
+
+# —— 四项动作的真实窗口驱动：选择 → 预览/选中 → 确认对话框 → 写入；cancel=true 走取消零写入 ——
+func unitcity_promote(params: Dictionary, cancel := false) -> bool:
+	var id := int(params.unitId)
+	var promotion := str(params.promotion)
+	if not await unitcity_select(id):
+		return false
+	var index := promotion_index(promotion)
+	if not check(index >= 0, "成长区含目标晋升候选：" + promotion):
+		return false
+	if not await click_option(app.unit_progression.promotion_picker, index):
+		return false
+	if not check(app.unit_progression.promotion_detail.text.contains("说明"), "晋升先选条目查看说明"):
+		return false
+	if not check(app.unit_progression.promote_button.get_meta("allowed", false) and not app.unit_progression.promote_button.disabled, "选中晋升后确认按钮可用"):
+		return false
+	var revision: int = app.client.revision
+	if not await click_control(app.unit_progression.promote_button):
+		return false
+	if not check(app.unit_progression.confirmation.visible, "晋升弹出单位动作确认"):
+		return false
+	if cancel:
+		if not await click_unit_action_dialog(false):
+			return false
+		return check(app.client.revision == revision and not app.unit_progression.confirmation.visible, "取消晋升零写入")
+	await screenshot("smoke-unitcity-promote-confirm.png")
+	if not await click_unit_action_dialog(true):
+		return false
+	return check(app.client.revision == revision + 1, "晋升写入仅一次")
+
+func unitcity_upgrade(params: Dictionary, twice := false, cancel := false) -> bool:
+	var id := int(params.unitId)
+	var target := str(params.targetUnit)
+	if not await unitcity_select(id):
+		return false
+	var index := upgrade_index(target)
+	if not check(index >= 0, "成长区含目标升级候选：" + target):
+		return false
+	if not await click_option(app.unit_progression.upgrade_picker, index):
+		return false
+	if not check(app.unit_progression.upgrade_detail.text.contains(target) and app.unit_progression.upgrade_detail.text.contains("金币价格") and app.unit_progression.upgrade_detail.text.contains("资源需求"), "升级确认展示目标兵种、原生金币价格与资源需求"):
+		return false
+	if not check(app.unit_progression.upgrade_button.get_meta("allowed", false) and not app.unit_progression.upgrade_button.disabled, "选中升级后确认按钮可用"):
+		return false
+	var revision: int = app.client.revision
+	if not await click_control(app.unit_progression.upgrade_button):
+		return false
+	if not check(app.unit_progression.confirmation.visible, "升级弹出单位动作确认"):
+		return false
+	if cancel:
+		if not await click_unit_action_dialog(false):
+			return false
+		return check(app.client.revision == revision, "取消升级零写入")
+	await screenshot("smoke-unitcity-upgrade-confirm.png")
+	# 双击确认最多一次写入；升级后按同 ID 重解析（不存在则清空）。
+	if not await click_unit_action_dialog(true, twice):
+		return false
+	return check(app.client.revision == revision + 1 and (app.unit_id == id or app.unit_id == -1), "升级双击最多一次写入")
+
+func unitcity_bombard(params: Dictionary, cancel := false) -> bool:
+	var city_id := str(params.cityId)
+	var target := Vector2i(int(params.x), int(params.y))
+	if not await unitcity_select_city(city_id):
+		return false
+	if not await click_tab(app.city_tabs, app.CTAB_OVERVIEW):
+		return false
+	if not check(app.city_combat_inst.panel.visible, "城市概况页显示轰击面板"):
+		return false
+	var mode_button = find_by_name(app.city_combat_inst.panel, "BombardMode")
+	if not check(mode_button != null and not mode_button.disabled, "轰击模式按钮可用"):
+		return false
+	if not await click_control(mode_button):
+		return false
+	if not check(app.bombard_mode and app.map.attack_targets.has(target), "进入轰击模式并仅高亮内核返回目标"):
+		return false
+	var revision: int = app.client.revision
+	if not await click_map(target, MOUSE_BUTTON_RIGHT):
+		return false
+	if not check(app.city_combat_inst.has_preview() and app.client.revision == revision, "右键候选预览轰击且零写入"):
+		return false
+	await screenshot("smoke-unitcity-bombard-preview.png")
+	if cancel:
+		await diplomacy_key(KEY_ESCAPE)
+		await settle()
+		return check(not app.city_combat_inst.has_preview() and app.client.revision == revision, "取消轰击预览零写入")
+	var confirm_button = find_by_name(app.city_combat_inst.panel, "ConfirmBombard")
+	if not check(confirm_button != null and not confirm_button.disabled, "确认轰击按钮可用"):
+		return false
+	if not await click_control(confirm_button, true):
+		return false
+	return check(app.client.revision == revision + 1 and not app.city_combat_inst.has_preview(), "城市轰击双击最多一次写入并清空预览")
+
+func unitcity_workboat(params: Dictionary, twice := false, cancel := false) -> bool:
+	var id := int(params.unitId)
+	var improvement := str(params.name)
+	if not await unitcity_select(id):
+		return false
+	if not check(app.worker_panel.visible, "工作船施工区可见"):
+		return false
+	var card = find_by_name(app.worker_panel, "WorkerCard")
+	if not check(card != null and card.text.contains(improvement) and card.text.contains("消耗单位"), "工作船卡展示立即创建并消耗单位"):
+		return false
+	# 工作船不显示陆地工人的继续施工／修复／取消控件。
+	if not check(find_by_name(app.worker_panel, "WorkerStart") == null and find_by_name(app.worker_panel, "WorkerCancel") == null and find_by_name(app.worker_panel, "WorkerRepair") == null, "工作船不显示陆地工人施工控件"):
+		return false
+	var confirm = find_by_name(app.worker_panel, "ConfirmWorkboat")
+	if not check(confirm != null and not confirm.disabled, "工作船确认按钮可用"):
+		return false
+	var revision: int = app.client.revision
+	if not await click_control(confirm):
+		return false
+	if not check(app.unit_progression.confirmation.visible, "工作船弹出单位动作确认"):
+		return false
+	if cancel:
+		if not await click_unit_action_dialog(false):
+			return false
+		return check(app.client.revision == revision and not unit_by_id(id).is_empty(), "取消工作船零写入且单位仍在")
+	await screenshot("smoke-unitcity-workboat-confirm.png")
+	# 双击确认最多一次；工作船消耗后清空单位面板但保留地块显示。
+	if not await click_unit_action_dialog(true, twice):
+		return false
+	return check(app.client.revision == revision + 1 and app.unit_id == -1 and not app.unit_progression.panel.visible, "工作船双击最多一次写入并消耗单位")
+
+# —— 预览／取消／旧 stamp／迟到响应／模式互斥（plan：每类取消零写入，升级与轰击覆盖旧 stamp 与迟到响应）——
+func verify_unitcity_previews() -> bool:
+	# 晋升：取消零写入 + 七字段旧 stamp 零写入。
+	var promotion := unitcity_scenario("promotion")
+	var promote_params: Dictionary = promotion.steps[0].params
+	if not await perform("load", {"path": promotion.fixture}):
+		return false
+	if not await unitcity_promote(promote_params, true):
+		return false
+	for key in ["session", "gameId", "revision", "loadEpoch", "selectionGeneration", "readGeneration", "unitId"]:
+		if not await unitcity_select(int(promote_params.unitId)):
+			return false
+		if not await click_option(app.unit_progression.promotion_picker, promotion_index(str(promote_params.promotion))):
+			return false
+		if not await click_control(app.unit_progression.promote_button):
+			return false
+		if not check(app.unit_progression.confirmation.visible, "晋升确认可见以测试旧 stamp"):
+			return false
+		var stamp: Dictionary = app.unit_progression.payload.stamp
+		if not check(stamp.has(key), "晋升确认载荷绑定 stamp 字段 " + key):
+			return false
+		var previous = stamp[key]
+		stamp[key] = int(previous) - 1 if previous is float or previous is int else "expired-" + str(previous)
+		var revision_before: int = app.client.revision
+		if not await click_unit_action_dialog(true):
+			return false
+		# 旧 stamp 下 confirm_unit_action 重验失败→重解析（只读）但不写入，revision 不变。
+		if not check(app.client.revision == revision_before, "旧 stamp 晋升确认零写入 " + key):
+			return false
+	# 升级：取消零写入 + 迟到 unitOptions 不回填成长区。
+	var upgrade := unitcity_scenario("upgrade")
+	var upgrade_params: Dictionary = upgrade.steps[0].params
+	if not await perform("load", {"path": upgrade.fixture}):
+		return false
+	if not await unitcity_upgrade(upgrade_params, false, true):
+		return false
+	var original_client = app.client
+	var late_unit := NavalFaultClient.new()
+	app.add_child(late_unit)
+	late_unit.delayed_action = "unitOptions"
+	swap_great_person_test_client(late_unit)
+	app._select_unit(int(upgrade_params.unitId))
+	var guard := 0
+	while not late_unit.captured and guard < 600:
+		guard += 1
+		await get_tree().process_frame
+	app.selection_generation += 1
+	late_unit.release_response = true
+	await settle()
+	var unit_ignored: bool = late_unit.captured and app.unit_progression.current_unit == -1
+	swap_great_person_test_client(original_client)
+	late_unit.queue_free()
+	if not check(unit_ignored, "迟到 unitOptions 不得回填成长区"):
+		return false
+	# 工作船：取消零写入且单位仍在。
+	var workboat := unitcity_scenario("workboat")
+	var workboat_params: Dictionary = workboat.steps[0].params
+	if not await perform("load", {"path": workboat.fixture}):
+		return false
+	if not await unitcity_workboat(workboat_params, false, true):
+		return false
+	# 轰击：取消预览零写入 + 非候选不回退 + 旧 stamp 零请求 + 迟到预览 + 子页互斥。
+	var bombard := unitcity_scenario("bombard")
+	var bombard_params: Dictionary = bombard.steps[0].params
+	var bombard_target := Vector2i(int(bombard_params.x), int(bombard_params.y))
+	if not await perform("load", {"path": bombard.fixture}):
+		return false
+	if not await unitcity_bombard(bombard_params, true):
+		return false
+	# 取消预览后仍在轰击模式；非候选（城市中心）右键仅提示，不发命令、不产生预览。
+	if not check(app.bombard_mode, "取消预览后仍处轰击模式"):
+		return false
+	var cities: Array = app.client.snapshot.cities.filter(func(c): return str(c.id) == str(bombard_params.cityId) and c.own)
+	var non_candidate := Vector2i(int(cities[0].x), int(cities[0].y))
+	var non_candidate_count: int = app.client.request_counter
+	if not await click_map(non_candidate, MOUSE_BUTTON_RIGHT):
+		return false
+	if not check(not app.city_combat_inst.has_preview() and app.client.request_counter == non_candidate_count and app.target.is_empty(), "非候选右键不回退为单位移动"):
+		return false
+	# 旧 stamp：重新预览后逐键篡改，确认轰击零请求零写入。
+	var confirm_button = find_by_name(app.city_combat_inst.panel, "ConfirmBombard")
+	for key in ["session", "gameId", "revision", "loadEpoch", "selectionGeneration", "readGeneration", "cityId"]:
+		if not await click_map(bombard_target, MOUSE_BUTTON_RIGHT):
+			return false
+		if not check(app.city_combat_inst.has_preview(), "轰击预览就绪以测试旧 stamp " + key):
+			return false
+		var b_stamp: Dictionary = app.city_combat_inst.bombard_stamp
+		if not check(b_stamp.has(key), "轰击 stamp 含字段 " + key):
+			return false
+		var b_previous = b_stamp[key]
+		b_stamp[key] = int(b_previous) - 1 if b_previous is float or b_previous is int else "expired-" + str(b_previous)
+		var b_count: int = app.client.request_counter
+		var b_revision: int = app.client.revision
+		if not await click_control(confirm_button):
+			return false
+		if not check(app.client.request_counter == b_count and app.client.revision == b_revision, "旧 stamp 轰击确认零请求零写入 " + key):
+			return false
+	# 迟到 cityBombardPreview：切换城市读取代际后旧预览不得回填。
+	if not await click_map(bombard_target, MOUSE_BUTTON_RIGHT):
+		return false
+	var original_bombard = app.client
+	var late_bombard := NavalFaultClient.new()
+	app.add_child(late_bombard)
+	late_bombard.delayed_action = "cityBombardPreview"
+	swap_great_person_test_client(late_bombard)
+	app.city_combat_inst.preview_target({"x": bombard_target.x, "y": bombard_target.y})
+	var bombard_guard := 0
+	while not late_bombard.captured and bombard_guard < 600:
+		bombard_guard += 1
+		await get_tree().process_frame
+	app.city_read_generation += 1
+	late_bombard.release_response = true
+	await settle()
+	var bombard_ignored: bool = late_bombard.captured and not app.city_combat_inst.has_preview()
+	swap_great_person_test_client(original_bombard)
+	late_bombard.queue_free()
+	if not check(bombard_ignored, "迟到轰击预览不得回填"):
+		return false
+	# 模式互斥：切换城市子页退出轰击并清空目标高亮；右键旧目标不串操作。
+	if not app.bombard_mode:
+		if not await click_map(bombard_target, MOUSE_BUTTON_RIGHT):
+			return false
+	var mode_button = find_by_name(app.city_combat_inst.panel, "BombardMode")
+	if not app.bombard_mode and mode_button != null and not mode_button.disabled:
+		if not await click_control(mode_button):
+			return false
+	if not check(app.bombard_mode and app.map.attack_targets.has(bombard_target), "轰击模式激活以测试子页互斥"):
+		return false
+	if not await click_tab(app.city_tabs, app.CTAB_POPULATION):
+		return false
+	if not check(not app.bombard_mode and app.map.attack_targets.is_empty(), "切换城市子页退出轰击并清空高亮"):
+		return false
+	var cross_count: int = app.client.request_counter
+	if not await click_map(bombard_target, MOUSE_BUTTON_RIGHT):
+		return false
+	if not check(not app.city_combat_inst.has_preview() and app.client.request_counter == cross_count, "退出轰击后右键旧目标不串操作"):
+		return false
+	return true
+
+# —— 客户端边界丢响应（升级与轰击）：同请求重试 / 快照恢复 / 恢复失败锁写。复用 NavalFaultClient 透传并记录。——
+func verify_unitcity_transport() -> bool:
+	var upgrade := unitcity_scenario("upgrade")
+	var up_params: Dictionary = upgrade.steps[0].params
+	for mode in ["retry", "recover", "snapshot"]:
+		if not await perform("load", {"path": upgrade.fixture}):
+			return false
+		if not await unitcity_select(int(up_params.unitId)):
+			return false
+		if not await click_option(app.unit_progression.upgrade_picker, upgrade_index(str(up_params.targetUnit))):
+			return false
+		if not await click_control(app.unit_progression.upgrade_button):
+			return false
+		if not check(app.unit_progression.confirmation.visible, "升级确认可见以注入传输故障"):
+			return false
+		var original = app.client
+		var revision: int = original.revision
+		var fault := NavalFaultClient.new()
+		app.add_child(fault)
+		fault.drop_action = "unitUpgrade"
+		fault.drop_writes = 1 if mode == "retry" else 2
+		fault.fail_snapshot = mode == "snapshot"
+		swap_great_person_test_client(fault)
+		if not await click_unit_action_dialog(true):
+			return false
+		await settle()
+		var writes: Array = fault.trace.filter(func(e): return e.request.action == "unitUpgrade")
+		var guarded: bool = app.unit_state_uncertain == (mode == "snapshot")
+		var path: String = "res://.local/" + run_id + "-unitcity-transport-upgrade-" + mode + ".json"
+		var file := FileAccess.open(path, FileAccess.WRITE)
+		file.store_string(JSON.stringify({"method": "客户端边界故障注入", "trace": fault.trace, "guarded": guarded}))
+		file.close()
+		unitcity_evidence.append({"fault": "upgrade/" + mode, "path": ProjectSettings.globalize_path(path)})
+		swap_great_person_test_client(original)
+		fault.queue_free()
+		if not check(guarded and writes.size() == 2 and writes[0].request == writes[1].request and writes[0].answer == writes[1].answer and writes[0].answer.ok, "升级同请求重试及不确定状态保护 " + mode):
+			return false
+		if app.unit_state_uncertain:
+			var blocked: Dictionary = await app.execute("nextTurn")
+			if not check(not blocked.get("ok", false) and str(blocked.get("error", {}).get("code")) == "STATE_UNCERTAIN", "升级恢复失败后玩法写入被锁"):
+				return false
+			if not await perform("snapshot"):
+				return false
+		if not check(original.revision == revision + 1 and not app.unit_state_uncertain, "升级恢复后仅一次写入"):
+			return false
+		if not await unitcity_matches("upgrade", str(upgrade.steps[0].step)):
+			return false
+	var bombard := unitcity_scenario("bombard")
+	var b_params: Dictionary = bombard.steps[0].params
+	var b_target := Vector2i(int(b_params.x), int(b_params.y))
+	for mode in ["retry", "recover", "snapshot"]:
+		if not await perform("load", {"path": bombard.fixture}):
+			return false
+		if not await unitcity_select_city(str(b_params.cityId)):
+			return false
+		if not await click_tab(app.city_tabs, app.CTAB_OVERVIEW):
+			return false
+		var mode_button = find_by_name(app.city_combat_inst.panel, "BombardMode")
+		if not await click_control(mode_button):
+			return false
+		if not await click_map(b_target, MOUSE_BUTTON_RIGHT):
+			return false
+		if not check(app.city_combat_inst.has_preview(), "轰击预览就绪以注入传输故障"):
+			return false
+		var confirm_button = find_by_name(app.city_combat_inst.panel, "ConfirmBombard")
+		var original = app.client
+		var revision: int = original.revision
+		var fault := NavalFaultClient.new()
+		app.add_child(fault)
+		fault.drop_action = "cityBombard"
+		fault.drop_writes = 1 if mode == "retry" else 2
+		fault.fail_snapshot = mode == "snapshot"
+		swap_great_person_test_client(fault)
+		if not await click_control(confirm_button):
+			return false
+		await settle()
+		var writes: Array = fault.trace.filter(func(e): return e.request.action == "cityBombard")
+		var guarded: bool = app.unit_state_uncertain == (mode == "snapshot")
+		var path: String = "res://.local/" + run_id + "-unitcity-transport-bombard-" + mode + ".json"
+		var file := FileAccess.open(path, FileAccess.WRITE)
+		file.store_string(JSON.stringify({"method": "客户端边界故障注入", "trace": fault.trace, "guarded": guarded}))
+		file.close()
+		unitcity_evidence.append({"fault": "bombard/" + mode, "path": ProjectSettings.globalize_path(path)})
+		swap_great_person_test_client(original)
+		fault.queue_free()
+		if not check(guarded and writes.size() == 2 and writes[0].request == writes[1].request and writes[0].answer == writes[1].answer and writes[0].answer.ok, "轰击同请求重试及不确定状态保护 " + mode):
+			return false
+		if app.unit_state_uncertain:
+			var blocked: Dictionary = await app.execute("nextTurn")
+			if not check(not blocked.get("ok", false) and str(blocked.get("error", {}).get("code")) == "STATE_UNCERTAIN", "轰击恢复失败后玩法写入被锁"):
+				return false
+			if not await perform("snapshot"):
+				return false
+		if not check(original.revision == revision + 1 and not app.unit_state_uncertain, "轰击恢复后仅一次写入"):
+			return false
+		if not await unitcity_matches("bombard", str(bombard.steps[0].step)):
+			return false
+	return true
+
+# 三尺寸（1024×720／1280×800／1600×900）检查面板可读、可滚动入视且回合入口不被裁切，并保存截图。
+func unitcity_check_sizes(tag: String, panel: Control, detail: Label) -> bool:
+	var original := get_window().size
+	for size in [Vector2i(1024, 720), Vector2i(1280, 800), Vector2i(1600, 900)]:
+		get_window().size = size
+		await settle()
+		scroll_into_view(panel)
+		await settle()
+		var label := "%dx%d" % [size.x, size.y]
+		if not check(panel.visible and panel.size.x > 0 and detail.text.length() > 0 and get_viewport().get_visible_rect().encloses(app.turn_button.get_global_rect()), "单位城市三尺寸可读可滚动布局 " + tag + " " + label):
+			get_window().size = original
+			return false
+		window_sizes_checked.append("unitcity-" + tag + "-" + label)
+		await screenshot("smoke-unitcity-" + tag + "-" + label + ".png")
+	get_window().size = original
+	await settle()
+	return true
+
+func verify_unitcity_sizes() -> bool:
+	var promotion := unitcity_scenario("promotion")
+	if not await perform("load", {"path": promotion.fixture}): return false
+	if not await unitcity_select(int(promotion.steps[0].params.unitId)): return false
+	if not await unitcity_check_sizes("promotion", app.unit_progression.panel, app.unit_progression.xp_label): return false
+	var upgrade := unitcity_scenario("upgrade")
+	if not await perform("load", {"path": upgrade.fixture}): return false
+	if not await unitcity_select(int(upgrade.steps[0].params.unitId)): return false
+	if not await unitcity_check_sizes("upgrade", app.unit_progression.panel, app.unit_progression.upgrade_detail): return false
+	var workboat := unitcity_scenario("workboat")
+	if not await perform("load", {"path": workboat.fixture}): return false
+	if not await unitcity_select(int(workboat.steps[0].params.unitId)): return false
+	var card = find_by_name(app.worker_panel, "WorkerCard")
+	if not check(card != null, "工作船卡存在以检查三尺寸"): return false
+	if not await unitcity_check_sizes("workboat", app.worker_panel, card): return false
+	var bombard := unitcity_scenario("bombard")
+	if not await perform("load", {"path": bombard.fixture}): return false
+	if not await unitcity_select_city(str(bombard.steps[0].params.cityId)): return false
+	if not await click_tab(app.city_tabs, app.CTAB_OVERVIEW): return false
+	if not await unitcity_check_sizes("bombard", app.city_combat_inst.panel, app.city_combat_inst.status_label): return false
+	return true
+
+func verify_unitcity_flow() -> bool:
+	var expected_file := "res://.local/tests/unitcity-expected.json"
+	if not check(FileAccess.file_exists(expected_file), "独立单位城市原生期望存在，请先运行 :godot-kernel:test"): return false
+	unitcity_expected = JSON.parse_string(FileAccess.get_file_as_string(expected_file))
+	if not check(unitcity_expected.scenarios.size() == 4, "单位城市期望含四场景"): return false
+	if not await verify_unitcity_previews(): return false
+	if not await verify_unitcity_transport(): return false
+	if not await verify_unitcity_sizes(): return false
+	for scenario in unitcity_expected.scenarios:
+		if not await perform("load", {"path": scenario.fixture}) or not await unitcity_matches(scenario.name, "initial"): return false
+		for order in scenario.steps:
+			unitcity_evidence.append({"order": order.duplicate(true), "scenario": scenario.name, "revision": app.client.revision, "turn": app.client.snapshot.turn})
+			var action := str(order.action)
+			var p: Dictionary = order.params
+			if action == "promote":
+				if not await unitcity_promote(p): return false
+			elif action == "upgrade":
+				if not await unitcity_upgrade(p, true): return false
+			elif action == "bombard":
+				if not await unitcity_bombard(p): return false
+			elif action == "createWaterImprovement":
+				if not await unitcity_workboat(p, true): return false
+			elif action == "reload":
+				if not await perform("load", {"path": app.last_saved_path}): return false
+			elif action == "nextTurn":
+				if not await click_control(app.turn_button): return false
+			else:
+				return check(false, "未接线单位城市窗口动作 " + action)
+			if not await unitcity_matches(scenario.name, str(order.step)): return false
+	steps.append("单位晋升／升级、城市轰击、工作船改良：真实窗口交互、完整原生差分、取消零写入、旧 stamp 与迟到响应、重试恢复及三尺寸截图")
 	return true
 
 func normalize_asset(value, key := ""):
@@ -3333,6 +3891,7 @@ func _fail(message: String) -> void:
 			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
 			"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
+			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,

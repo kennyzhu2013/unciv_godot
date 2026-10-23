@@ -87,7 +87,7 @@ class CityDevelopmentCommandsTest {
             dto("city" to CityDevelopmentCommands(nat.game).cityDto(cv),
                 "resources" to nat.game.currentPlayerCiv.getCivResourcesByName().toSortedMap().toString())
         }
-        val actual = dto("city" to JsonObject(cityDto(session, id) - "economy"),
+        val actual = dto("city" to JsonObject(cityDto(session, id) - "economy" - "bombard"),
             "resources" to session.game!!.currentPlayerCiv.getCivResourcesByName().toSortedMap().toString())
         assertEquals("$step 瞬态城市统计／资源供应／DTO 应一致", expected.toString(), actual.toString())
         assertNativeCityValues(session, nat, id, step)
