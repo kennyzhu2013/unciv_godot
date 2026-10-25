@@ -68,6 +68,8 @@ var unit_orders_checks
 var unit_orders_evidence: Array[Dictionary] = []
 var unit_abilities_checks
 var unit_abilities_evidence: Array[Dictionary] = []
+var presentation_checks
+var presentation_evidence: Array[Dictionary] = []
 
 # 真实 HTTP 后丢弃响应／延迟只读响应，属于客户端边界故障注入。
 class NavalFaultClient extends "res://scripts/kernel_client.gd":
@@ -302,6 +304,12 @@ func run(frontend) -> void:
 	if not await unit_abilities_checks.run(self):
 		return
 	print("Smoke 完成：unit-abilities")
+	print("Smoke 开始：presentation")
+	presentation_checks = load("res://tests/presentation_smoke.gd").new()
+	presentation_evidence = presentation_checks.evidence
+	if not await presentation_checks.run(self):
+		return
+	print("Smoke 完成：presentation")
 	# 保持原验证次序，逐场景输出进度，使超时或异常退出也能定位最后执行的领域。
 	for scenario in [
 		["settlement-promise", verify_promise_dialog],
@@ -335,10 +343,10 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["new-game", "save-browser", "autosave-resume", "empire-overview", "notifications", "research-info", "policy-info", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat", "unit-orders", "unit-abilities"],
+		"scenarios": ["new-game", "save-browser", "autosave-resume", "empire-overview", "notifications", "research-info", "policy-info", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat", "unit-orders", "unit-abilities", "presentation"],
 		"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence,
+		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "presentationEvidence": presentation_evidence,
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -3921,7 +3929,7 @@ func _fail(message: String) -> void:
 			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
 			"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence,
+			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "presentationEvidence": presentation_evidence,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,

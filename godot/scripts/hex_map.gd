@@ -29,6 +29,12 @@ var buy_tiles: Dictionary = {}
 var show_citizen_yields := true
 # 专用覆盖层：选中边框／血条／施工数字／人口覆盖绘制在单位贴图（z_index=3）之上。
 var overlay: Node2D
+# 相机补间（小地图跳转）：同一时刻仅保留一条，避免叠加抖动；纯表现，不影响命中/结算。
+var camera_tween: Tween = null
+# 攻击命中表现状态：{from, to, t} 由 Tween 驱动 t（0→1），_draw_overlay 读取绘制曳光/闪环；不触及单位节点。
+var attack_flash: Dictionary = {}
+# 攻击表现补间句柄：保留引用供 smoke 等待 finished（与帧率无关），同一时刻仅一条。
+var attack_tween: Tween = null
 # Unciv 六方向邻接（与 HexMath.clockPositionToHexcoordMap 一致）：(1,1)、(-1,-1) 而非 (1,-1)、(-1,1)。
 const HEX_NEIGHBORS := [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1), Vector2i(1, 1), Vector2i(-1, -1)]
 
@@ -95,12 +101,82 @@ func center_on_player() -> void:
 			return
 
 # 将给定地图坐标居中到视口；“定位”优先当前选中单位／城市，其次回退到玩家默认对象。
+# 保持瞬时（smoke 与顶栏“定位”依赖），仅在越界时夹取；居中在册地块时夹取恒为空操作。
 func center_on(coord: Vector2i) -> void:
 	position = viewport_size * 0.5 - hex_to_pixel(coord) * scale.x
+	clamp_position()
+
+# 平滑跳转：供小地图点击/拖拽使用，补间到夹取后的目标位置（约 0.3s ease-out）。
+# center_on 仍为瞬时，二者互不影响既有 smoke 的“居中后立即 click_map”链路。
+func center_on_smooth(coord: Vector2i) -> void:
+	var target := viewport_size * 0.5 - hex_to_pixel(coord) * scale.x
+	var saved := position
+	position = target
+	clamp_position()
+	target = position
+	position = saved
+	if camera_tween != null and camera_tween.is_valid():
+		camera_tween.kill()
+	camera_tween = create_tween()
+	camera_tween.set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_CUBIC)
+	camera_tween.tween_property(self, "position", target, 0.3)
+
+# 键盘/程序化平移：按屏幕像素位移并夹取；速率由调用方（main._process）随 delta 决定。
+func pan_by(delta: Vector2) -> void:
+	position += delta
+	clamp_position()
+	queue_redraw()
+
+# 地图世界像素包围盒：由在册地块 hex 像素极值外扩 RADIUS，供相机夹取与小地图换算共用。
+func map_bounds() -> Rect2:
+	if tiles.is_empty():
+		return Rect2(Vector2.ZERO, Vector2.ONE)
+	var minv := Vector2(INF, INF)
+	var maxv := Vector2(-INF, -INF)
+	for coord: Vector2i in tiles:
+		var p := hex_to_pixel(coord)
+		minv.x = minf(minv.x, p.x)
+		minv.y = minf(minv.y, p.y)
+		maxv.x = maxf(maxv.x, p.x)
+		maxv.y = maxf(maxv.y, p.y)
+	return Rect2(minv - Vector2.ONE * RADIUS, (maxv - minv) + Vector2.ONE * RADIUS * 2.0)
+
+# 相机夹取：保证地图包围盒在屏幕上始终覆盖至少 35% 视口，杜绝拖入纯空白。
+# 采用宽松的“保持相交”语义——小地图仍可在带内自由平移，不锁定为定点，
+# 从而兼容既有拖拽断言（24px 拖动必改变 position）；居中在册地块时恒不触发夹取。
+func clamp_position() -> void:
+	if tiles.is_empty() or viewport_size.x <= 0.0 or viewport_size.y <= 0.0:
+		return
+	var b := map_bounds()
+	var sx := scale.x
+	# 地图整体小于视口时直接居中，避免缩略图漂在角落；否则用宽松的“保持相交”语义——
+	# 地图仍可在带内自由平移，不锁定为定点，从而兼容既有拖拽断言（24px 拖动必改变 position）；
+	# 居中在册地块时恒不触发夹取。
+	if b.size.x * sx <= viewport_size.x:
+		position.x = (viewport_size.x - b.size.x * sx) * 0.5 - b.position.x * sx
+	else:
+		var mx := viewport_size.x * 0.35
+		var lo_x := mx - b.end.x * sx
+		var hi_x := viewport_size.x - mx - b.position.x * sx
+		position.x = clampf(position.x, minf(lo_x, hi_x), maxf(lo_x, hi_x))
+	if b.size.y * sx <= viewport_size.y:
+		position.y = (viewport_size.y - b.size.y * sx) * 0.5 - b.position.y * sx
+	else:
+		var my := viewport_size.y * 0.35
+		var lo_y := my - b.end.y * sx
+		var hi_y := viewport_size.y - my - b.position.y * sx
+		position.y = clampf(position.y, minf(lo_y, hi_y), maxf(lo_y, hi_y))
+
+# 当前视口可见的世界像素矩形：供小地图绘制视口框（screen = position + world * scale.x）。
+func viewport_world_rect() -> Rect2:
+	var tl := (Vector2.ZERO - position) / scale.x
+	var br := (viewport_size - position) / scale.x
+	return Rect2(tl, br - tl)
 
 func handle_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and event.button_mask & MOUSE_BUTTON_MASK_MIDDLE:
 		position += event.relative
+		clamp_position()
 	if not event is InputEventMouseButton or not event.pressed:
 		return
 	if event.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]:
@@ -108,6 +184,7 @@ func handle_input(event: InputEvent) -> void:
 		var factor := 1.12 if event.button_index == MOUSE_BUTTON_WHEEL_UP else 1.0 / 1.12
 		scale = Vector2.ONE * clampf(scale.x * factor, 0.35, 2.8)
 		position = event.position - local_point * scale.x
+		clamp_position()
 		queue_redraw()
 		return
 	var cell := pixel_to_hex((event.position - position) / scale.x)
@@ -288,11 +365,102 @@ func _draw_overlay(ov: Node2D) -> void:
 	for unit in snapshot.get("units", []):
 		var center := hex_to_pixel(Vector2i(int(unit.x), int(unit.y)))
 		_health_bar(ov, center + Vector2(-20 if unit.civilian else -2, 7), 24, float(unit.health), float(unit.get("maxHealth", 100)))
+	# 攻击曳光/命中闪环（表现层）：t∈[0,1] 驱动扩散与淡出；不移动单位节点，与命中链路无耦合。
+	if not attack_flash.is_empty():
+		var t: float = float(attack_flash.get("t", 0.0))
+		var a := 1.0 - t
+		var fc := hex_to_pixel(attack_flash["to"])
+		var ff := hex_to_pixel(attack_flash["from"])
+		ov.draw_line(ff, fc, Color(1.0, 0.92, 0.6, a * 0.85), 3.0 * a + 1.0)
+		ov.draw_arc(fc, RADIUS * (0.35 + 0.85 * t), 0, TAU, 24, Color(1.0, 0.8, 0.45, a), 4.0 * a + 1.0)
+		ov.draw_colored_polygon(_polygon(fc, RADIUS * 0.9), Color(1.0, 1.0, 1.0, a * 0.35))
 
 func _health_bar(ov: Node2D, at: Vector2, width: float, health: float, maximum: float) -> void:
 	ov.draw_rect(Rect2(at - Vector2.ONE, Vector2(width + 2, 6)), Color("18222c"))
 	var fraction := clampf(health / maxf(maximum, 1), 0, 1)
 	ov.draw_rect(Rect2(at, Vector2(width * fraction, 4)), Color("e86658") if fraction < 0.35 else Color("92d17a"))
+
+# 攻击表现：从攻击起点到目标画淡出曳光 + 目标处扩散环 + 白闪，由 Tween 驱动 attack_flash.t（0→1）；
+# 同时攻击方节点朝目标前冲再回弹、受击方节点 modulate 白闪。纯表现层，不改动命中或结算；
+# 快照更新（_update_units）会先终止这些补间并复位，避免与移动补间争抢节点位置。
+func flash_attack(from: Vector2i, to: Vector2i) -> void:
+	attack_flash = {"from": from, "to": to, "t": 0.0}
+	if attack_tween != null and attack_tween.is_valid():
+		attack_tween.kill()
+	attack_tween = create_tween()
+	attack_tween.tween_method(_set_flash_t, 0.0, 1.0, 0.35)
+	attack_tween.tween_callback(func(): attack_flash.clear())
+	_lunge_attacker(from, to)
+	_flash_defender(to)
+	if overlay:
+		overlay.queue_redraw()
+
+# 攻击方朝目标前冲再回弹（0.12s 出 + 0.18s 回），落点即原位置，不影响后续命中坐标。
+func _lunge_attacker(from: Vector2i, to: Vector2i) -> void:
+	var node: Node2D = _node_at(from, true)
+	if node == null:
+		return
+	_stop_node_effects(node)
+	var dir := hex_to_pixel(to) - hex_to_pixel(from)
+	if dir.length() < 0.001:
+		return
+	var base: Vector2 = node.position
+	var t: Tween = node.create_tween()
+	t.tween_property(node, "position", base + dir.normalized() * RADIUS * 0.45, 0.12).set_ease(Tween.EASE_OUT)
+	t.tween_property(node, "position", base, 0.18).set_ease(Tween.EASE_IN)
+	t.tween_callback(_clear_meta.bind(node, "lunge_tween"))
+	node.set_meta("lunge_base", base)
+	node.set_meta("lunge_tween", t)
+
+# 受击方 modulate 白闪（先提亮再回落），与攻击闪环同步；无他方单位时退回己方（如城市轰击）。
+func _flash_defender(to: Vector2i) -> void:
+	var node: Node2D = _node_at(to, false)
+	if node == null:
+		node = _node_at(to, true)
+	if node == null:
+		return
+	_stop_node_effects(node)
+	var t: Tween = node.create_tween()
+	t.tween_property(node, "modulate", Color(2.6, 2.6, 2.6, 1.0), 0.08)
+	t.tween_property(node, "modulate", Color(1, 1, 1, 1), 0.25)
+	t.tween_callback(_clear_meta.bind(node, "flash_tween"))
+	node.set_meta("flash_tween", t)
+
+# 取某格上指定阵营的单位节点（堆叠时取首个）；无则返回 null。
+func _node_at(coord: Vector2i, own: bool) -> Node2D:
+	for unit in snapshot.get("units", []):
+		if int(unit.x) == coord.x and int(unit.y) == coord.y and bool(unit.get("own", false)) == own:
+			var node = unit_nodes.get(int(unit.id))
+			if node != null and is_instance_valid(node):
+				return node
+	return null
+
+# 终止节点上的前冲/白闪补间并复位（前冲回到记录的原位），供快照更新与新一次闪动复用。
+func _stop_node_effects(node: Node2D) -> void:
+	if node.has_meta("lunge_tween"):
+		var lt: Tween = node.get_meta("lunge_tween")
+		if lt != null and lt.is_valid():
+			lt.kill()
+		node.remove_meta("lunge_tween")
+	if node.has_meta("lunge_base"):
+		node.position = node.get_meta("lunge_base")
+		node.remove_meta("lunge_base")
+	if node.has_meta("flash_tween"):
+		var ft: Tween = node.get_meta("flash_tween")
+		if ft != null and ft.is_valid():
+			ft.kill()
+		node.remove_meta("flash_tween")
+		node.modulate = Color(1, 1, 1, 1)
+
+func _clear_meta(node: Node, key: String) -> void:
+	if node.has_meta(key):
+		node.remove_meta(key)
+
+func _set_flash_t(v: float) -> void:
+	if attack_flash.has("t"):
+		attack_flash["t"] = v
+		if overlay:
+			overlay.queue_redraw()
 
 
 # 虚线折线：把每段按固定长度切分为短划，用于未来回合估算路线，区别于本回合实线。
@@ -426,7 +594,24 @@ func _update_units() -> void:
 				node.add_child(label)
 			add_child(node)
 			unit_nodes[id] = node
-		unit_nodes[id].position = hex_to_pixel(Vector2i(int(unit.x), int(unit.y))) + Vector2(-9 if unit.civilian else 9, -17)
+		var node_now: Node2D = unit_nodes[id]
+		# 快照更新优先于攻击表现：终止前冲/白闪补间并复位，避免与移动补间争抢节点位置。
+		_stop_node_effects(node_now)
+		var dest := hex_to_pixel(Vector2i(int(unit.x), int(unit.y))) + Vector2(-9 if unit.civilian else 9, -17)
+		if node_now.get_meta("placed", false) and not node_now.position.is_equal_approx(dest):
+			# 已存在单位换格：补间移动呈现连续行进（多回合推进逐格可见）；纯表现，不影响命中/结算。
+			# 首次换格尚无 move_tween 元数据；get_meta 的 nil 默认值会触发引擎报错，必须先 has_meta 判定。
+			if node_now.has_meta("move_tween"):
+				var mt: Tween = node_now.get_meta("move_tween")
+				if mt != null and mt.is_valid():
+					mt.kill()
+			var moving: Tween = node_now.create_tween()
+			moving.set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_QUAD)
+			moving.tween_property(node_now, "position", dest, 0.25)
+			node_now.set_meta("move_tween", moving)
+		else:
+			node_now.position = dest
+		node_now.set_meta("placed", true)
 	for id in unit_nodes.keys():
 		if not active.has(id):
 			unit_nodes[id].queue_free()

@@ -2,6 +2,8 @@ extends Control
 
 const ClientScript = preload("res://scripts/kernel_client.gd")
 const MapScript = preload("res://scripts/hex_map.gd")
+const MinimapScript = preload("res://scripts/minimap.gd")
+const SfxScript = preload("res://scripts/sfx.gd")
 const VotePanelScript = preload("res://scripts/panels/vote_panel.gd")
 const VictoryPanelScript = preload("res://scripts/panels/victory_panel.gd")
 const GreatPersonPanelScript = preload("res://scripts/panels/great_person_panel.gd")
@@ -26,6 +28,10 @@ var message := Label.new()
 var details := Label.new()
 var pending := Label.new()
 var map_area := Control.new()
+var minimap = MinimapScript.new()
+var sfx = SfxScript.new()
+var mute_button: Button
+var _last_pending_count := 0
 var unit_picker := OptionButton.new()
 var city_picker := OptionButton.new()
 var research_picker := OptionButton.new()
@@ -187,10 +193,21 @@ const ACTION_NAMES := {"skip": "跳过／取消跳过本回合", "fortify": "驻
 const CAPTURE_NAMES := {"annex": "吞并", "puppet": "傀儡", "raze": "焚城", "liberate": "解放"}
 # 候选生产分类展示顺序（对应内核 constructionType）：单位／建筑／持续／其他。
 const PRODUCTION_CATEGORIES := [["unit", "单位"], ["building", "建筑"], ["perpetual", "持续"], ["other", "其他"]]
+# 写命令 → 音效键（android/assets/sounds 下的 mp3 名）；只读查询不列入，保持静默。
+const ACTION_SOUNDS := {
+	"moveTo": "whoosh", "move": "whoosh", "unitOrder": "whoosh",
+	"unitAction": "fortify", "foundCity": "construction", "workerOrder": "construction",
+	"unitPromote": "promote", "unitUpgrade": "upgrade", "production": "construction",
+	"cityPurchase": "coin", "cityBuyTile": "coin",
+	"cityBombard": "bombard", "cityDecision": "click", "nextTurn": "swap",
+	"greatPersonChoose": "chimes", "unitAbility": "choir", "eventChoose": "paper",
+	"assetDecision": "paper", "victoryContinue": "chimes", "acknowledge": "paper",
+}
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if _execute_depth == 0 and is_instance_valid(victory_panel_inst.open_button):
 		victory_panel_inst.guide_if_needed()
+	_keyboard_pan(delta)
 
 func _victory_pending() -> bool:
 	return client.snapshot.get("victory", {}).get("requiresAcknowledgement", false)
@@ -228,6 +245,7 @@ func _ready() -> void:
 	theme.default_font = system_font
 	theme.default_font_size = 16
 	map.font = system_font
+	add_child(sfx)
 	_build_ui()
 	add_child(client)
 	client.snapshot_changed.connect(_apply_snapshot)
@@ -287,6 +305,8 @@ func _build_ui() -> void:
 		button(toolbar, "验证开局", _demo, false)
 	button(toolbar, "刷新", func(): await execute("snapshot"), false).set_meta("state_recovery", true)
 	button(toolbar, "定位", _locate, false)
+	button(toolbar, "小地图", _toggle_minimap, false)
+	mute_button = button(toolbar, "音效: 开", _toggle_mute, false)
 	var savebar := HBoxContainer.new()
 	layout.add_child(savebar)
 	save_name.text = "godot-save"
@@ -315,6 +335,8 @@ func _build_ui() -> void:
 	map_area.resized.connect(func(): map.viewport_size = map_area.size)
 	body.add_child(map_area)
 	map_area.add_child(map)
+	minimap.map = map
+	map_area.add_child(minimap)
 	_build_right_panel(body)
 	# 底部固定：反馈文本 + 待办摘要 + 结束回合入口（不再随右栏滚动到列表末端）。
 	var bottom := HBoxContainer.new()
@@ -538,6 +560,55 @@ func _locate() -> void:
 				return
 	map.center_on_player()
 
+# 小地图显隐切换（顶栏按钮）：仅切换可见性，隐藏时不消费地图点击。
+func _toggle_minimap() -> void:
+	minimap.visible = not minimap.visible
+
+# 键盘平移相机：方向键/WASD 按住持续平移，屏幕速率随缩放（世界速率恒定，穿越整图耗时不随 zoom 变化）；文本输入聚焦时让位。
+func _keyboard_pan(delta: float) -> void:
+	var focus := get_viewport().gui_get_focus_owner()
+	if focus is LineEdit or focus is TextEdit or focus is SpinBox:
+		return
+	var dir := Vector2.ZERO
+	if Input.is_key_pressed(KEY_LEFT) or Input.is_key_pressed(KEY_A):
+		dir.x += 1.0
+	if Input.is_key_pressed(KEY_RIGHT) or Input.is_key_pressed(KEY_D):
+		dir.x -= 1.0
+	if Input.is_key_pressed(KEY_UP) or Input.is_key_pressed(KEY_W):
+		dir.y += 1.0
+	if Input.is_key_pressed(KEY_DOWN) or Input.is_key_pressed(KEY_S):
+		dir.y -= 1.0
+	if dir == Vector2.ZERO:
+		return
+	map.pan_by(dir.normalized() * 620.0 * map.scale.x * delta)
+
+# UI 点击反馈：所有 button() 生成的按钮统一播放；静音或 headless 时自动 no-op。
+func _play_click() -> void:
+	sfx.play("click")
+
+# 写命令成功后的动作音效映射；只读查询不在表中，保持静默。
+func _play_action_sound(action: String) -> void:
+	var key: String = ACTION_SOUNDS.get(action, "")
+	if not key.is_empty():
+		sfx.play(key)
+
+# 音效静音切换（顶栏按钮）：内存级，不写存档。
+func _toggle_mute() -> void:
+	sfx.set_muted(not sfx.muted)
+	if mute_button != null:
+		mute_button.text = "音效: 关" if sfx.muted else "音效: 开"
+
+# 按攻击单位名称粗略选择战斗音效（火炮/远程/舰炮/近战），纯表现，不影响结算。
+func _attack_sound(unit_name: String) -> String:
+	var n := unit_name.to_lower()
+	if "cannon" in n or "artillery" in n or "catapult" in n or "ballista" in n or "trebuchet" in n:
+		return "cannon"
+	if "archer" in n or "bowman" in n:
+		return "arrow"
+	if "ship" in n or "battleship" in n or "carrier" in n or "submarine" in n or "frigate" in n or "trireme" in n or "galleass" in n or "privateer" in n or "ironclad" in n or "destroyer" in n or "cruiser" in n:
+		return "shipguns"
+	return "metalhit"
+
 func _demo() -> void:
 	await execute("demo")
 
@@ -587,6 +658,7 @@ func button(parent: Node, text: String, action: Callable, gameplay := true) -> B
 	result.set_meta("gameplay", gameplay)
 	result.text = text
 	result.custom_minimum_size.y = 34
+	result.pressed.connect(_play_click)
 	result.pressed.connect(action)
 	parent.add_child(result)
 	buttons.append(result)
@@ -702,6 +774,7 @@ func execute(action: String, params: Dictionary = {}, committing = null) -> Dict
 			unit_state_uncertain = false
 			_on_busy(client.busy)
 		message.text = "操作完成 · 状态版本 %s" % client.revision
+		_play_action_sound(action)
 		if result.get("savedPath"):
 			last_saved_path = result.savedPath
 			message.text = "已保存副本：" + last_saved_path
@@ -735,6 +808,9 @@ func _apply_snapshot(data: Dictionary) -> void:
 	top_status.text = "%s  /  第 %s 回合  /  金币 %s  /  科研 %s" % [data.nation, _num(data.turn, true), _num(data.gold, true), data.research if data.get("research") != null else "—"]
 	_rebuild_pickers(data)
 	_rebuild_pending(data)
+	if data.pending.size() > _last_pending_count:
+		sfx.play("notification1")
+	_last_pending_count = data.pending.size()
 	_on_busy(client.busy)
 
 func _rebuild_pickers(data: Dictionary) -> void:
@@ -1538,9 +1614,16 @@ func _commit_attack() -> void:
 	# Godot 将响应中的 JSON 数字读成 float；命令坐标必须重新转为整数。
 	var params := {"unitId": int(combat_preview.unitId),
 		"x": int(combat_preview.target.x), "y": int(combat_preview.target.y)}
+	# 攻击表现所需坐标须在 await 前捕获：写入成功会经 _apply_snapshot → _clear_combat 清空 combat_preview。
+	var af: Dictionary = combat_preview.get("attackFrom", {})
+	var flash_from := Vector2i(int(af.get("x", params.x)), int(af.get("y", params.y)))
+	var flash_to := Vector2i(int(params.x), int(params.y))
+	var attacker_name := str(combat_preview.get("attacker", {}).get("name", ""))
 	var before: Array = client.snapshot.get("units", []).duplicate(true)
 	var result := await _unit_write("attack", params)
 	if result.get("ok", false):
+		map.flash_attack(flash_from, flash_to)
+		sfx.play(_attack_sound(attacker_name))
 		var battle: Dictionary = result.battleResult
 		if battle.outcome == "movedOnly":
 			message.text = "仅完成移动或架设，当前未能攻击；已保留实际行动结果。"
