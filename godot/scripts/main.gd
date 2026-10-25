@@ -268,6 +268,10 @@ func _ready() -> void:
 	if not hello.get("ok", false):
 		return
 	message.text = "内核已连接。可创建新游戏、继续最近存档或导入原版单人存档。"
+	# 发布包自检入口：只验证“打包产物能否独立运行”，不依赖 tests/ 夹具。
+	if "--selftest" in OS.get_cmdline_user_args():
+		await load("res://tests/release_selftest.gd").new().run(self)
+		return
 	if "--smoke" in OS.get_cmdline_user_args():
 		var smoke = load("res://tests/smoke.gd").new()
 		add_child(smoke)

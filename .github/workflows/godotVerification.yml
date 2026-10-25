@@ -79,3 +79,60 @@ jobs:
             godot/.local/smoke-*.json
             godot/.local/smoke-*.log
             godot/.local/smoke-*.png
+
+  windows-package:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Install pinned Godot
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'godot.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'godot'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/godotengine/godot-builds/releases/download/4.6.2-stable/Godot_v4.6.2-stable_win64.exe.zip' -OutFile $zip
+          # 校验官方 SHA512-SUMS.txt 中的固定版本摘要。
+          $expected = '01c3bc0ede0f8771e810832fb92ce52a3a4352af7b7ac32a81a8edf05bb30760f56a6ab7e17cebc80b81c4f609a95c24c2fdbbe6929ac4e0285cb8f654b56d78'
+          if ((Get-FileHash $zip -Algorithm SHA512).Hash -ne $expected) { throw 'Godot checksum mismatch' }
+          Expand-Archive -Path $zip -DestinationPath $destination
+          "GODOT_BIN=$destination\Godot_v4.6.2-stable_win64.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Package and self-test release (PCK fallback)
+        run: |
+          # CI 不拉 1194 MB 导出模板，固定走 PCK 便携回退，再跑发布自检。
+          & .\godot\tools\package_windows.ps1 -SkipTemplates -Verify
+          exit $LASTEXITCODE
+      - name: Archive release directory
+        if: success()
+        run: Compress-Archive -Path .\godot\dist\* -DestinationPath .\godot\dist-unciv-godot-windows.zip -Force
+      - name: Upload packaging evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-windows-package-${{ github.sha }}
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            godot/.local/package-latest.json
+            godot/.local/package-verify.log
+            godot/.local/import.log
+            godot/.local/export-pack.log
+            godot/.local/export-pack.err.log
+            godot/dist/README.txt
+            godot/dist/logs/
+      - name: Upload zipped release
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unciv-godot-windows-dist-${{ github.sha }}
+          retention-days: 14
+          path: godot/dist-unciv-godot-windows.zip

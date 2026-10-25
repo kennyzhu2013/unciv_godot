@@ -10,6 +10,7 @@
     [int]$SmokeTimeoutSeconds = 1200
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'tools\common.ps1')
 $root = Split-Path $PSScriptRoot -Parent
 $local = Join-Path $PSScriptRoot '.local'
 $previousJava = $env:JAVA_HOME
@@ -36,11 +37,7 @@ $context = [ordered]@{
     javaVersion = $null
 }
 try {
-    if (-not $Godot) {
-        $installedGodot = Get-Command godot.exe, godot -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($installedGodot) { $Godot = $installedGodot.Source }
-        else { $Godot = 'D:\software\godot\Godot_v4.6.2-stable_win64.exe\Godot_v4.6.2-stable_win64.exe' }
-    }
+    $Godot = Resolve-GodotExecutable -Explicit $Godot
     if ($Smoke) {
         New-Item -ItemType Directory -Force $local | Out-Null
         $context.commit = (git -C $root rev-parse HEAD | Out-String).Trim()
@@ -49,19 +46,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Cannot identify working tree state.' }
         $context.dirty = $status.Count -gt 0
     }
-    if (-not $JavaHome) {
-        $installedJava = Get-Command java.exe -ErrorAction SilentlyContinue
-        if ($installedJava) { $JavaHome = Split-Path (Split-Path $installedJava.Source -Parent) -Parent }
-        else {
-            $candidate = Get-ChildItem "$env:USERPROFILE\.qoder\extensions\redhat.java-*\jre\*\bin\java.exe" -ErrorAction SilentlyContinue |
-                Sort-Object FullName -Descending | Select-Object -First 1
-            if ($candidate) { $JavaHome = Split-Path (Split-Path $candidate.FullName -Parent) -Parent }
-        }
-    }
-    if (-not $JavaHome -or -not (Test-Path "$JavaHome\bin\java.exe")) {
-        throw 'JDK 21+ required. Pass -JavaHome <JDK directory>.'
-    }
-    if (-not (Test-Path $Godot -PathType Leaf)) { throw "Godot executable not found: $Godot. Pass -Godot or set GODOT_BIN." }
+    $JavaHome = Resolve-JavaHome -Explicit $JavaHome
     if ($Headless -and -not $Smoke) { throw '-Headless requires -Smoke.' }
     $env:JAVA_HOME = $JavaHome
     if ($Smoke) {

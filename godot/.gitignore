@@ -1,4 +1,7 @@
 .godot/
 .local/
+# 临时排查日志（.local-check-*/ .local-pkg-*/ …），验证证据在 .local/ 下
+.local-*
+dist/
 kernel/build/
 kernel/bin/

@@ -3,6 +3,7 @@ extends Node2D
 signal tile_selected(tile: Dictionary)
 signal move_requested(tile: Dictionary)
 
+const AssetPaths = preload("res://scripts/asset_paths.gd")
 const RADIUS := 38.0
 const TERRAIN_COLORS := {"Grassland": Color("6e9b48"), "Plains": Color("b6a369"),
 	"Desert": Color("d6bd7c"), "Coast": Color("38798c"), "Ocean": Color("234d70"),
@@ -21,7 +22,8 @@ var future_route: Array = []
 var selected := Vector2i(99999, 99999)
 var viewport_size := Vector2(900, 670)
 var font: Font = ThemeDB.fallback_font
-var asset_root := ProjectSettings.globalize_path("res://../android/")
+# 素材根由 AssetPaths 解析：发布包读 exe 同目录 assets/，开发期读工程外 android/。
+var asset_root := AssetPaths.images_root()
 # 城市地块管理模式下的覆盖标记：键为坐标，值为 cityOptions.citizenTiles 中的一项。
 var citizen_tiles: Dictionary = {}
 var buy_tiles: Dictionary = {}
