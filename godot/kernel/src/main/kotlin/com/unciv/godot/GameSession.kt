@@ -50,6 +50,9 @@ internal class GameSession(root: File, private val saveDirectory: File =
         contributeCityCombat(this, this@GameSession)
         CityStateWire.contribute(this, this@GameSession)
         DiplomacyWire.contribute(this, this@GameSession)
+        EmpireInformation.contribute(this, this@GameSession)
+        contributeUnitOrders(this, this@GameSession)
+        contributeUnitAbilities(this, this@GameSession)
         registerCore(this)
     }.build()
 
@@ -155,7 +158,7 @@ internal class GameSession(root: File, private val saveDirectory: File =
     }
 
     /**
-     * 仍留在会话内的命令：移动、建城、生产／科研／政策、存读档与回合推进。
+     * 仍留在会话内的命令：移动、建城、生产、存读档与回合推进。
      * 它们要调用本类的私有查找与存档助手，所以不拆到领域文件；每个名字仍然只登记一次。
      */
     private fun registerCore(registry: CommandRegistry) {
@@ -221,22 +224,6 @@ internal class GameSession(root: File, private val saveDirectory: File =
             city.tryReassignPopulation()
             city.updateCityStats()
         })
-        registry.effect("research", executeFn = { ctx, _ ->
-            val civ = ctx.candidate.currentPlayerCiv
-            val name = ctx.request.text("name")
-            ensure(ctx.candidate.ruleset.technologies.containsKey(name) && civ.tech.canBeResearched(name),
-                "CANNOT_RESEARCH", "当前不能研究该科技")
-            if (civ.tech.freeTechs > 0) civ.tech.getFreeTechnology(name)
-            else civ.tech.techsToResearch = arrayListOf(name)
-        })
-        registry.effect("policy", executeFn = { ctx, _ ->
-            val civ = ctx.candidate.currentPlayerCiv
-            val policy = ctx.candidate.ruleset.policies[ctx.request.text("name")]
-                ?: throw GatewayError("POLICY", "未知政策")
-            ensure(civ.policies.canAdoptPolicy() && civ.policies.isAdoptable(policy), "CANNOT_ADOPT", "当前不能采用此政策")
-            civ.policies.adopt(policy)
-        })
-        registry.effect("deferPolicy", executeFn = { ctx, _ -> ctx.snapshot.view.civView.tryDismissPolicyPicker() })
         registry.effect("declineTrade", executeFn = { ctx, _ ->
             val civ = ctx.candidate.currentPlayerCiv
             // 与 TradePopup 的“Not this time.”一致；接受与还价需要完整交易界面，首版只接入拒绝。

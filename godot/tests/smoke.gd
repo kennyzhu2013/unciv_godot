@@ -62,6 +62,12 @@ var unitcity_steps := 0
 var unitcity_expected: Dictionary = {}
 var unitcity_evidence: Array[Dictionary] = []
 var lifecycle_evidence: Array[Dictionary] = []
+var information_checks
+var information_evidence: Array[Dictionary] = []
+var unit_orders_checks
+var unit_orders_evidence: Array[Dictionary] = []
+var unit_abilities_checks
+var unit_abilities_evidence: Array[Dictionary] = []
 
 # 真实 HTTP 后丢弃响应／延迟只读响应，属于客户端边界故障注入。
 class NavalFaultClient extends "res://scripts/kernel_client.gd":
@@ -210,6 +216,12 @@ func run(frontend) -> void:
 	if not await lifecycle.run(self):
 		return
 	print("Smoke 完成：game-lifecycle")
+	print("Smoke 开始：empire-information")
+	information_checks = load("res://tests/empire_information_smoke.gd").new()
+	information_evidence = information_checks.evidence
+	if not await information_checks.run(self):
+		return
+	print("Smoke 完成：empire-information")
 	if not await perform("demo"):
 		return
 	await get_tree().process_frame
@@ -278,6 +290,18 @@ func run(frontend) -> void:
 		if not check(before[key] == after[key], "重载一致性：" + key):
 			return
 	steps.append("原格式保存与重载，关键状态一致")
+	print("Smoke 开始：unit-orders")
+	unit_orders_checks = load("res://tests/unit_orders_smoke.gd").new()
+	unit_orders_evidence = unit_orders_checks.evidence
+	if not await unit_orders_checks.run(self):
+		return
+	print("Smoke 完成：unit-orders")
+	print("Smoke 开始：unit-abilities")
+	unit_abilities_checks = load("res://tests/unit_abilities_smoke.gd").new()
+	unit_abilities_evidence = unit_abilities_checks.evidence
+	if not await unit_abilities_checks.run(self):
+		return
+	print("Smoke 完成：unit-abilities")
 	# 保持原验证次序，逐场景输出进度，使超时或异常退出也能定位最后执行的领域。
 	for scenario in [
 		["settlement-promise", verify_promise_dialog],
@@ -311,10 +335,10 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["new-game", "save-browser", "autosave-resume", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat"],
+		"scenarios": ["new-game", "save-browser", "autosave-resume", "empire-overview", "notifications", "research-info", "policy-info", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat", "unit-orders", "unit-abilities"],
 		"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence,
+		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence,
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -453,7 +477,8 @@ func verify_naval_previews() -> bool:
 		var original = app.client
 		var fault := NavalFaultClient.new()
 		app.add_child(fault)
-		fault.delayed_action = "path" if action == "move" else "combatPreview"
+		# 预览走只读查询：move 流程的迟到注入须匹配前端实际发出的 unitRoute（原 path）。
+		fault.delayed_action = "unitRoute" if action == "move" else "combatPreview"
 		swap_great_person_test_client(fault)
 		if action == "move":
 			app._preview_move(order.params)
@@ -493,14 +518,15 @@ func verify_naval_transport() -> bool:
 			var revision: int = original.revision
 			var fault := NavalFaultClient.new()
 			app.add_child(fault)
-			fault.drop_action = action
+			# 提交走写命令：move 流程前端实际发出 moveTo（原 move），丢响应注入须匹配该写命令。
+			fault.drop_action = "moveTo" if action == "move" else action
 			fault.drop_writes = 1 if mode == "retry" else 2
 			fault.fail_snapshot = mode == "snapshot"
 			swap_great_person_test_client(fault)
 			if not await click_control(app.move_button if action == "move" else app.attack_button):
 				return false
 			await settle()
-			var writes: Array = fault.trace.filter(func(e): return e.request.action == action)
+			var writes: Array = fault.trace.filter(func(e): return e.request.action == ("moveTo" if action == "move" else action))
 			var guarded: bool = app.target.is_empty() and app.combat_preview.is_empty() and app.move_button.disabled and app.attack_button.disabled and app.unit_state_uncertain == (mode == "snapshot")
 			var path: String = "res://.local/" + run_id + "-naval-transport-" + action + "-" + mode + ".json"
 			var file := FileAccess.open(path, FileAccess.WRITE)
@@ -1920,6 +1946,10 @@ func verify_great_person_flow() -> bool:
 					return false
 			var adopt: Array = app.buttons.filter(func(b): return b.text == "采用政策")
 			if not await click_control(adopt[0]):
+				return false
+			if not check(app.information.selected.get("name") == "Meritocracy", "政策快捷入口预选 Meritocracy"):
+				return false
+			if not await information_checks.click_window(app.information.commit_button):
 				return false
 		elif not await click_control(app.turn_button):
 			return false
@@ -3891,7 +3921,7 @@ func _fail(message: String) -> void:
 			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
 			"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence,
+			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,

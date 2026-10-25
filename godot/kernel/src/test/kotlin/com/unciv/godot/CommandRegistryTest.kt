@@ -30,7 +30,8 @@ class CommandRegistryTest {
         val queries = catalog.filterValues { it is QueryCommand }.keys
         assertEquals(setOf(
             "victoryOptions", "eventOptions", "greatPersonOptions", "assetDecisionOptions", "diplomaticVoteOptions",
-            "religionOptions", "combatPreview", "diplomacyOptions", "unitOptions", "cityOptions", "cityBombardPreview", "path", "newGameOptions", "listSaves"),
+            "religionOptions", "combatPreview", "diplomacyOptions", "unitOptions", "cityOptions", "cityBombardPreview", "path", "unitRoute", "unitAbilityOptions", "newGameOptions", "listSaves",
+            "empireOverview", "notificationOptions", "researchOptions", "policyOptions"),
             queries)
 
         fun effect(name: String) = catalog[name] as EffectCommand
@@ -50,8 +51,8 @@ class CommandRegistryTest {
             assertFalse(effect(name).allowedDuringVictory)
         }
         assertFalse(catalog.keys.any { it.startsWith("naval") || it.startsWith("embark") })
-        // 单位成长、城市轰击与工人（含水上改良）复用同一 CURRENT／inPlace 事务与写后胜利门禁，不引入平行协议。
-        for (name in listOf("unitPromote", "unitUpgrade", "cityBombard", "workerOrder")) {
+        // 单位成长、城市轰击、工人与多回合移动指令复用同一 CURRENT／inPlace 事务与写后胜利门禁，不引入平行协议。
+        for (name in listOf("unitPromote", "unitUpgrade", "cityBombard", "workerOrder", "moveTo", "unitOrder", "unitAbility")) {
             assertEquals(CandidateSource.CURRENT, effect(name).source)
             assertTrue(effect(name).inPlace)
             assertTrue(effect(name).checksVictory)

@@ -16,6 +16,8 @@ var reachable: Dictionary = {}
 var attack_targets: Dictionary = {}
 var attack_from: Dictionary = {}
 var route: Array = []
+# 后续回合落点（原生估算）：与本回合实线路线 route 区分绘制，仅用于预览。
+var future_route: Array = []
 var selected := Vector2i(99999, 99999)
 var viewport_size := Vector2(900, 670)
 var font: Font = ThemeDB.fallback_font
@@ -74,6 +76,7 @@ func set_snapshot(data: Dictionary, focus := false) -> void:
 	attack_targets.clear()
 	attack_from.clear()
 	route.clear()
+	future_route.clear()
 	citizen_tiles.clear()
 	buy_tiles.clear()
 	_update_units()
@@ -257,6 +260,20 @@ func _draw_overlay(ov: Node2D) -> void:
 		for point in route:
 			points.append(hex_to_pixel(Vector2i(int(point.x), int(point.y))))
 		ov.draw_polyline(points, Color("fff0ad"), 4)
+	# 未来回合落点（原生估算）：蓝色虚线 + 每回合端点空心圈，与本回合黄色实线路线区分。
+	if not future_route.is_empty():
+		var future_points := PackedVector2Array()
+		if not route.is_empty():
+			var last: Dictionary = route[route.size() - 1]
+			future_points.append(hex_to_pixel(Vector2i(int(last.x), int(last.y))))
+		for point in future_route:
+			future_points.append(hex_to_pixel(Vector2i(int(point.x), int(point.y))))
+		_draw_dashed(ov, future_points, Color("7fc4ff", 0.9), 2.5)
+		for i in range(future_points.size()):
+			# 起点即本回合落点，已由实线标示，不重复画圈。
+			if not route.is_empty() and i == 0:
+				continue
+			ov.draw_arc(future_points[i], 6.0, 0, TAU, 12, Color("bfe0ff", 0.95), 2.0)
 	# 选中边框。
 	if tiles.has(selected):
 		var points := _polygon(hex_to_pixel(selected), RADIUS - 2)
@@ -276,6 +293,25 @@ func _health_bar(ov: Node2D, at: Vector2, width: float, health: float, maximum: 
 	ov.draw_rect(Rect2(at - Vector2.ONE, Vector2(width + 2, 6)), Color("18222c"))
 	var fraction := clampf(health / maxf(maximum, 1), 0, 1)
 	ov.draw_rect(Rect2(at, Vector2(width * fraction, 4)), Color("e86658") if fraction < 0.35 else Color("92d17a"))
+
+
+# 虚线折线：把每段按固定长度切分为短划，用于未来回合估算路线，区别于本回合实线。
+func _draw_dashed(ov: Node2D, points: PackedVector2Array, color: Color, width: float, dash := 10.0, gap := 8.0) -> void:
+	for i in range(points.size() - 1):
+		var from := points[i]
+		var to := points[i + 1]
+		var total := from.distance_to(to)
+		if total <= 0.0:
+			continue
+		var direction := (to - from) / total
+		var cursor := 0.0
+		var drawing := true
+		while cursor < total:
+			var length := minf(dash if drawing else gap, total - cursor)
+			if drawing:
+				ov.draw_line(from + direction * cursor, from + direction * (cursor + length), color, width)
+			cursor += length
+			drawing = not drawing
 
 
 # 简易道路／铁路：仅连接相邻且同有道路的地块中心到中点，不引入美术资源。

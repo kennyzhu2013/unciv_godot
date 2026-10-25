@@ -73,6 +73,7 @@ internal class PlayerSnapshot(private val game: GameInfo) {
                     "embarked" to unit.isEmbarked(),
                     "movement" to if (own) unit.currentMovement else null,
                     "action" to if (own) unit.getUnit().action else null,
+                    "automated" to if (own) unit.getUnit().automated else null,
                     "due" to if (own) unit.getUnit().due else null,
                     "attacksThisTurn" to if (own) unit.attacksThisTurn else null,
                     "maxHealth" to unit.asCombatant().getMaxHealth(),
@@ -146,6 +147,7 @@ internal class PlayerSnapshot(private val game: GameInfo) {
             "worker" to WorkerCommands(game).workerDto(raw),
             "progression" to UnitProgressionCommands(game).progressionDto(raw),
             "religion" to ReligionCommands(game).unitDto(raw),
+            "abilities" to UnitAbilityCommands(game).summaryDto(raw),
             "canFound" to (founding?.action != null),
             "foundReason" to if (founding?.action != null) "" else "此单位不能在当前地块建城，或行动力不足",
             "reachable" to if (!unit.hasMovement() || unit.cannotMove() || unit.isAirUnit() || unit.isNuclearWeapon() || unit.isPreparingParadrop()) emptyList<JsonObject>()

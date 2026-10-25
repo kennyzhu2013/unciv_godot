@@ -14,6 +14,9 @@ const CityDevelopmentPanelScript = preload("res://scripts/panels/city_developmen
 const UnitProgressionPanelScript = preload("res://scripts/panels/unit_progression_panel.gd")
 const CityCombatPanelScript = preload("res://scripts/panels/city_combat_panel.gd")
 const GameSetupPanelScript = preload("res://scripts/panels/game_setup_panel.gd")
+const EmpireInformationScript = preload("res://scripts/panels/empire_information_panel.gd")
+const UnitAbilitiesPanelScript = preload("res://scripts/panels/unit_abilities_panel.gd")
+var information = EmpireInformationScript.new()
 var game_setup = GameSetupPanelScript.new()
 var autosave_status := Label.new()
 var client = ClientScript.new()
@@ -40,6 +43,13 @@ var buttons: Array[Button] = []
 var panels: Array = []
 var founding_button: Button
 var move_button: Button
+# 停止移动：仅当选中单位处于原生 moveTo 指令中时启用（见 _resolve_unit）。
+var stop_move_button: Button
+# 持续指令（T3.2）：自动探索／自动工人的启停按钮，可见性与可用性由 _resolve_unit 依快照 action/automated 派生。
+var explore_button: Button
+var stop_explore_button: Button
+var automate_button: Button
+var stop_automate_button: Button
 var turn_button: Button
 var confirmation := ConfirmationDialog.new()
 var unit_actions := VBoxContainer.new()
@@ -161,6 +171,9 @@ var diplomacy_panel_inst = DiplomacyPanelScript.new()
 var religion_panel_inst = ReligionPanelScript.new()
 # 免费伟人事务域已迁移至 panels/great_person_panel.gd（TransactionController 子类）；main 仅持有实例引用。
 var great_person_panel_inst = GreatPersonPanelScript.new()
+# 单位主动能力事务域（T3.3：传教／清异教／伟人能力）已迁移至 panels/unit_abilities_panel.gd；
+# 挂单位页，绑定当前选中单位（_resolve_unit 经 set_context 推入 unitId 与 abilities 摘要），登记进 panels。
+var unit_abilities_panel_inst = UnitAbilitiesPanelScript.new()
 # 外交投票事务域已迁移至 panels/vote_panel.gd（TransactionController 子类）；main 仅持有实例引用。
 var vote_panel_inst = VotePanelScript.new()
 var victory_panel_inst = VictoryPanelScript.new()
@@ -185,12 +198,16 @@ func _victory_pending() -> bool:
 func _ready() -> void:
 	game_setup.orchestrator = self
 	panels.append(game_setup)
+	information.orchestrator = self
+	panels.append(information)
 	victory_panel_inst.orchestrator = self
 	panels.append(victory_panel_inst)
 	vote_panel_inst.orchestrator = self
 	panels.append(vote_panel_inst)
 	great_person_panel_inst.orchestrator = self
 	panels.append(great_person_panel_inst)
+	unit_abilities_panel_inst.orchestrator = self
+	panels.append(unit_abilities_panel_inst)
 	event_panel_inst.orchestrator = self
 	panels.append(event_panel_inst)
 	religion_panel_inst.orchestrator = self
@@ -220,11 +237,13 @@ func _ready() -> void:
 	client.state_invalidated.connect(diplomacy_panel_inst.invalidate)
 	client.state_invalidated.connect(religion_panel_inst.invalidate)
 	client.state_invalidated.connect(great_person_panel_inst.invalidate)
+	client.state_invalidated.connect(unit_abilities_panel_inst.invalidate)
 	client.state_invalidated.connect(vote_panel_inst.invalidate)
 	client.state_invalidated.connect(victory_panel_inst.invalidate)
 	client.state_invalidated.connect(asset_panel_inst.invalidate)
 	client.state_invalidated.connect(city_combat_inst.invalidate)
 	client.state_invalidated.connect(unit_progression.cancel)
+	client.state_invalidated.connect(information.invalidate)
 	map.tile_selected.connect(_select_tile)
 	map.move_requested.connect(_preview_target)
 	var hello: Dictionary = await execute("hello")
@@ -276,6 +295,7 @@ func _build_ui() -> void:
 	savebar.add_child(save_name)
 	button(savebar, "保存副本", _save, false)
 	button(savebar, "重载副本", _reload, false)
+	information.build(savebar)
 	autosave_status.text = "自动存档：新局、读档与回合开始（每局 5 槽）"
 	autosave_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	autosave_status.clip_text = true
@@ -373,8 +393,28 @@ func _build_unit_tab() -> void:
 			await _activate_unit(int(unit_picker.get_item_metadata(index))))
 	move_button = button(page, "确认移动", _commit_move)
 	move_button.name = "ConfirmMove"
+	stop_move_button = button(page, "停止移动", _stop_movement)
+	stop_move_button.name = "StopMove"
+	# 默认禁用：仅当选中单位处于原生移动指令中时由 _resolve_unit 置为可用。
+	stop_move_button.set_meta("allowed", false)
+	# 持续指令按钮：默认隐藏且禁用，_resolve_unit 依单位类型与原生状态显隐并置可用性；均经 unitOrder 写命令。
+	explore_button = button(page, "自动探索", _unit_order.bind("explore"))
+	explore_button.name = "Explore"
+	explore_button.tooltip_text = "让单位自动探索未知区域；启用后当回合可能立即行动。"
+	stop_explore_button = button(page, "停止探索", _unit_order.bind("stopExploration"))
+	stop_explore_button.name = "StopExplore"
+	automate_button = button(page, "自动工人", _unit_order.bind("automateWorker"))
+	automate_button.name = "AutomateWorker"
+	automate_button.tooltip_text = "让工人自动选地施工；启用后当回合可能立即行动。"
+	stop_automate_button = button(page, "停止自动化", _unit_order.bind("stopAutomation"))
+	stop_automate_button.name = "StopAutomation"
+	for order_button in [explore_button, stop_explore_button, automate_button, stop_automate_button]:
+		order_button.set_meta("allowed", false)
+		order_button.visible = false
 	founding_button = button(page, "在此建城", func(): await execute("foundCity", {"unitId": unit_id}))
 	founding_button.name = "FoundCity"
+	# 单位主动能力入口（T3.3）：入口按钮与子面板挂在单位页，可见性由 _resolve_unit→set_context 依 abilities 摘要派生。
+	unit_abilities_panel_inst.build(page)
 	page.add_child(unit_actions)
 	page.add_child(worker_panel)
 	worker_panel.hide()
@@ -438,14 +478,12 @@ func _build_matters_tab() -> void:
 	label(page, "科研")
 	page.add_child(research_picker)
 	button(page, "选择科技", func():
-		if research_picker.selected >= 0:
-			await execute("research", {"name": research_picker.get_item_text(research_picker.selected)}))
+		await information.open("research", research_picker.get_item_text(research_picker.selected) if research_picker.selected >= 0 else ""), false)
 	label(page, "政策")
 	page.add_child(policy_picker)
 	button(page, "采用政策", func():
-		if policy_picker.selected >= 0:
-			await execute("policy", {"name": policy_picker.get_item_text(policy_picker.selected)}))
-	button(page, "暂缓政策", func(): await execute("deferPolicy"))
+		await information.open("policy", policy_picker.get_item_text(policy_picker.selected) if policy_picker.selected >= 0 else ""), false)
+	button(page, "暂缓政策", func(): await _unit_write("deferPolicy", {}))
 
 # 右栏宽度按视口伸缩：低于 1280 用 340，其余 400；地图占剩余空间。
 func _apply_right_width() -> void:
@@ -577,7 +615,7 @@ func _on_busy(is_busy: bool) -> void:
 		city_tabs.get_tab_bar().focus_mode = Control.FOCUS_NONE if is_busy else Control.FOCUS_ALL
 	for control in buttons:
 		if is_instance_valid(control):
-			control.disabled = is_busy or not control.get_meta("allowed", true) or (game_setup.uncertain and not control.get_meta("state_recovery", false))
+			control.disabled = is_busy or not control.get_meta("allowed", true) or ((game_setup.uncertain or information.uncertain) and not control.get_meta("state_recovery", false))
 	attack_button.disabled = is_busy or combat_preview.is_empty() or not _unit_stamp_valid(combat_stamp)
 	for control in unit_actions.get_children():
 		if control is Button:
@@ -606,9 +644,9 @@ func _on_busy(is_busy: bool) -> void:
 			focus_option.disabled = true
 
 func execute(action: String, params: Dictionary = {}, committing = null) -> Dictionary:
-	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "victoryOptions", "assetDecisionOptions", "eventOptions", "combatPreview", "cityBombardPreview", "path", "snapshot", "hello", "newGameOptions", "listSaves"]
-	if game_setup.uncertain and not query:
-		return {"ok": false, "error": {"code": "STATE_UNCERTAIN", "message": "对局切换结果未确认，请先刷新，暂不可保存或再次切换。"}}
+	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "victoryOptions", "assetDecisionOptions", "eventOptions", "combatPreview", "cityBombardPreview", "path", "unitRoute", "snapshot", "hello", "newGameOptions", "listSaves", "empireOverview", "notificationOptions", "researchOptions", "policyOptions"]
+	if (game_setup.uncertain or information.uncertain) and not query:
+		return {"ok": false, "error": {"code": "STATE_UNCERTAIN", "message": "操作结果未确认，请先刷新，暂不可保存或再次切换。"}}
 	if _victory_pending() and not query and action not in ["load", "demo", "newGame", "resume", "save", "diplomaticVoteAcknowledge", "victoryContinue"]:
 		message.text = "请先查看胜负结算并选择是否继续游戏。"
 		return {"ok": false, "error": {"code": "PENDING_DECISION", "message": message.text}}
@@ -660,6 +698,7 @@ func execute(action: String, params: Dictionary = {}, committing = null) -> Dict
 		# 首次开局请求可能根本未送达；内核明确返回空对局，也是一种有效的状态恢复。
 		if action == "snapshot" and result.has("snapshot") and result.snapshot == null:
 			game_setup.uncertain = false
+			information.uncertain = false
 			unit_state_uncertain = false
 			_on_busy(client.busy)
 		message.text = "操作完成 · 状态版本 %s" % client.revision
@@ -772,11 +811,13 @@ func _rebuild_pending(data: Dictionary) -> void:
 
 # 本地选择状态：用户切换选择或重载时自增代际；异步详情回填前比对，任一不符即丢弃。
 func _reset_selection() -> void:
+	information.invalidate()
 	victory_panel_inst.reset_selection()
 	asset_panel_inst.invalidate()
 	event_panel_inst.invalidate()
 	vote_panel_inst.reset_selection()
 	great_person_panel_inst.reset_selection()
+	unit_abilities_panel_inst.reset_selection()
 	diplomacy_panel_inst.reset_selection()
 	religion_panel_inst.invalidate()
 	_set_buy_tile_mode(false)
@@ -842,6 +883,7 @@ func _refresh_active_context() -> void:
 			_clear_dynamic(worker_panel)
 			worker_panel.hide()
 			unit_progression.clear()
+			_reset_order_buttons()
 			details.text = "该单位已消失或不再归属己方。"
 	elif active_context == "city":
 		if _own_city_exists(city_id):
@@ -889,6 +931,7 @@ func _select_tile(tile: Dictionary) -> void:
 	selection_generation += 1
 	vote_panel_inst.invalidate()
 	great_person_panel_inst.invalidate()
+	unit_abilities_panel_inst.on_unit_switched()
 	target.clear()
 	_clear_combat()
 	_clear_dynamic(unit_actions)
@@ -970,6 +1013,7 @@ func _activate_unit(id: int) -> void:
 	selection_generation += 1
 	vote_panel_inst.invalidate()
 	great_person_panel_inst.invalidate()
+	unit_abilities_panel_inst.on_unit_switched()
 	tabs.current_tab = TAB_UNIT
 	await _resolve_unit(id, selection_generation)
 
@@ -982,6 +1026,8 @@ func _resolve_unit(id: int, generation: int) -> void:
 	_clear_dynamic(worker_panel)
 	worker_panel.hide()
 	unit_progression.clear()
+	stop_move_button.set_meta("allowed", false)
+	_reset_order_buttons()
 	var stamp := _unit_stamp()
 	var result: Dictionary = await execute("unitOptions", {"unitId": id})
 	if generation != selection_generation or not _unit_response_matches(result, stamp):
@@ -996,7 +1042,10 @@ func _resolve_unit(id: int, generation: int) -> void:
 			control.tooltip_text = option.reason
 		founding_button.set_meta("allowed", result.data.canFound)
 		founding_button.tooltip_text = result.data.foundReason
-		_populate_worker(result.data.get("worker", {}), id)
+		# 单位主动能力（T3.3）：把 unitId 与 abilities 摘要推入能力面板，决定入口可见性与候选数量。
+		unit_abilities_panel_inst.set_context(id, result.data.get("abilities", {}))
+		var worker: Dictionary = result.data.get("worker", {})
+		_populate_worker(worker, id)
 		unit_progression.populate(result.data.get("progression", {}), id)
 		for unit in client.snapshot.units:
 			if int(unit.id) == id:
@@ -1008,6 +1057,31 @@ func _resolve_unit(id: int, generation: int) -> void:
 				details.text += "\n%s%s" % [domain, " · 已登船" if unit.get("embarked", false) else ""]
 				if not result.data.get("combatSupported", false):
 					details.text += "\n" + str(result.data.get("combatReason", ""))
+				# 原生移动指令格式 "moveTo x,y"（含负坐标）：据此启用「停止移动」并展示目的地。
+				var order := str(unit.action) if unit.action else ""
+				var moving := order.begins_with("moveTo")
+				stop_move_button.set_meta("allowed", moving)
+				if moving:
+					var coord := order.trim_prefix("moveTo ").split(",")
+					if coord.size() == 2:
+						details.text += "\n前往目的地：(%s, %s) · 后续回合由原生推进，可「停止移动」中断" % [coord[0], coord[1]]
+				# 持续指令（T3.2）：探索状态取原生 action==Explore，工人自动化取 automated 字段；启停均经 unitOrder 写命令。
+				var exploring := order == "Explore"
+				var automated := bool(unit.get("automated", false))
+				var is_air := str(unit.get("domain", "land")) == "air"
+				var land_worker := str(worker.get("mode", "")) == "worker" and bool(worker.get("supported", false))
+				explore_button.visible = not is_air and not exploring
+				explore_button.set_meta("allowed", not is_air and not exploring)
+				stop_explore_button.visible = exploring
+				stop_explore_button.set_meta("allowed", exploring)
+				automate_button.visible = land_worker and not automated
+				automate_button.set_meta("allowed", land_worker and not automated)
+				stop_automate_button.visible = automated
+				stop_automate_button.set_meta("allowed", automated)
+				if exploring:
+					details.text += "\n自动探索中 · 后续回合由原生推进，可「停止探索」中断（启用当回合可能立即行动）"
+				elif automated:
+					details.text += "\n自动化施工中 · 后续回合由原生推进，可「停止自动化」中断（启用当回合可能立即行动）"
 				map.selected = Vector2i(int(unit.x), int(unit.y))
 				map.queue_redraw()
 				break
@@ -1185,6 +1259,7 @@ func _activate_city(id: String) -> void:
 	selection_generation += 1
 	vote_panel_inst.invalidate()
 	great_person_panel_inst.invalidate()
+	unit_abilities_panel_inst.on_unit_switched()
 	tabs.current_tab = TAB_CITY
 	await _resolve_city(id, selection_generation)
 
@@ -1287,7 +1362,7 @@ func _select_buy_tile(tile: Dictionary) -> void:
 	_on_busy(client.busy)
 
 const STAT_NAMES := {"Food": "食物", "Production": "生产", "Gold": "金币",
-	"Science": "科研", "Culture": "文化", "Faith": "信仰"}
+	"Science": "科研", "Culture": "文化", "Faith": "信仰", "Happiness": "幸福"}
 
 func _format_stats(stats) -> String:
 	var parts := PackedStringArray()
@@ -1327,13 +1402,19 @@ func _preview_move(tile: Dictionary) -> void:
 	_clear_combat()
 	target.clear()
 	var stamp := _unit_stamp()
-	var result: Dictionary = await execute("path", {"unitId": unit_id, "x": int(tile.x), "y": int(tile.y)})
+	var result: Dictionary = await execute("unitRoute", {"unitId": unit_id, "x": int(tile.x), "y": int(tile.y)})
 	if _unit_response_matches(result, stamp):
 		move_stamp = stamp
 		target = {"x": int(tile.x), "y": int(tile.y)}
-		map.route = result.data.path
+		# 本回合实线路线与后续回合估算落点分开绘制；未来落点取自原生 getShortestPath 每回合端点，不在前端寻路。
+		map.route = result.data.thisTurn
+		map.future_route = result.data.future
 		map.queue_redraw()
-		message.text = "路线由 Kotlin 内核计算；点击「确认移动」执行。"
+		var dest: Dictionary = result.data.get("destination", {})
+		if result.data.get("arrivesThisTurn", false):
+			message.text = "前往 (%s, %s)：本回合即可抵达；点击「确认移动」执行。" % [_num(dest.get("x", 0), true), _num(dest.get("y", 0), true)]
+		else:
+			message.text = "前往 (%s, %s)：预计 %s 回合抵达（后续回合为原生估算）；点击「确认移动」执行。" % [_num(dest.get("x", 0), true), _num(dest.get("y", 0), true), _num(result.data.get("turns", 0), true)]
 	_on_busy(false)
 
 func _commit_move() -> void:
@@ -1341,7 +1422,27 @@ func _commit_move() -> void:
 		return
 	var parameters := target.duplicate()
 	parameters.unitId = unit_id
-	await _unit_write("move", parameters)
+	await _unit_write("moveTo", parameters)
+
+# 停止移动：下达原生 unitOrder/stopMovement（清空 moveTo 指令）；成功后经 execute→_refresh_active_context 重解析单位面板。
+func _stop_movement() -> void:
+	if _input_locked() or unit_id < 0:
+		return
+	await _unit_write("unitOrder", {"unitId": unit_id, "type": "stopMovement"})
+
+# 持续指令统一入口（explore/stopExploration/automateWorker/stopAutomation）：仅复用 unitOrder 写命令，
+# 成功后经 execute→_refresh_active_context 重解析单位面板，据快照 action/automated 刷新按钮与状态。
+func _unit_order(type: String) -> void:
+	if _input_locked() or unit_id < 0:
+		return
+	await _unit_write("unitOrder", {"unitId": unit_id, "type": type})
+
+# 隐藏并禁用全部持续指令按钮；在单位重解析起始与单位消失时调用，避免残留互相冲突的可用状态。
+func _reset_order_buttons() -> void:
+	for order_button in [explore_button, stop_explore_button, automate_button, stop_automate_button]:
+		if is_instance_valid(order_button):
+			order_button.set_meta("allowed", false)
+			order_button.visible = false
 
 func _unit_write(action: String, params: Dictionary) -> Dictionary:
 	unit_transaction = true
@@ -1373,6 +1474,7 @@ func _clear_combat() -> void:
 	combat_panel.hide()
 	map.attack_from.clear()
 	map.route.clear()
+	map.future_route.clear()
 	map.queue_redraw()
 	raze_confirmation.hide()
 	raze_revision = -1
