@@ -149,8 +149,14 @@ func populate() -> void:
 		if not candidate.get("enabled", false):
 			description.text += "\n%s：%s" % [candidate.unitName, candidate.reason]
 	submit.set_meta("allowed", false)
-	locate.visible = orchestrator._own_unit_exists(unit_id)
+	refresh_locate()
 	orchestrator._on_busy(orchestrator.client.busy)
+
+# 定位入口以最新快照为准：领取结果与快照可能分先后落地，不能只在提交当帧判定一次。
+func refresh_locate() -> void:
+	if locate == null or orchestrator == null:
+		return
+	locate.visible = unit_id >= 0 and orchestrator._own_unit_exists(unit_id)
 
 func great_person_name() -> String:
 	if picker.selected < 0:
@@ -222,6 +228,9 @@ func confirm_great_person() -> void:
 	locate.visible = orchestrator._own_unit_exists(unit_id)
 	transaction = false
 	orchestrator._on_busy(orchestrator.client.busy)
+	# 快照可能晚于业务结果应用；下一帧按最新单位列表再校正一次定位入口。
+	await orchestrator.get_tree().process_frame
+	refresh_locate()
 	orchestrator.message.text = result.text
 
 func back_great_person() -> void:
@@ -241,12 +250,17 @@ func locate_great_person() -> void:
 # --- 编排钩子 ---
 func apply_busy(is_busy: bool) -> void:
 	picker.disabled = is_busy or picker.item_count == 0 or not stamp_valid(stamp)
+	refresh_locate()
 
 func should_refresh(active_tab: int) -> bool:
 	return transaction or (active_tab == orchestrator.TAB_MATTERS and panel.visible)
 
 func on_execute_snapshot() -> void:
 	invalidate()
+
+func on_snapshot_applied() -> void:
+	# 快照不清空伟人域，但新单位可能随快照到达；据此校正定位入口。
+	refresh_locate()
 
 func on_snapshot_pending(pending: Array) -> void:
 	open_button.set_meta("allowed", pending.any(func(item): return item.get("kind", "") == "greatPerson") or uncertain)

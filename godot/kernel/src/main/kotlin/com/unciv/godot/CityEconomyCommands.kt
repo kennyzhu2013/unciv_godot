@@ -15,11 +15,14 @@ import com.unciv.view.GameView
 import com.unciv.view.TileView
 import kotlinx.serialization.json.*
 
-/** 金币经济边界：只读报价与写前校验共用规则，实际效果完全交由原生 View 执行。 */
+/** 城市经济边界：只读报价与写前校验共用规则，实际效果完全交由原生 View 执行。 */
 internal class CityEconomyCommands(private val game: GameInfo) {
     private val player = game.currentPlayerCiv
     private val view by lazy { GameView(game, player) }
     private fun city(id: String) = view.civView.cities().firstOrNull { it.id == id }
+        ?: throw GatewayError("NOT_OWNED", "找不到己方城市")
+    /** 只读查询原生 City 状 flags（如是否沿海），不用于执行。 */
+    private fun logicCity(id: String) = player.cities.firstOrNull { it.id == id }
         ?: throw GatewayError("NOT_OWNED", "找不到己方城市")
 
     private fun requireWritable() {
@@ -31,20 +34,25 @@ internal class CityEconomyCommands(private val game: GameInfo) {
         ?: PerpetualConstruction.perpetualConstructionsMap[name]
         ?: throw GatewayError("INVALID_ARGUMENT", "未知生产项目：$name")
 
+    /**
+     * 本期可购买货币：金币与信仰。购买资格、价格递增、伟人／宗教单位写入后的移动力等全部由原生
+     * `canBePurchasedWithStat`／`getStatBuyCost`／`isConstructionPurchaseAllowed`／`purchaseConstruction` 决定。
+     */
+    private val purchaseStats = listOf(Stat.Gold, Stat.Faith)
+    private fun statLabel(stat: Stat) = when (stat) {
+        Stat.Gold -> "金币"
+        Stat.Faith -> "信仰"
+        else -> stat.name
+    }
+
     /** 不通过创建 MapUnit 试探能力，避免只读查询分配单位 ID。 */
     private fun unsupported(c: IConstruction): String = when (c) {
         is PerpetualConstruction -> "持续生产项目不能购买"
         is Building -> if (c.hasUnique(UniqueType.CreatesOneImprovement, GameContext.IgnoreConditionals))
             "需要指定改良地块的建筑购买尚未接入" else ""
         is BaseUnit -> when {
-            !c.isLandUnit || c.isAirUnit() -> "海军和空军购买尚未接入"
+            c.isAirUnit() -> "空军购买尚未接入"
             c.hasUnique(UniqueType.NuclearWeapon, GameContext.IgnoreConditionals) -> "核武购买尚未接入"
-            c.hasUnique(UniqueType.GreatPerson, GameContext.IgnoreConditionals) -> "伟人购买尚未接入"
-            c.hasUnique(UniqueType.ReligiousUnit, GameContext.IgnoreConditionals) ||
-                c.hasUnique(UniqueType.CanSpreadReligion, GameContext.IgnoreConditionals) ||
-                c.hasUnique(UniqueType.CanRemoveHeresy, GameContext.IgnoreConditionals) -> "宗教单位购买尚未接入"
-            c.isCivilian() && !c.isCityFounder() && !c.hasUnique(UniqueType.BuildImprovements, GameContext.IgnoreConditionals) ->
-                "仅接入普通陆军、建城和工人民用单位购买"
             else -> ""
         }
         else -> "尚未接入该项目购买"
@@ -71,23 +79,29 @@ internal class CityEconomyCommands(private val game: GameInfo) {
             else -> ""
         })
     }
-    private fun purchaseQuote(cv: CityView, c: IConstruction, blocked: String): Quote {
+    private fun purchaseQuote(cv: CityView, c: IConstruction, blocked: String, stat: Stat): Quote {
         val unsupported = unsupported(c)
         if (unsupported.isNotEmpty()) return Quote(null, unsupported)
         c as INonPerpetualConstruction
-        if (!cv.canBePurchasedWithStat(c, Stat.Gold)) return Quote(null, "该项目不能用金币购买")
-        val cost = cv.constructions.getStatBuyCost(c, Stat.Gold) ?: return Quote(null, "该项目没有金币报价")
-        val allowed = cv.constructions.isConstructionPurchaseAllowed(c, Stat.Gold, cost)
+        if (!cv.canBePurchasedWithStat(c, stat)) return Quote(null, "该项目不能用${statLabel(stat)}购买")
+        val cost = cv.constructions.getStatBuyCost(c, stat) ?: return Quote(null, "该项目没有${statLabel(stat)}报价")
+        val allowed = cv.constructions.isConstructionPurchaseAllowed(c, stat, cost)
         return Quote(cost, when {
             blocked.isNotEmpty() -> blocked
             allowed -> ""
             cv.isPuppet() && !cv.hasMatchingUnique(UniqueType.MayBuyConstructionsInPuppets) -> "此傀儡城市不允许购买生产"
             cv.isInResistance() -> "抵抗期间不能购买生产"
+            c is BaseUnit && c.isWaterUnit && !logicCity(cv.id).isNaval() -> "内陆城市不能购买海军单位"
             cv.constructions.isConstructionPurchaseBlockedByUnit(c) -> "城市对应单位槽位已占用"
-            !cv.isGodModeEnabled() && cost > cv.getStatReserve(Stat.Gold) -> "金币不足"
+            !cv.isGodModeEnabled() && cost > cv.getStatReserve(stat) -> "${statLabel(stat)}不足"
             else -> "原生规则不允许购买：请检查科技、资源及已有建筑"
         })
     }
+    /** 统一报价：每种可用货币一项，前端不自行换算价格或推断资格。 */
+    private fun quotesDto(cv: CityView, c: IConstruction, blocked: String): JsonArray = JsonArray(purchaseStats.map { stat ->
+        val quote = purchaseQuote(cv, c, blocked, stat)
+        dto("stat" to stat.name, "cost" to quote.cost, "enabled" to quote.enabled, "reason" to quote.reason)
+    })
     private fun saleQuote(cv: CityView, b: Building, blocked: String): Quote {
         val cost = if (b.isSellable()) cv.getGoldForSellingBuilding(b.name) else null
         return Quote(cost, when {
@@ -117,22 +131,22 @@ internal class CityEconomyCommands(private val game: GameInfo) {
     fun preparePurchase(request: JsonObject): () -> Unit {
         val id = request.requiredText("cityId")
         val name = request.requiredText("name")
-        val stat = request.requiredText("stat")
+        val stat = Stat.entries.firstOrNull { it.name == request.requiredText("stat") }
+            ?: throw GatewayError("INVALID_ARGUMENT", "未知购买货币")
         val index = request.requiredInt("queueIndex")
-        ensure(Stat.entries.any { it.name == stat }, "INVALID_ARGUMENT", "未知购买货币")
         val cv = city(id)
         requireWritable()
+        ensure(stat in purchaseStats, "UNSUPPORTED", "本期仅接入金币与信仰购买")
         val c = construction(name)
         val queue = cv.constructions.constructionQueue
         ensure(index == -1 || index in queue.indices && queue[index] == name,
             "INVALID_ARGUMENT", "队列索引越界或项目名称不匹配，请重新获取报价")
-        ensure(stat == Stat.Gold.name, "UNSUPPORTED", "仅接入金币购买")
         val unsupported = unsupported(c)
         ensure(unsupported.isEmpty(), "UNSUPPORTED", unsupported)
-        val quote = purchaseQuote(cv, c, "")
+        val quote = purchaseQuote(cv, c, "", stat)
         ensure(quote.enabled, "CANNOT_PURCHASE", quote.reason)
         return {
-            ensure(cv.constructions.purchaseConstruction(c as INonPerpetualConstruction, index, Stat.Gold, null),
+            ensure(cv.constructions.purchaseConstruction(c as INonPerpetualConstruction, index, stat, null),
                 "CANNOT_PURCHASE", "购买生产失败，已回滚")
             cv.updateCityStats()
         }
@@ -153,14 +167,11 @@ internal class CityEconomyCommands(private val game: GameInfo) {
 
     fun economyDto(cv: CityView): JsonObject {
         val blocked = blockedReason()
-        fun purchaseDto(c: IConstruction, index: Int? = null): JsonObject {
-            val quote = purchaseQuote(cv, c, blocked)
-            return dto("index" to index, "name" to c.name,
-                "type" to if (c is BaseUnit) "unit" else if (c is Building) "building" else "perpetual",
-                "supported" to unsupported(c).isEmpty(), "goldCost" to quote.cost,
-                "enabled" to quote.enabled, "reason" to quote.reason)
-        }
-        return dto("gold" to player.gold, "godMode" to cv.isGodModeEnabled(), "blockedReason" to blocked,
+        fun purchaseDto(c: IConstruction, index: Int? = null): JsonObject = dto("index" to index, "name" to c.name,
+            "type" to if (c is BaseUnit) "unit" else if (c is Building) "building" else "perpetual",
+            "supported" to unsupported(c).isEmpty(), "quotes" to quotesDto(cv, c, blocked))
+        return dto("gold" to cv.getStatReserve(Stat.Gold), "faith" to cv.getStatReserve(Stat.Faith),
+            "godMode" to cv.isGodModeEnabled(), "blockedReason" to blocked,
             "hasSoldBuildingThisTurn" to cv.hasSoldBuildingThisTurn(),
             "buyTiles" to game.tileMap.tileList.mapNotNull {
                 val tv = cv.tileView(it)

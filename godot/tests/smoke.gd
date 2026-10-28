@@ -25,6 +25,7 @@ var religion_lock_valid := true
 var religion_pan_checked := false
 var religion_pan_result: Dictionary = {}
 var economy_expected: Dictionary = {}
+var economy_faith_expected: Dictionary = {}
 var economy_lock_handoffs := 0
 var economy_lock_valid := true
 var input_trace: Array[Dictionary] = []
@@ -1969,7 +1970,18 @@ func verify_great_person_flow() -> bool:
 			return false
 		if not await choose_great_person("Great Scientist", true, true) or not await great_person_matches(kind + "-granted"):
 			return false
-		if not await click_control(app.great_person_panel_inst.locate) or not check(app.unit_id == app.great_person_panel_inst.unit_id, "按新快照定位伟人"):
+		var granted_panel = app.great_person_panel_inst
+		if not check(granted_panel.panel.visible and granted_panel.locate.visible and granted_panel.unit_id >= 0,
+				"领取后定位入口可用：panel=%s locate=%s unit=%d 现有=%s" % [str(granted_panel.panel.visible), str(granted_panel.locate.visible),
+					granted_panel.unit_id, str(app.client.snapshot.get("units", []).filter(func(u): return u.own).map(func(u): u.id))]):
+			return false
+		if not await click_control(granted_panel.locate):
+			await screenshot("smoke-gp-locate-fail-" + kind + ".png")
+			var pend_kinds: Array = app.client.snapshot.get("pending", []).map(func(i): return str(i.get("kind", "")))
+			return check(false, "定位点击后面板状态：panel=%s locate=%s unit=%d tree=%s tab=%d paneltree=%s ctx=%s appunit=%d pending=%s" % [str(granted_panel.panel.visible), str(granted_panel.locate.visible),
+				granted_panel.unit_id, str(granted_panel.locate.is_visible_in_tree()), app.tabs.current_tab, str(granted_panel.panel.is_visible_in_tree()),
+				app.active_context, app.unit_id, str(pend_kinds)])
+		if not check(app.unit_id == app.great_person_panel_inst.unit_id, "按新快照定位伟人"):
 			return false
 		if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches(kind + "-granted-reload"):
 			return false
@@ -2920,10 +2932,20 @@ func load_diplomacy(name: String, matters := false) -> bool:
 		if app.diplomacy_panel_inst.picker.get_item_text(i) == "Greece":
 			if app.diplomacy_panel_inst.picker.selected != i and not await click_option(app.diplomacy_panel_inst.picker, i):
 				return false
+	# 详情刷新会顺带发一次只读交易候选查询：落定后控件才不会被 busy 禁用，后续点击不竞态。
+	await settle()
 	return check(not app.diplomacy_panel_inst.data.is_empty(), "外交详情已取得新版本")
 
 func diplomacy_control(choice: String, pending := false):
 	return find_by_name(app.diplomacy_panel_inst.pending if pending else app.diplomacy_panel_inst.details, "Diplomacy_" + choice)
+
+# 待决区实际渲染的文本；逐条款核对必须用界面标签，而不是只看回传 JSON。
+func diplomacy_pending_text() -> String:
+	var lines := PackedStringArray()
+	for child in app.diplomacy_panel_inst.pending.get_children():
+		if child is Label:
+			lines.append(child.text)
+	return "\n".join(lines)
 
 func click_diplomacy_dialog(confirm: bool, twice := false) -> bool:
 	var dialog: ConfirmationDialog = app.diplomacy_panel_inst.confirmation
@@ -2984,6 +3006,8 @@ func normalize_diplomacy(value, key := ""):
 	return value
 
 func diplomacy_matches(step: String) -> bool:
+	# 外交刷新会顺带发一次只读交易候选查询：先落定再断言锁已释放，不放宽锁本身。
+	await settle()
 	if not check(not app.diplomacy_panel_inst.transaction and not app.client.busy, "外交事务完整解锁：" + step):
 		return false
 	if not await perform("save", {"name": run_id + "-dip-" + step}):
@@ -3075,6 +3099,64 @@ func verify_diplomacy_flow() -> bool:
 		await screenshot("smoke-diplomacy-trade-" + choice + ".png")
 		if not await click_diplomacy_dialog(true) or not await diplomacy_matches("trade-" + choice + "-done"):
 			return false
+	# 第 4 批：多条款来件交易逐条款渲染并整笔接受。
+	if not await load_diplomacy("trade-rich", true) or not await diplomacy_matches("trade-rich-initial"):
+		return false
+	var rich_trade: Dictionary = app.diplomacy_panel_inst.data.incomingTrade
+	if not check(bool(rich_trade.get("supported", false)) and not bool(rich_trade.get("expired", true)), "多条款来件交易可整笔接受"):
+		return false
+	if not check(rich_trade.ourOffers.size() == 3 and rich_trade.theirOffers.size() == 4, "双方条款数量完整"):
+		return false
+	var rich_text := diplomacy_pending_text()
+	for fragment in ["我方给出", "对方给出", "即时效果", "风险", "每回合金币", "开放边界", "奢侈资源 Furs", "使馆"]:
+		if not check(rich_text.contains(fragment), "来件条款完整渲染：" + fragment):
+			return false
+	await screenshot("smoke-diplomacy-trade-rich.png")
+	if not await click_control(diplomacy_control("accept", true)):
+		return false
+	if not check(app.diplomacy_panel_inst.confirmation.dialog_text.contains("对方给出") and app.diplomacy_panel_inst.confirmation.dialog_text.contains("即时效果"), "接受确认显示双方条款与即时效果"):
+		return false
+	var rich_revision: int = app.client.revision
+	if not await click_diplomacy_dialog(true) or not check(app.client.revision == rich_revision + 1, "多条款交易单次提交"):
+		return false
+	if not await diplomacy_matches("trade-rich-done"):
+		return false
+	# 城市条款显示名称与人口，接收后解放待决先于后续交易。
+	if not await load_diplomacy("trade-city", true) or not await diplomacy_matches("trade-city-initial"):
+		return false
+	var city_trade: Dictionary = app.diplomacy_panel_inst.data.incomingTrade
+	var city_clause: Dictionary = city_trade.theirOffers[0]
+	var city_info: Dictionary = city_clause.get("city", {})
+	if not check(str(city_clause.name) == "陆战测试城" and int(city_info.get("population", 0)) > 0, "城市条款显示名称与人口"):
+		return false
+	if not check(diplomacy_pending_text().contains("城市 陆战测试城"), "城市条款进入界面文本"):
+		return false
+	await screenshot("smoke-diplomacy-trade-city.png")
+	if not await click_control(diplomacy_control("accept", true)) or not await click_diplomacy_dialog(true):
+		return false
+	if not await diplomacy_matches("trade-city-done"):
+		return false
+	if not check(str(app.asset_panel_inst.asset_pending().get("type", "")) == "CityTraded", "城市交易后弹出解放待决"):
+		return false
+	var blocked = diplomacy_control("accept", true)
+	if not check(blocked != null and blocked.disabled and blocked.tooltip_text.contains("弹窗"), "解放待决阻塞后续交易的接受"):
+		return false
+	# 第三方宣战与议和条款明文显示目标文明。
+	if not await load_diplomacy("trade-third", true) or not await diplomacy_matches("trade-third-initial"):
+		return false
+	if not check(diplomacy_pending_text().contains("对 Egypt 宣战"), "第三方宣战条款明文展示目标"):
+		return false
+	await screenshot("smoke-diplomacy-trade-third.png")
+	if not await click_control(diplomacy_control("accept", true)) or not await click_diplomacy_dialog(true) or not await diplomacy_matches("trade-third-done"):
+		return false
+	if not await load_diplomacy("trade-third-peace", true) or not await diplomacy_matches("trade-third-peace-initial"):
+		return false
+	if not check(diplomacy_pending_text().contains("与 Egypt 议和"), "第三方议和条款明文展示目标"):
+		return false
+	if not await click_control(diplomacy_control("accept", true)) or not await click_diplomacy_dialog(true) or not await diplomacy_matches("trade-third-peace-done"):
+		return false
+	if not await verify_diplomacy_trade_offers():
+		return false
 	var new_alerts := ["DemandToStopSpreadingReligion", "BulliedProtectedMinor", "AttackedProtectedMinor", "AttackedAllyMinor"] + SPY_ALERTS
 	for pair in [["DeclarationOfFriendship", ["accept", "decline"]], ["DemandToStopSettlingCitiesNear", ["agree", "refuse"]],
 			["DemandToNotAttackUs", ["agree", "refuseAndDeclareWar"]], ["Denounced", ["dismiss", "declareWar"]],
@@ -3124,7 +3206,156 @@ func verify_diplomacy_flow() -> bool:
 		return false
 	if not await verify_spy_transport() or not await verify_diplomacy_sizes():
 		return false
-	steps.append("外交：真实窗口宣战、和平提案、撤回、AI回合、交易处置、十类事件全部选择；含间谍待决取消／双击／重载、丢响应恢复及完整原生差分")
+	steps.append("外交：真实窗口宣战、和平提案、撤回、AI回合、交易处置、主动报价／还价、十类事件全部选择；含间谍待决取消／双击／重载、丢响应恢复及完整原生差分")
+	return true
+
+# —— 第 5 批：主动交易构建器只经真实控件驱动 ——
+
+func trade_control(node_name: String):
+	return find_by_name(app.diplomacy_panel_inst.trade_box, node_name)
+
+func select_trade_side(side: int) -> bool:
+	var picker: OptionButton = trade_control("TradeSide")
+	if not check(picker != null, "交易方向选择存在"):
+		return false
+	if picker.selected != side:
+		await select_option(picker, side)
+	picker = trade_control("TradeSide")
+	return check(picker != null and picker.selected == side, "交易方向已切换：%d" % side)
+
+func select_trade_clause(fragment: String) -> bool:
+	var picker: OptionButton = trade_control("TradeClausePicker")
+	if not check(picker != null, "交易条款选择存在"):
+		return false
+	for i in range(picker.item_count):
+		if picker.get_item_text(i).contains(fragment):
+			await select_option(picker, i)
+			var current: OptionButton = trade_control("TradeClausePicker")
+			return check(current != null and current.selected == i, "交易条款已选：" + fragment)
+	return check(false, "交易候选包含：" + fragment)
+
+func add_trade_clause(side: int, fragment: String, amount: int) -> bool:
+	if not await select_trade_side(side) or not await select_trade_clause(fragment):
+		return false
+	var spin: SpinBox = trade_control("TradeAmount")
+	if not check(spin != null, "交易金额输入存在") or not await enter_gold(spin, amount):
+		return false
+	return await click_control(trade_control("TradeAdd"))
+
+func preview_trade(expect_supported := true) -> bool:
+	if not await click_control(trade_control("TradePreview")):
+		return false
+	var status: Label = trade_control("TradePreviewStatus")
+	if not check(status != null, "交易预览状态已显示"):
+		return false
+	return check(status.text.begins_with("预览：可发送") == expect_supported, "交易预览结论：" + status.text)
+
+# 切换外交对象后的候选查询不持有事务锁，需等构建器重新出现才能继续真实控件输入。
+func wait_trade_composer() -> bool:
+	var deadline := Time.get_ticks_msec() + 60000
+	while Time.get_ticks_msec() < deadline:
+		if trade_control("TradeSide") != null and trade_control("TradeClausePicker") != null \
+				and not app.diplomacy_panel_inst.trade_options.is_empty():
+			return true
+		await get_tree().process_frame
+	return check(false, "交易构建器在切换对象后重新出现")
+
+func verify_diplomacy_trade_offers() -> bool:
+	# 主动发送：候选→金额→预览→发送→AI 回合，全部为真实控件输入。
+	if not await load_diplomacy("trade-send") or not await diplomacy_matches("trade-send-initial"):
+		return false
+	if not check(trade_control("TradeHeading") != null and bool(app.diplomacy_panel_inst.trade_options.get("canSend", false)), "主动交易候选已加载且可发送"):
+		return false
+	if not await add_trade_clause(0, "一次性金币", 500):
+		return false
+	var staged: Label = trade_control("TradeRowText0")
+	if not check(staged != null and staged.text.contains("我方给出：一次性金币 ×500"), "加入条款显示在草稿区"):
+		return false
+	await screenshot("smoke-diplomacy-trade-build.png")
+	# 草稿只属于当前这一局：重载存档后不复现旧条款与旧预览票据。
+	if not await load_diplomacy("trade-send") or not check(
+			app.diplomacy_panel_inst.trade_staged.is_empty() and app.diplomacy_panel_inst.trade_preview_data.is_empty()
+			and trade_control("TradeRowText0") == null, "重载存档后本地草稿与预览作废"):
+		return false
+	if not await add_trade_clause(0, "一次性金币", 500):
+		return false
+	if not check(trade_control("TradeRowText0") != null, "重载后重新加入的条款显示在草稿区"):
+		return false
+	if not await preview_trade():
+		return false
+	# 前端把预览返回的 draft 原样回传（Godot 读回的数字是浮点）：金额与票据必须不变。
+	var replay: Dictionary = await app.client.command("diplomacyTradePreview", {"civId": app.diplomacy_panel_inst.civ_id,
+		"draft": app.diplomacy_panel_inst.trade_preview_data.get("draft", {})})
+	if not check(replay.get("ok", false) and str(replay.get("data", {}).get("tradeToken", "")) == str(app.diplomacy_panel_inst.trade_preview_data.get("tradeToken", ""))
+			and int(replay.get("data", {}).get("draft", {}).get("ourOffers", [{}])[0].get("amount", 0)) == 500,
+			"预览草稿往返后金额与票据稳定"):
+		return false
+	if not await click_control(trade_control("TradeSend")):
+		return false
+	var dialog: ConfirmationDialog = app.diplomacy_panel_inst.confirmation
+	if not check(dialog.dialog_text.contains("我方给出") and dialog.dialog_text.contains("对方会在其回合"), "发送确认展示双方条款与等待说明"):
+		return false
+	await screenshot("smoke-diplomacy-trade-send-confirm.png")
+	var revision: int = app.client.revision
+	if not await click_diplomacy_dialog(true) or not check(app.client.revision == revision + 1, "主动提案单次提交（消息：%s）" % app.message.text):
+		return false
+	if not await diplomacy_matches("trade-send-sent"):
+		return false
+	if not check(trade_control("TradeWithdraw") != null and not bool(app.diplomacy_panel_inst.trade_options.get("canSend", true))
+			and trade_control("TradeRowText0") == null and app.diplomacy_panel_inst.trade_staged.is_empty(),
+			"发送后出现撤回入口、禁止重复发送且草稿清空"):
+		return false
+	await screenshot("smoke-diplomacy-trade-sent.png")
+	if not await click_control(app.turn_button) or not await diplomacy_matches("trade-send-nextTurn"):
+		return false
+	# 撤回：资源可用性恢复与原生存档一致。
+	if not await load_diplomacy("trade-withdraw") or not await diplomacy_matches("trade-withdraw-initial"):
+		return false
+	if not await add_trade_clause(0, "战略资源 Iron", 1) or not await preview_trade():
+		return false
+	if not await click_control(trade_control("TradeSend")) or not await click_diplomacy_dialog(true) or not await diplomacy_matches("trade-withdraw-sent"):
+		return false
+	if not await click_control(trade_control("TradeWithdraw")):
+		return false
+	if not check(app.diplomacy_panel_inst.confirmation.dialog_text.contains("撤回已发提案"), "撤回确认说明不写拒绝冷却"):
+		return false
+	await screenshot("smoke-diplomacy-trade-withdraw-confirm.png")
+	if not await click_diplomacy_dialog(true) or not await diplomacy_matches("trade-withdraw-done"):
+		return false
+	# 还价：移除来件（无冷却）并把原条款预填回构建器。
+	if not await load_diplomacy("trade-renegotiate") or not await diplomacy_matches("trade-renegotiate-initial"):
+		return false
+	if not check(trade_control("TradeRenegotiate") != null, "来件显示还价入口"):
+		return false
+	await screenshot("smoke-diplomacy-trade-incoming.png")
+	if not await click_control(trade_control("TradeRenegotiate")) or not await diplomacy_matches("trade-renegotiate-done"):
+		return false
+	var prefill: Label = trade_control("TradeRowText0")
+	if not check(prefill != null and prefill.text.contains("对方给出：一次性金币 ×40"), "还价预填原条款"):
+		return false
+	if not await preview_trade() or not await click_control(trade_control("TradeSend")) or not await click_diplomacy_dialog(true):
+		return false
+	if not await diplomacy_matches("trade-renegotiate-sent"):
+		return false
+	await screenshot("smoke-diplomacy-trade-counter.png")
+	# 草稿绑定外交对象：切换到另一文明即作废（此场景有两个主要文明可供切换）。
+	if not await load_diplomacy("peace"):
+		return false
+	if not await wait_trade_composer() or not await add_trade_clause(0, "一次性金币", 100):
+		return false
+	var picker: OptionButton = app.diplomacy_panel_inst.picker
+	var keep := picker.selected
+	if not check(picker.item_count >= 2 and trade_control("TradeRowText0") != null, "多文明场景已加入草稿条款"):
+		return false
+	if not await click_option(picker, (keep + 1) % picker.item_count) or not check(
+			app.diplomacy_panel_inst.trade_staged.is_empty() and app.diplomacy_panel_inst.trade_prefill.is_empty(),
+			"切换外交对象后本地草稿作废"):
+		return false
+	if not await click_option(picker, keep) or not await wait_trade_composer() or not check(
+			trade_control("TradeRowText0") == null and app.diplomacy_panel_inst.trade_staged.is_empty(),
+			"切回原对象也不复活旧草稿"):
+		return false
+	steps.append("主动交易：候选→预览→发送→撤回→AI回合；还价移除来件并预填重发，重载与切文明作废草稿，全程原生差分")
 	return true
 
 func verify_spy_transport() -> bool:
@@ -3143,9 +3374,17 @@ func verify_spy_transport() -> bool:
 			fault.fail_query = mode if mode in ["snapshot", "diplomacyOptions"] else ""
 			swap_great_person_test_client(fault)
 			var clicked := await click_diplomacy_dialog(true, true)
+			# 交易候选查询不持有事务锁：等注入客户端的在途请求全部落定再取顺序，否则偶发少一项。
+			var traced := fault.trace.size()
+			for attempt in range(3600):
+				if fault.trace.size() == traced:
+					break
+				traced = fault.trace.size()
+				await get_tree().process_frame
 			var writes: Array = fault.trace.filter(func(entry): return entry.request.action == "diplomacyAlertDecision")
 			var order: Array = fault.trace.filter(func(entry): return entry.request.action != "diplomacyAlertDecision").map(func(entry): return entry.request.action)
-			var expected_order: Array = ["diplomacyOptions"] if mode == "retry" else ["snapshot", "diplomacyOptions"]
+			# 事件处理完后的那次刷新会顺带取一次主动交易候选（无待决事件才取）。
+			var expected_order: Array = ["diplomacyOptions", "diplomacyTradeOptions"] if mode == "retry" else ["snapshot", "diplomacyOptions", "diplomacyTradeOptions"]
 			if mode == "snapshot":
 				expected_order = ["snapshot", "snapshot"]
 			elif mode == "diplomacyOptions":
@@ -3162,6 +3401,8 @@ func verify_spy_transport() -> bool:
 			spy_evidence.append({"event": kind, "mode": mode, "path": ProjectSettings.globalize_path(path)})
 			swap_great_person_test_client(original)
 			fault.queue_free()
+			# 恢复真实客户端后的刷新会带一次只读交易候选查询：先落定，后面的锁断言才不误报。
+			await settle()
 			if not clicked or not check(guarded and order == expected_order and diplomacy_lock_valid, "间谍外交恢复顺序、全程锁与禁用：" + kind + "/" + mode):
 				return false
 			if not check(writes.size() == 2 and writes[0].request == writes[1].request and writes[0].answer == writes[1].answer and writes[0].answer.ok, "间谍外交同请求重试、仅一次写入：" + kind + "/" + mode):
@@ -3238,6 +3479,8 @@ func verify_diplomacy_sizes() -> bool:
 				civ.warWarnings.append("长警告布局注入：宣战会取消相关条约和交易，并可能导致盟友连带参战，请核对不攻击承诺。")
 		if not check(app.diplomacy_panel_inst.apply_response({"ok": true, "session": app.client.session, "revision": app.client.revision, "data": long_data}, app.diplomacy_panel_inst.stamp), label + " 长文本布局注入"):
 			return false
+		# 注入后的刷新会顺带发一次只读交易候选查询：先落定，控件才不再被 busy 禁用。
+		await settle()
 		if not await click_control(diplomacy_control("declareWar")):
 			return false
 		await screenshot("smoke-diplomacy-" + label + "-long-injected.png")
@@ -3554,7 +3797,8 @@ func observe_economy_lock(busy: bool) -> void:
 	for control in app.buttons:
 		economy_lock_valid = economy_lock_valid and control.disabled
 	economy_lock_valid = economy_lock_valid and app.city_picker.disabled and app.unit_picker.disabled \
-		and app.economy_panel_inst.economy_picker.disabled and not app.economy_panel_inst.economy_filter.editable \
+		and app.economy_panel_inst.economy_picker.disabled and app.economy_panel_inst.economy_stat.disabled \
+		and not app.economy_panel_inst.economy_filter.editable \
 		and app.tabs.get_tab_bar().mouse_filter == Control.MOUSE_FILTER_IGNORE \
 		and app.city_tabs.get_tab_bar().mouse_filter == Control.MOUSE_FILTER_IGNORE
 
@@ -3665,7 +3909,7 @@ func verify_economy_flow() -> bool:
 			return false
 	if not check(economy_lock_handoffs >= 8 and economy_lock_valid, "经济写入与详情刷新之间全部写控件及选择保持锁定"):
 		return false
-	if not await verify_economy_stamps(fixture) or not await verify_economy_poor(fixture):
+	if not await verify_economy_stamps(fixture) or not await verify_economy_poor(fixture) or not await verify_economy_faith():
 		return false
 	steps.append("城市经济：真实输入买地、候选及指定队列购买、出售、回合恢复与原格式重载，逐步对照独立原生期望")
 	return true
@@ -3718,14 +3962,16 @@ func equal_persisted(actual, expected, path: String) -> bool:
 		return true
 	return check(false, path + "：%s != %s" % [str(actual), str(expected)])
 
-func economy_matches(step: String) -> bool:
-	if step in ["buyTile", "buyBuilding", "buyQueue", "sell"]:
+func economy_matches(step: String, source := {}) -> bool:
+	var expected_all: Dictionary = source if not source.is_empty() else economy_expected
+	if step in ["buyTile", "buyBuilding", "buyQueue", "sell", "buyFaith"]:
 		if not check(not app.economy_panel_inst.transaction and not app.client.busy
 				and app.message.text.begins_with("操作完成"), "经济事务结束恢复完成提示：" + step):
 			return false
-	var expected: Dictionary = economy_expected[step]
+	var expected: Dictionary = expected_all[step]
 	var city: Dictionary = app.city_data
-	var actual := {"cityId": app.city_id, "gold": app.client.snapshot.gold, "turn": app.client.snapshot.turn,
+	var actual := {"cityId": app.city_id, "gold": app.client.snapshot.gold, "faith": city.economy.faith,
+		"turn": app.client.snapshot.turn,
 		"population": city.population, "food": city.growth.foodStored, "freePopulation": city.specialists.freePopulation,
 		"manual": city.specialists.manual, "sold": city.economy.hasSoldBuildingThisTurn, "queue": city.queue}
 	for key in actual:
@@ -3863,6 +4109,60 @@ func verify_economy_poor(fixture: String) -> bool:
 		return false
 	economy_steps += 1
 	if not await perform("load", {"path": fixture}):
+		return false
+	return await click_map(Vector2i.ZERO) and await click_tab(app.city_tabs, app.CTAB_ECONOMY)
+
+# 信仰购买：币种切换、报价、扣款与单位落地全部由真实控件触发，逐步对照独立原生期望。
+func verify_economy_faith() -> bool:
+	var fixture := ProjectSettings.globalize_path("res://.local/tests/economy-faith.json")
+	var expected = JSON.parse_string(FileAccess.get_file_as_string("res://.local/tests/economy-faith-expected.json"))
+	if not check(expected is Dictionary and expected.has("initial") and expected.has("buyFaith"), "独立原生信仰购买期望存在"):
+		return false
+	economy_faith_expected = expected
+	if not await perform("load", {"path": fixture}):
+		return false
+	app.map.center_on(Vector2i.ZERO)
+	await get_tree().process_frame
+	if not await click_map(Vector2i.ZERO) or not await click_tab(app.city_tabs, app.CTAB_ECONOMY):
+		return false
+	var panel = app.economy_panel_inst
+	if not check(panel.economy_stat.item_count == 2 and str(panel.economy_stat.get_item_metadata(0)) == "Gold" \
+			and str(panel.economy_stat.get_item_metadata(1)) == "Faith", "经济货币选择仅含金币与信仰"):
+		return false
+	if not check(panel.economy_balance.text.contains("金币") and panel.economy_balance.text.contains("信仰"), "经济余额同时展示金币与信仰"):
+		return false
+	if not economy_matches("initial", economy_faith_expected):
+		return false
+	if not await click_option(panel.economy_stat, 1):
+		return false
+	if not check(panel.selected_stat() == "Faith", "切换信仰购买货币"):
+		return false
+	var index := -1
+	for i in range(panel.economy_picker.item_count):
+		var meta = panel.economy_picker.get_item_metadata(i)
+		if meta is Dictionary and meta.get("name") == "Missionary":
+			index = i
+	if not check(index >= 0, "信仰购买候选含传教士") or not await click_option(panel.economy_picker, index):
+		return false
+	var quote: Dictionary = panel.quote_of(panel.economy_selection())
+	if not check(quote.get("enabled", false) and int(quote.get("cost", 0)) > 0, "信仰报价可用且价格来自内核"):
+		return false
+	if not check(panel.economy_detail.text.contains("信仰") and not panel.purchase_button.disabled, "信仰预览展示币种且购买按钮可点"):
+		return false
+	if not await click_control(panel.purchase_button):
+		return false
+	if not check(panel.confirmation.dialog_text.contains("信仰"), "信仰确认框展示币种与余额"):
+		return false
+	await screenshot("smoke-economy-faith.png")
+	if not await click_economy_dialog(true) or not economy_matches("buyFaith", economy_faith_expected):
+		return false
+	var bought: Array = app.client.snapshot.units.filter(func(u): return u.own and str(u.name) == "Missionary")
+	if not check(bought.size() == 1 and is_equal_approx(float(bought[0].movement), 0.0), "信仰购买传教士落地且原生罚没行动力"):
+		return false
+	steps.append("城市经济：切换信仰货币购买传教士，报价、扣款与单位落地对照独立原生期望")
+	# 恢复主经济场景，供后续窗口尺寸布局断言使用。
+	economy_steps += 1
+	if not await perform("load", {"path": ProjectSettings.globalize_path("res://.local/tests/economy.json")}):
 		return false
 	return await click_map(Vector2i.ZERO) and await click_tab(app.city_tabs, app.CTAB_ECONOMY)
 
@@ -4708,7 +5008,8 @@ func settle() -> void:
 		if Time.get_ticks_msec() >= deadline:
 			_fail("等待内核与界面事务落定超时")
 			return
-		if app.client.busy or app._execute_depth > 0 or app.victory_panel_inst.guide_active or app.panels.any(func(p): return p.transaction):
+		if app.client.busy or app._execute_depth > 0 or app.victory_panel_inst.guide_active \
+				or app.panels.any(func(p): return p.transaction) or app.diplomacy_panel_inst.trade_load_pending > 0:
 			idle = 0
 		else:
 			idle += 1
@@ -4793,12 +5094,28 @@ func click_control(control, twice := false) -> bool:
 	scroll_into_view(control)
 	await get_tree().process_frame
 	await get_tree().process_frame
+	# 悬停满提示延迟后条目/控件提示窗会浮在指针下，抢占后续命中；先移到空白处置空再回到目标。
+	await window_motion(get_viewport(), Vector2(4, 4))
+	await get_tree().process_frame
 	var rect: Rect2 = control.get_global_rect()
 	if not check(rect.size.x > 0 and rect.size.y > 0, "控件已完成布局"):
 		return false
 	var center := rect.get_center()
 	var hover = gui_hover_at(center)
-	if not check(hover != null and (hover == control or control.is_ancestor_of(hover)), "鼠标命中目标控件：" + str(control.name)):
+	for attempt in range(2):
+		if hover != null and (hover == control or control.is_ancestor_of(hover)):
+			break
+		# 面板可能在点击前刚被异步刷新重新排布，旧滚动位置不再包含目标；落定后重新校正一次。
+		await settle()
+		scroll_into_view(control)
+		await get_tree().process_frame
+		await get_tree().process_frame
+		rect = control.get_global_rect()
+		if not check(rect.size.x > 0 and rect.size.y > 0, "控件已完成布局"):
+			return false
+		center = rect.get_center()
+		hover = gui_hover_at(center)
+	if not check(hover != null and (hover == control or control.is_ancestor_of(hover)), "鼠标命中目标控件：" + str(control.name) + "，实际命中：" + (str(hover.name) if hover != null else "null") + "，可见：" + str(control.is_visible_in_tree()) + "，矩形：" + str(control.get_global_rect())):
 		return false
 	var trace := {"control": str(control.name), "center": str(center), "events": [], "signals": 0}
 	var on_input := func(event: InputEvent):
@@ -4873,6 +5190,17 @@ func select_option(ob: OptionButton, index: int) -> void:
 	ob.item_selected.emit(index)
 	await settle()
 
+# 下拉弹层的键盘导航：同样投递真实按键事件，焦点移动由 PopupMenu 自身处理并自动滚动。
+func option_key(popup: PopupMenu, code: Key) -> void:
+	for pressed in [true, false]:
+		var event := InputEventKey.new()
+		event.keycode = code
+		event.physical_keycode = code
+		event.pressed = pressed
+		event.window_id = popup.get_window_id()
+		popup.push_input(event)
+		await get_tree().process_frame
+
 # 经济下拉通过弹出窗口自身的视口输入，不发射业务信号或直接修改选择。
 func click_option(ob: OptionButton, index: int) -> bool:
 	if not check(index >= 0 and index < ob.item_count, "经济下拉目标存在"):
@@ -4885,21 +5213,44 @@ func click_option(ob: OptionButton, index: int) -> bool:
 		return false
 	popup.scroll_to_item(index)
 	await get_tree().process_frame
-	# PopupMenu 未公开条目矩形，逐点真实悬停并读取命中索引；滚动只负责使条目进入视口。
-	var focused_samples: Array = []
-	for y in range(4, popup.size.y - 4, 4):
+	# PopupMenu 未公开条目矩形：按索引比例在目标附近做少量真实悬停，命中即真实点击。
+	var samples: Array = []
+	var span := maxi(popup.size.y - 8, 8)
+	var guess := clampi(int(round(float(index) / maxf(float(ob.item_count - 1), 1.0) * (span - 8))) + 4, 4, span)
+	for offset: int in [0, -8, 8, -16, 16, -24, 24]:
+		var y := guess + offset
+		if y < 4 or y > popup.size.y - 4:
+			continue
 		var pos := Vector2(popup.size.x / 2.0, y)
 		await window_motion(popup, pos)
-		if focused_samples.is_empty() or focused_samples.back().focused != popup.get_focused_item():
-			focused_samples.append({"y": y, "focused": popup.get_focused_item(), "mouse": str(popup.get_mouse_position()), "rootMouse": str(get_viewport().get_mouse_position())})
+		samples.append({"y": y, "focused": popup.get_focused_item(), "visible": popup.visible})
+		if not popup.visible:
+			break
 		if popup.get_focused_item() == index:
 			await window_mouse(popup, MOUSE_BUTTON_LEFT, pos)
 			await settle()
-			return check(ob.selected == index and not popup.visible, "真实鼠标选中经济下拉项目")
+			if ob.selected == index and not popup.visible:
+				return check(true, "真实鼠标选中下拉项目：" + str(ob.name))
+			break
+	# 小窗口下弹层可能被裁切、提示窗也会抢走焦点；键盘导航同为真实输入，用它兜底。
+	if popup.visible:
+		for step in range(ob.item_count + 1):
+			await option_key(popup, KEY_DOWN)
+			if popup.get_focused_item() == index:
+				break
+		for step in range(ob.item_count * 2 + 2):
+			if popup.get_focused_item() == index:
+				break
+			await option_key(popup, KEY_UP)
+		if popup.get_focused_item() == index:
+			await option_key(popup, KEY_ENTER)
+			await settle()
+			if ob.selected == index and not popup.visible:
+				return check(true, "键盘导航选中下拉项目：" + str(ob.name))
 	input_trace.append({"picker": str(ob.name), "target": index, "text": ob.get_item_text(index),
 		"disabled": ob.is_item_disabled(index), "popupPosition": str(popup.position), "popupSize": str(popup.size),
-		"embedded": popup.is_embedded(), "visible": popup.visible,
-		"rootFocused": get_window().has_focus(), "focusedSamples": focused_samples})
+		"embedded": popup.is_embedded(), "visible": popup.visible, "selected": ob.selected,
+		"rootFocused": get_window().has_focus(), "focusedSamples": samples})
 	await screenshot("smoke-option-hit-failure.png")
 	return check(false, "经济下拉条目未命中：" + str(index))
 
@@ -4928,12 +5279,13 @@ func click_economy_dialog(confirm: bool, twice := false) -> bool:
 	await settle()
 	return check(not dialog.visible and app.economy_panel_inst.payload.is_empty(), "经济确认关闭并清空载荷")
 
-func economy_control(root: Node, node_name: String, project: String, index := -1):
+func economy_control(root: Node, node_name: String, project: String, index := -1, stat := "Gold"):
 	if str(root.name) == node_name and str(root.get_meta("projectName", "")) == project \
-			and int(root.get_meta("queueIndex", -1)) == index and int(root.get_meta("revision", -1)) == int(app.client.revision):
+			and int(root.get_meta("queueIndex", -1)) == index and str(root.get_meta("stat", "Gold")) == stat \
+			and int(root.get_meta("revision", -1)) == int(app.client.revision):
 		return root
 	for child in root.get_children():
-		var found = economy_control(child, node_name, project, index)
+		var found = economy_control(child, node_name, project, index, stat)
 		if found != null:
 			return found
 	return null

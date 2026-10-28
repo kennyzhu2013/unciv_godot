@@ -47,6 +47,8 @@ internal object UnitAbilityFixtures {
             mapSize = MapSize.Tiny; seed = 4602L; noRuins = true
         }))
         native(game) {
+            // 新开局的参数默认不含胜利类型；科学胜利需要启用后才能投影部件的需求数量。
+            game.gameParameters.victoryTypes = ArrayList(game.ruleset.victories.keys.filter { it != Constants.neutralVictoryType })
             game.civilizations.forEach { civ -> civ.units.getCivUnits().toList().forEach { it.destroy() } }
             game.tileMap = TileMap(8, game.ruleset).apply {
                 gameInfo = game; mapParameters.mapSize = MapSize(8); mapParameters.seed = 4602L
@@ -82,6 +84,22 @@ internal object UnitAbilityFixtures {
     fun capital(game: GameInfo) = player(game).cities.single { it.location == center }
     fun add(game: GameInfo, name: String, coord: HexCoord): MapUnit = BattleFixtures.add(game, name, coord.x, coord.y)
 
+    /**
+     * 强制把平民单位落在指定地块（含敌方城市中心），仅用于构造原生归属拒绝场景。
+     * 先在无主空地创建，再绕过 canMoveTo 强制落位；敌方领土与城市中心原生会拒绝平民进入，
+     * 强制落位只存在于测试 fixture，不进入生产网关。
+     */
+    fun placeAt(game: GameInfo, name: String, coord: HexCoord, staging: HexCoord = HexCoord(2, 2)): MapUnit = native(game) {
+        val unit = BattleFixtures.add(game, name, staging.x, staging.y)
+        val tile = game.tileMap[coord]
+        if (unit.currentTile.position != coord) {
+            unit.removeFromTile()
+            tile.civilianUnit = unit
+            unit.currentTile = tile
+        }
+        unit
+    }
+
     /** 放置宗教单位并绑定己方宗教名（原生 spread／heresy 门禁依赖 unit.religion）。 */
     fun addReligiousUnit(game: GameInfo, name: String, coord: HexCoord): MapUnit = add(game, name, coord).also {
         it.religion = player(game).religionManager.religion?.name
@@ -111,6 +129,7 @@ internal object UnitAbilityFixtures {
      * 不经网关 DTO／UnitAbilityCommands 生成期望）：
      * - unit-abilities-scientist：己方大科学家(2,0)——加速研究可执行且消耗单位；学院因所在为中立地块不可执行（前端展示禁用原因）。
      * - unit-abilities-missionary：已创立宗教局 + 传教士(5,0)——传播宗教可执行，首次仅扣次数不消耗单位（验证非消耗路径）。
+     * - unit-abilities-spaceship：首都已建 Apollo Program + SS Booster 驻首都——组装可执行、消耗部件并推进科学胜利进度。
      */
     fun emit() {
         val scientist = game()
@@ -119,6 +138,12 @@ internal object UnitAbilityFixtures {
         val missionary = ReligionFixtures.foundedGame()
         native(missionary) { addReligiousUnit(missionary, "Missionary", HexCoord(5, 0)) }
         export(missionary, "unit-abilities-missionary")
+        val spaceship = game()
+        native(spaceship) {
+            capital(spaceship).cityConstructions.addBuilding("Apollo Program")
+            add(spaceship, "SS Booster", center)
+        }
+        export(spaceship, "unit-abilities-spaceship")
     }
 
     /** 期望端：取该类型唯一可执行原生动作（可按标题／关联 Unique 过滤）并调用一次。 */

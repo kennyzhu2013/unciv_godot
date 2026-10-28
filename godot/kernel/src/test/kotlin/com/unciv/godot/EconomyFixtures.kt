@@ -62,7 +62,8 @@ internal object EconomyFixtures {
         val city = capital(game)
         val player = game.currentPlayerCiv
         fun coordinates(values: Collection<HexCoord>) = values.sortedWith(compareBy({ it.x }, { it.y })).map { it.dto() }
-        dto("cityId" to city.id, "gold" to player.gold, "turn" to game.turns,
+        dto("cityId" to city.id, "gold" to player.gold, "faith" to player.religionManager.storedFaith,
+            "turn" to game.turns,
             "tiles" to coordinates(city.tiles), "worked" to coordinates(city.workedTiles),
             "locked" to coordinates(city.lockedTiles), "buildings" to city.cityConstructions.builtBuildings.sorted(),
             "population" to city.population.population, "food" to city.population.foodStored,
@@ -93,6 +94,7 @@ internal object EconomyFixtures {
             "buyBuilding" -> check(cv.constructions.purchaseConstruction(game.ruleset.buildings["Monument"]!!, -1, Stat.Gold, null))
             "buyQueue" -> check(cv.constructions.purchaseConstruction(game.ruleset.units["Warrior"]!!, 2, Stat.Gold, null))
             "sell" -> check(cv.trySellBuilding(game.ruleset.buildings["Market"]!!))
+            "buyFaith" -> check(cv.constructions.purchaseConstruction(game.ruleset.units["Missionary"]!!, -1, Stat.Faith, null))
             else -> error("未知原生经济步骤：$step")
         }
         cv.updateCityStats()
@@ -122,5 +124,32 @@ internal object EconomyFixtures {
         expected["mapOfSetFields"] = GameplayAssertions.mapOfSetFields.toList()
         File(root, "godot/.local/tests/economy-expected.json").writeText(dto(*expected.toList().toTypedArray()).toString())
         file("economy-poor") { it.currentPlayerCiv.addGold(-it.currentPlayerCiv.gold) }
+        emitFaith()
+    }
+
+    /**
+     * 信仰购买 fixture：已完成主宗教的首都＋充足信仰，前端只需切换币种购买传教士。
+     * 期望端在与导出文件重新加载后的副本上执行同一原生 purchaseConstruction，不经过网关。
+     */
+    fun emitFaith() {
+        val game = ReligionFixtures.foundedGame()
+        BattleFixtures.native(game) {
+            val player = game.currentPlayerCiv
+            player.religionManager.storedFaith = 5000
+            player.addGold(2000 - player.gold)
+            game.civilizations.forEach { it.popupAlerts.clear(); it.notifications.clear() }
+            game.setTransients()
+            player.cities.forEach { it.cityStats.update() }
+        }
+        val file = ReligionFixtures.export(game, "economy-faith")
+        val native = UncivFiles.gameInfoFromString(file.readText())
+        val expected = linkedMapOf<String, Any?>("initial" to summary(native))
+        nativeStep(native, "buyFaith")
+        expected["buyFaith"] = summary(native)
+        check(native.unitNamesTaken.isEmpty())
+        expected["gameplay"] = GameplayAssertions.gameplay(native)
+        expected["setFields"] = GameplayAssertions.setFields.toList()
+        expected["mapOfSetFields"] = GameplayAssertions.mapOfSetFields.toList()
+        File(root, "godot/.local/tests/economy-faith-expected.json").writeText(dto(*expected.toList().toTypedArray()).toString())
     }
 }

@@ -21,7 +21,8 @@ import java.security.MessageDigest
  *
  * 候选全部取自原生 [UnitActions] 的类型化入口；黄金时代仅接受关联 Unique 为
  * [UniqueType.OneTimeEnterGoldenAgeTurns] 的 TriggerUnique 候选，不开放通用 TriggerUnique 执行入口。
- * 本期清单外能力（海军统帅特殊能力、任意 Mod 触发动作、太空船组装）不登记。
+ * 太空船部件组装复用原生 [UnitActionType.AddInCapital]：组装计数、销毁单位与胜利记录都由原生闭包完成。
+ * 本期清单外能力（海军统帅特殊能力、任意 Mod 触发动作）不登记。
  */
 internal class UnitAbilityCommands(private val game: GameInfo, private val session: String = "", private val revision: Int = -1) {
     private val player = game.currentPlayerCiv
@@ -35,10 +36,11 @@ internal class UnitAbilityCommands(private val game: GameInfo, private val sessi
         "tradeMission" to UnitActionType.ConductTradeMission,
         "createImprovement" to UnitActionType.CreateImprovement,
         "goldenAge" to UnitActionType.TriggerUnique,
+        "assembleSpaceship" to UnitActionType.AddInCapital,
     )
 
-    /** 无关联 Unique 的类型化伟人动作：原生闭包直接消耗单位，次数即一次。 */
-    private val consumingTyped = setOf("hurryResearch", "hurryBuilding", "tradeMission")
+    /** 无关联 Unique 修饰符可直接读取的类型化动作：原生闭包恒定消耗单位。 */
+    private val consumingTyped = setOf("hurryResearch", "hurryBuilding", "tradeMission", "assembleSpaceship")
 
     /** 原生 SpreadReligion／RemoveHeresy／伟人类型化动作不携带 associatedUnique，按类型回查其动作 Unique 以读取次数与消耗。 */
     private val abilityUniques = mapOf(
@@ -103,7 +105,7 @@ internal class UnitAbilityCommands(private val game: GameInfo, private val sessi
             ?: abilityUniques[candidate.wireType]?.let { raw.getMatchingUniques(it).firstOrNull() }
 
     private fun consumesUnit(raw: MapUnit, candidate: Candidate): Boolean {
-        // 伟人类型化动作（加速研究／加速建筑／贸易任务）的原生闭包恒定 unit.consume()，与 Unique 修饰符无关，先行判定。
+        // 伟人类型化动作（加速研究／加速建筑／贸易任务）与太空船组装的原生闭包恒定销毁单位，与 Unique 修饰符无关，先行判定。
         if (candidate.wireType in consumingTyped) return true
         val unique = actionUnique(raw, candidate) ?: return false
         val left = usagesLeft(raw, unique)
@@ -111,7 +113,8 @@ internal class UnitAbilityCommands(private val game: GameInfo, private val sessi
             (unique.hasModifier(UniqueType.UnitActionAfterWhichConsumed) && left == 1)
     }
 
-    /** 目标：传教／清异教／加速建筑作用于所在或所站城市，贸易作用于城邦，瞬建作用于当前格；科研与黄金时代为帝国范围。 */
+    /** 目标：传教／清异教／加速建筑作用于所在或所站城市，贸易作用于城邦，瞬建作用于当前格；
+     * 太空船组装指向己方当前首都（即使单位尚未到达，也用于指引移动）；科研与黄金时代为帝国范围。 */
     private fun targetDto(raw: MapUnit, wireType: String): JsonObject? {
         val tile = raw.currentTile
         return when (wireType) {
@@ -120,23 +123,37 @@ internal class UnitAbilityCommands(private val game: GameInfo, private val sessi
             "tradeMission" ->
                 tile.owningCity?.let { dto("city" to it.name, "position" to it.location.dto()) }
             "createImprovement" -> dto("position" to tile.position.dto())
+            "assembleSpaceship" -> player.getCapital()?.let { dto("city" to it.name, "position" to it.location.dto()) }
             else -> null
         }
     }
 
     private fun reason(raw: MapUnit, candidate: Candidate): String {
         if (candidate.action.action != null) return ""
+        // 原生 AddInCapital 只看“己方当前首都的城市中心”，不消耗也不要求行动力。
+        if (candidate.wireType == "assembleSpaceship") return "单位必须位于己方当前首都的城市中心"
         return if (!raw.hasMovement()) "行动力不足"
         else "当前目标或条件不满足（需站在合适地块、次数未耗尽且未达原生限制）"
     }
 
-    private fun effectText(wireType: String, action: UnitAction): String =
-        action.associatedUnique?.text?.removeConditionals() ?: when (wireType) {
+    private fun effectText(raw: MapUnit, candidate: Candidate): String =
+        candidate.action.associatedUnique?.text?.removeConditionals() ?: when (candidate.wireType) {
             "hurryResearch" -> "消耗单位，立即获得一批科研（原生结算）"
             "hurryBuilding" -> "消耗单位，为所在城市当前建筑追加产能（原生结算）"
             "tradeMission" -> "消耗单位，在城邦完成贸易任务获得金币与影响力（原生结算）"
-            else -> action.title
+            "assembleSpaceship" -> "消耗单位，将「${raw.name}」计入太空船组装进度（原生结算）"
+            else -> candidate.action.title
         }
+
+    /** 部件进度只读投影：需求来自启用中的科学胜利定义，不自行推算胜利条件。 */
+    private fun spaceshipProgress(raw: MapUnit): JsonObject? {
+        val victory = player.victoryManager.getAvailableVictories()
+            .firstOrNull { it.requiredSpaceshipParts.isNotEmpty() } ?: return null
+        val required = victory.requiredSpaceshipPartsAsCounter
+        val built = player.victoryManager.currentsSpaceshipParts
+        return dto("part" to raw.name, "assembled" to built[raw.name], "required" to required[raw.name],
+            "totalAssembled" to built.sumValues(), "totalRequired" to required.sumValues())
+    }
 
     private fun candidateDto(raw: MapUnit, candidate: Candidate): JsonObject {
         val unique = actionUnique(raw, candidate)
@@ -144,7 +161,7 @@ internal class UnitAbilityCommands(private val game: GameInfo, private val sessi
             "id" to candidate.id,
             "type" to candidate.wireType,
             "title" to candidate.action.title,
-            "effect" to effectText(candidate.wireType, candidate.action),
+            "effect" to effectText(raw, candidate),
             "position" to raw.currentTile.position.dto(),
             "target" to targetDto(raw, candidate.wireType),
             "usesLeft" to unique?.let { usagesLeft(raw, it) },
@@ -153,6 +170,7 @@ internal class UnitAbilityCommands(private val game: GameInfo, private val sessi
             "consumesUnit" to consumesUnit(raw, candidate),
             "enabled" to (candidate.action.action != null),
             "reason" to reason(raw, candidate),
+            "spaceship" to if (candidate.wireType == "assembleSpaceship") spaceshipProgress(raw) else null,
         )
     }
 

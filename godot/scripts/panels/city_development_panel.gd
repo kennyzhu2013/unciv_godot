@@ -286,10 +286,16 @@ func _populate_queue(editable: bool) -> void:
 			for item in orchestrator._economy().get("queuePurchases", []):
 				if int(item.index) != idx:
 					continue
-				var payload: Dictionary = orchestrator.economy_panel_inst.economy_request("cityPurchase", {"name": str(item.name), "stat": "Gold", "queueIndex": idx}, item.get("goldCost"))
-				var buy : Button = orchestrator.button(row, "金币购买此项 · %s" % orchestrator._num(item.get("goldCost"), true), orchestrator.economy_panel_inst.open_economy.bind(payload))
-				buy.name = "QueuePurchase"
-				orchestrator.economy_panel_inst.economy_button_metadata(buy, item, idx)
+				# 每种币种一条按钮；价格与资格逐项来自内核报价，前端不自行换算。
+				for quote in item.get("quotes", []):
+					if quote.get("cost") == null:
+						continue
+					var stat := str(quote.get("stat", "Gold"))
+					var payload: Dictionary = orchestrator.economy_panel_inst.economy_request("cityPurchase", {"name": str(item.name), "stat": stat, "queueIndex": idx}, quote.get("cost"))
+					var buy : Button = orchestrator.button(row, "%s购买此项 · %s" % [orchestrator.economy_panel_inst.stat_label(stat), orchestrator._num(quote.get("cost"), true)], orchestrator.economy_panel_inst.open_economy.bind(payload))
+					buy.name = "QueuePurchase" if stat == "Gold" else "QueuePurchaseFaith"
+					buy.set_meta("stat", stat)
+					orchestrator.economy_panel_inst.economy_button_metadata(buy, item, idx, quote)
 
 func _populate_constructions() -> void:
 	# 记住刷新前的选中项目名，重建后按名称恢复；本地筛选只影响展示，不改变内核候选或排序。

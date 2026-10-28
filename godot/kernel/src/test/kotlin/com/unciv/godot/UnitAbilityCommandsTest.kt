@@ -279,4 +279,179 @@ class UnitAbilityCommandsTest {
 
     // —— 为真实窗口 smoke 导出独立原生夹具（不经网关生成期望）——
     @Test fun exportNativeSmokeScenarios() { UnitAbilityFixtures.emit() }
+
+    // —— 太空船组装（第 2 批）——
+    private fun shipOf(candidate: JsonObject) = candidate["spaceship"]!!.jsonObject
+
+    @Test fun assembleSpaceshipMatchesNativeAndConsumesUnit() {
+        val game = UnitAbilityFixtures.game().also { add(it, "SS Booster", center) }
+        val id = game.currentPlayerCiv.units.getCivUnits().single().id
+        val session = sessionFor(game)
+        val data = options(session, id)
+        val c = candidate(data, "assembleSpaceship")
+        assertTrue("在己方首都应可组装：${c.text("reason")}", c.boolean("enabled"))
+        assertTrue("组装消耗单位", c.boolean("consumesUnit"))
+        // 部件与需求量只由 ruleset／胜利管理器提供（SS Booster 需 3 件，总计 6 件）。
+        assertEquals("SS Booster", shipOf(c).text("part"))
+        assertEquals(0, shipOf(c).integer("assembled"))
+        assertEquals(3, shipOf(c).integer("required"))
+        assertEquals(6, shipOf(c).integer("totalRequired"))
+        assertEquals(UnitAbilityFixtures.capital(game).name, c["target"]!!.jsonObject.text("city"))
+
+        val expected = expectedFor(game)
+        UnitAbilityFixtures.nativeAbility(expected, own(expected, id), UnitActionType.AddInCapital)
+        useAbility(session, id, data, "assembleSpaceship")
+        assertGameplayEquals("组装应与原生一致", expected, session.game!!)
+        assertEquals(1, session.game!!.currentPlayerCiv.victoryManager.currentsSpaceshipParts["SS Booster"])
+        assertTrue("组装后单位应消失", session.game!!.currentPlayerCiv.units.getCivUnits().none { it.id == id })
+        // 胜利页投影与能力页同源，且只读。
+        val revision = session.revision
+        val ship = run(session, "victoryOptions")["data"]!!.jsonObject["spaceship"]!!.jsonObject
+        assertEquals(1, ship.integer("built"))
+        assertEquals(6, ship.integer("required"))
+        assertEquals(revision, session.revision)
+    }
+
+    @Test fun assembleSpaceshipRequiresOwnCurrentCapital() {
+        val game = UnitAbilityFixtures.game()
+        val detached = UnitAbilityFixtures.placeAt(game, "SS Booster", HexCoord(2, 0))
+        val intruder = UnitAbilityFixtures.placeAt(game, "SS Cockpit", greeceCapital)
+        val former = UnitAbilityFixtures.placeAt(game, "SS Engine", center)
+        // 迁都后旧首都也失效：资格随“当前首都”而非任何己方城市中心。
+        native(game) {
+            val player = game.currentPlayerCiv
+            val old = UnitAbilityFixtures.capital(game)
+            val next = player.addCity(HexCoord(3, 3))
+            game.setTransients()
+            player.moveCapitalTo(next, old)
+            game.setTransients()
+        }
+        val session = sessionFor(game)
+        for (unit in listOf(detached, intruder, former)) {
+            val data = options(session, unit.id)
+            val c = candidate(data, "assembleSpaceship")
+            assertFalse("${unit.currentTile.position} 不应可组装", c.boolean("enabled"))
+            assertEquals("单位必须位于己方当前首都的城市中心", c.text("reason"))
+            // 禁用候选仍出现在票据中，强制提交必须被原生资格拒绝且零写入。
+            reject(session, request(session, "unitAbility", "unitId" to unit.id,
+                "candidateId" to c.text("id"), "token" to data.text("token")), "UNIT_ACTION")
+        }
+    }
+
+    @Test fun assemblingEveryPartTriggersNativeScientificVictory() {
+        val parts = listOf("SS Engine", "SS Stasis Chamber", "SS Cockpit", "SS Booster", "SS Booster", "SS Booster")
+        val game = UnitAbilityFixtures.game()
+        val expected = expectedFor(game)
+        // Apollo Program 是科学胜利的首个里程碑；两边同样补上，组装动作本身不做任何胜利补写。
+        native(game) { UnitAbilityFixtures.capital(game).cityConstructions.addBuilding("Apollo Program") }
+        native(expected) { UnitAbilityFixtures.capital(expected).cityConstructions.addBuilding("Apollo Program") }
+        game.setTransients(); expected.setTransients()
+        val session = sessionFor(game)
+        for ((index, name) in parts.withIndex()) {
+            if (index == parts.size - 1) {
+                // 最后一件前保存重载：进度必须来自持久化状态。
+                val saved = run(session, "save", "name" to "spaceship-before-final")["savedPath"]!!.jsonPrimitive.content
+                run(session, "load", "path" to saved)
+            }
+            val actual = session.game!!
+            val id = native(actual) { add(actual, name, center) }.id
+            assertEquals("并行构造的单位 id 应一致", id, native(expected) { add(expected, name, center) }.id)
+            val data = options(session, id)
+            useAbility(session, id, data, "assembleSpaceship")
+            UnitAbilityFixtures.nativeAbility(expected, own(expected, id), UnitActionType.AddInCapital)
+            // 网关在效果事务末尾跑原生胜利检查；期望端同样每步调用，不手动写胜利记录。
+            native(expected) { expected.checkForVictory() }
+            assertGameplayEquals("组装 $name 后应与原生一致", expected, session.game!!)
+        }
+        assertEquals(expected.victoryData!!.victoryType, session.game!!.victoryData!!.victoryType)
+        assertEquals("Scientific", session.game!!.victoryData!!.victoryType)
+        assertEquals(session.game!!.currentPlayerCiv.civID, session.game!!.victoryData!!.winningCiv)
+        assertGameplayEquals("六件组装完成后的胜利记录应与原生一致", expected, session.game!!)
+        val victory = run(session, "victoryOptions")["data"]!!.jsonObject
+        assertEquals("won", victory.text("outcome"))
+        assertEquals(6, victory["spaceship"]!!.jsonObject.integer("built"))
+        assertEquals(0, victory["spaceship"]!!.jsonObject["parts"]!!.jsonArray.count { it.jsonObject.integer("built") < it.jsonObject.integer("required") })
+        // 最后一件之后同样保存重载：胜利记录与部件进度必须来自持久化状态。
+        val after = run(session, "save", "name" to "spaceship-after-victory")["savedPath"]!!.jsonPrimitive.content
+        run(session, "load", "path" to after)
+        val reloadedVictory = run(session, "victoryOptions")["data"]!!.jsonObject
+        assertEquals("won", reloadedVictory.text("outcome"))
+        assertEquals(6, reloadedVictory["spaceship"]!!.jsonObject.integer("built"))
+        assertEquals("Scientific", session.game!!.victoryData!!.victoryType)
+        // 继续游戏只设置原生持久化标志，与原生一致。
+        run(session, "victoryContinue", "resultToken" to reloadedVictory["continue"]!!.jsonObject.text("token"))
+        native(expected) { expected.oneMoreTurnMode = true }
+        assertGameplayEquals("胜利后继续游戏应与原生一致", expected, session.game!!)
+    }
+
+    /**
+     * 生产链条：部件由城市生产队列原生完工（不是测试直接造单位），移动回首都后再走同一组装能力。
+     * 只把进度预置到“本回合完工”以避免空转数十回合；完工、落位与消耗仍全部由原生实现。
+     */
+    @Test fun producedPartMovesIntoCapitalAndAssembles() {
+        val game = UnitAbilityFixtures.game()
+        native(game) {
+            val capital = UnitAbilityFixtures.capital(game)
+            // 测试只关心生产与组装，不制造“科技完成”弹窗挡住后续命令（等价于玩家已关闭该提示）。
+            game.currentPlayerCiv.tech.addTechnology("Advanced Ballistics", showNotification = false)
+            // 铝由 Electricity 揭示，矿山需要 Mining；否则原生资源统计不会把这格铝算进产出。
+            game.currentPlayerCiv.tech.addTechnology("Electricity", showNotification = false)
+            game.currentPlayerCiv.tech.addTechnology("Mining", showNotification = false)
+            game.currentPlayerCiv.popupAlerts.clear()
+            capital.cityConstructions.addBuilding("Apollo Program")
+            // 部件消耗铝；把铝矿放在首都中心，让原生资源统计自然算进产出。
+            val capitalTile = game.tileMap[center]
+            capitalTile.tileResource = game.ruleset.tileResources["Aluminum"]
+            capitalTile.resourceAmount = 1
+            capitalTile.setTerrainTransients()
+            game.setTransients()
+            game.currentPlayerCiv.cache.updateCivResources()
+            val part = game.ruleset.units["SS Booster"]!!
+            capital.cityConstructions.addToQueue(part.name)
+            capital.reassignPopulation()
+            capital.cityStats.update()
+            capital.cityConstructions.inProgressConstructions[part.name] =
+                part.getProductionCost(game.currentPlayerCiv, capital)
+            game.setTransients()
+        }
+        val session = sessionFor(game)
+        var expected = NavalFixtures.apply(expectedFor(game), "nextTurn")
+        run(session, "nextTurn")
+        assertGameplayEquals("城市生产应原生完工部件", expected, session.game!!)
+        val produced = session.game!!.currentPlayerCiv.units.getCivUnits().single { it.name == "SS Booster" }
+
+        // 部件先离开首都再移动回来，移动资格与路径仍由原生 movement 判定。
+        val away = HexCoord(1, 0)
+        if (produced.currentTile.position == center) {
+            expected = NavalFixtures.apply(expected, "move", dto("unitId" to produced.id, "x" to away.x, "y" to away.y))
+            run(session, "move", "unitId" to produced.id, "x" to away.x, "y" to away.y)
+            assertGameplayEquals("生产出的部件离开首都", expected, session.game!!)
+        }
+        expected = NavalFixtures.apply(expected, "move", dto("unitId" to produced.id, "x" to center.x, "y" to center.y))
+        run(session, "move", "unitId" to produced.id, "x" to center.x, "y" to center.y)
+        assertGameplayEquals("部件移动回首都城市中心", expected, session.game!!)
+
+        val data = options(session, produced.id)
+        val c = candidate(data, "assembleSpaceship")
+        assertTrue("生产出的部件应能在首都组装：${c.text("reason")}", c.boolean("enabled"))
+        UnitAbilityFixtures.nativeAbility(expected, own(expected, produced.id), UnitActionType.AddInCapital)
+        useAbility(session, produced.id, data, "assembleSpaceship")
+        assertGameplayEquals("生产链条组装应与原生一致", expected, session.game!!)
+        assertEquals(1, session.game!!.currentPlayerCiv.victoryManager.currentsSpaceshipParts["SS Booster"])
+    }
+
+    @Test fun assembleSpaceshipDuplicateSubmitCountsOnce() {
+        val game = UnitAbilityFixtures.game().also { add(it, "SS Booster", center) }
+        val id = game.currentPlayerCiv.units.getCivUnits().single().id
+        val session = sessionFor(game)
+        val data = options(session, id)
+        val c = candidate(data, "assembleSpaceship")
+        val body = request(session, "unitAbility", "unitId" to id, "candidateId" to c.text("id"), "token" to data.text("token"))
+        val first = session.handle(body)
+        assertTrue(first["ok"]!!.jsonPrimitive.boolean)
+        val revision = session.revision
+        assertEquals("同 requestId 重试应返回同一响应", first, session.handle(body))
+        assertEquals("重复提交不得二次组装", revision, session.revision)
+        assertEquals(1, session.game!!.currentPlayerCiv.victoryManager.currentsSpaceshipParts["SS Booster"])
+    }
 }

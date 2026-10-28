@@ -9,11 +9,14 @@ import com.unciv.logic.GameInfo
 import com.unciv.logic.city.CityFlags
 import com.unciv.logic.files.UncivFiles
 import com.unciv.logic.map.HexCoord
+import com.unciv.models.UnitActionType
 import com.unciv.models.ruleset.Building
+import com.unciv.models.ruleset.INonPerpetualConstruction
 import com.unciv.models.ruleset.unit.BaseUnit
 import com.unciv.models.ruleset.tile.TileResource
 import com.unciv.models.ruleset.unique.Unique
 import com.unciv.models.stats.Stat
+import com.unciv.ui.screens.worldscreen.unit.actions.UnitActions
 import com.unciv.view.CityView
 import com.unciv.view.GameView
 import kotlinx.serialization.json.*
@@ -51,27 +54,30 @@ class CityEconomyCommandsTest {
         assertEquals(revision, session.revision)
     }
     private fun apply(session: GameSession, expected: GameInfo, action: String,
-                      vararg args: Pair<String, Any?>, operation: (CityView, GameView) -> Unit) {
+                      vararg args: Pair<String, Any?>, cityId: String = id(session),
+                      operation: (CityView, GameView) -> Unit) {
         economy(session)
         native(expected) {
             val view = GameView(expected, expected.currentPlayerCiv)
-            val city = view.civView.cities().first { it.id == id(session) }
+            val city = view.civView.cities().first { it.id == cityId }
             operation(city, view)
             city.updateCityStats()
         }
         val before = session.revision
         val game = session.game
-        run(session, action, "cityId" to id(session), *args)
+        run(session, action, "cityId" to cityId, *args)
         assertSame(game, session.game)
         assertEquals(before + 1, session.revision)
         assertGameplayEquals(action, expected, session.game!!)
         assertEquals(EconomyFixtures.summary(expected), EconomyFixtures.summary(session.game!!))
         assertEquals(expected.currentPlayerCiv.getCivResourcesByName(), session.game!!.currentPlayerCiv.getCivResourcesByName())
     }
-    private fun purchase(session: GameSession, expected: GameInfo, name: String, index: Int = -1) {
-        apply(session, expected, "cityPurchase", "name" to name, "stat" to "Gold", "queueIndex" to index) { cv, _ ->
+    private fun purchase(session: GameSession, expected: GameInfo, name: String, index: Int = -1,
+                         stat: Stat = Stat.Gold, cityId: String = id(session)) {
+        apply(session, expected, "cityPurchase", "name" to name, "stat" to stat.name,
+            "queueIndex" to index, cityId = cityId) { cv, _ ->
             val construction = expected.ruleset.buildings[name] ?: expected.ruleset.units[name]!!
-            assertTrue(cv.constructions.purchaseConstruction(construction, index, Stat.Gold, null))
+            assertTrue(cv.constructions.purchaseConstruction(construction, index, stat, null))
         }
     }
     private fun buy(session: GameSession, expected: GameInfo, at: HexCoord = EconomyFixtures.target) {
@@ -91,10 +97,16 @@ class CityEconomyCommandsTest {
         val (session, expected) = scenario("quotes")
         val data = economy(session)
         assertEquals(expected.currentPlayerCiv.gold, data.integer("gold"))
+        assertEquals(expected.currentPlayerCiv.religionManager.storedFaith, data.integer("faith"))
         native(expected) {
             val city = EconomyFixtures.capital(expected)
             val view = GameView(expected, expected.currentPlayerCiv)
             val cv = view.civView.cities().first { it.id == city.id }
+            val statNames = data["purchaseOptions"]!!.jsonArray.map { it.jsonObject }
+                .first { it["supported"]!!.jsonPrimitive.boolean }["quotes"]!!.jsonArray
+                .map { it.jsonObject.text("stat") }
+            // 前端不应自行换算：每种货币都由内核生成一条报价，顺序固定。
+            assertEquals(listOf("Gold", "Faith"), statNames)
             val tiles = data["buyTiles"]!!.jsonArray.map { it.jsonObject }
             val visible = city.tilesInRange.filter { view.getTile(it).isVisible() }.map { it.position }.toSet()
             assertEquals(visible, tiles.map { HexCoord(it.integer("x"), it.integer("y")) }.toSet())
@@ -105,10 +117,22 @@ class CityEconomyCommandsTest {
                 assertEquals(cost != null && cv.viewingCiv().hasStatToBuy(Stat.Gold, cost), tile["enabled"]!!.jsonPrimitive.boolean)
             }
             for (item in data["purchaseOptions"]!!.jsonArray.map { it.jsonObject }) {
-                val c = expected.ruleset.units[item.text("name")] ?: expected.ruleset.buildings[item.text("name")]!!
-                if (!item["supported"]!!.jsonPrimitive.boolean) continue
-                val price = if (c.canBePurchasedWithStat(city, Stat.Gold)) c.getStatBuyCost(city, Stat.Gold) else null
-                assertEquals(price, item["goldCost"]!!.jsonPrimitive.intOrNull)
+                if (!item["supported"]!!.jsonPrimitive.boolean) {
+                    // 未接入类别仍逐币种给出拒绝原因，不让前端因缺字段自行解释。
+                    assertTrue(item["quotes"]!!.jsonArray.map { it.jsonObject }
+                        .all { it["cost"] == JsonNull && !it["enabled"]!!.jsonPrimitive.boolean && it.text("reason").isNotEmpty() })
+                    continue
+                }
+                val c = (expected.ruleset.units[item.text("name")] ?: expected.ruleset.buildings[item.text("name")]!!)
+                    as INonPerpetualConstruction
+                for (quote in item["quotes"]!!.jsonArray.map { it.jsonObject }) {
+                    val stat = Stat.valueOf(quote.text("stat"))
+                    // 报价与可购买性完全对齐原生 API：不用金币公式推算信仰价格。
+                    val price = if (c.canBePurchasedWithStat(city, stat)) c.getStatBuyCost(city, stat) else null
+                    assertEquals(price, quote["cost"]!!.jsonPrimitive.intOrNull)
+                    assertEquals(price != null && city.cityConstructions.isConstructionPurchaseAllowed(c, stat, price),
+                        quote["enabled"]!!.jsonPrimitive.boolean)
+                }
             }
             assertEquals(city.cityConstructions.constructionQueue, data["queuePurchases"]!!.jsonArray.map { it.jsonObject.text("name") })
             val buildings = data["buildings"]!!.jsonArray.map { it.jsonObject }
@@ -252,15 +276,23 @@ class CityEconomyCommandsTest {
         for (index in listOf(value(0.5), value("2"), value(-2), value(99), value(1)))
             rejectRequest(session, "INVALID_ARGUMENT", JsonObject(base + ("queueIndex" to index)))
         reject(session, "INVALID_ARGUMENT", "cityPurchase", "name" to "NoSuchProject", "stat" to "Gold", "queueIndex" to -1)
-        reject(session, "UNSUPPORTED", "cityPurchase", "name" to "Warrior", "stat" to "Faith", "queueIndex" to -1)
+        // 信仰本期已接入：仅有未开放币种仍是 UNSUPPORTED，不能购买的币种由原生规则拒绝。
+        reject(session, "CANNOT_PURCHASE", "cityPurchase", "name" to "Warrior", "stat" to "Faith", "queueIndex" to -1)
+        reject(session, "UNSUPPORTED", "cityPurchase", "name" to "Warrior", "stat" to "Science", "queueIndex" to -1)
+        reject(session, "INVALID_ARGUMENT", "cityPurchase", "name" to "Warrior", "stat" to "NotAStat", "queueIndex" to -1)
         reject(session, "UNSUPPORTED", "cityPurchase", "name" to "Nothing", "stat" to "Gold", "queueIndex" to 3)
     }
 
-    @Test fun unsupportedUnitsAreRejectedBeforeRuleEligibility() {
+    @Test fun airAndNuclearPurchaseRemainUnsupported() {
         val (session, _) = scenario("unsupported")
-        for (name in listOf("Trireme", "Fighter", "Atomic Bomb", "Great Scientist", "Missionary")) {
-            if (!session.game!!.ruleset.units.containsKey(name)) continue
+        for (name in listOf("Fighter", "Atomic Bomb")) {
+            assertTrue(name in session.game!!.ruleset.units)
             reject(session, "UNSUPPORTED", "cityPurchase", "name" to name, "stat" to "Gold", "queueIndex" to -1)
+        }
+        // 海军、伟人、宗教单位不再按类别一刀切：只保留空军与核武的未接入提示。
+        for (item in economy(session)["purchaseOptions"]!!.jsonArray.map { it.jsonObject }) {
+            assertFalse(item.text("name") in setOf("Fighter", "Atomic Bomb")
+                && item["supported"]!!.jsonPrimitive.boolean)
         }
     }
 
@@ -319,6 +351,37 @@ class CityEconomyCommandsTest {
         }
         return pair
     }
+    /**
+     * 信仰场景：已完成主宗教的首都 + 5000 信仰。邻城辖地（4,0）供传教士跨境施法：
+     * 使命单位自带“可无开放边界进入外国领土”的原生 unique，施法目标仍是原生 `tile.owningCity`。
+     */
+    private fun faithScenario(name: String, configure: (GameInfo) -> Unit = {}): Pair<GameSession, GameInfo> {
+        val game = ReligionFixtures.foundedGame()
+        native(game) {
+            val player = game.currentPlayerCiv
+            ReligionFixtures.enemy(game).cities.first { it.location == ReligionFixtures.aiCity }
+                .expansion.takeOwnership(game.tileMap[HexCoord(4, 0)])
+            player.religionManager.storedFaith = 5000
+            player.addGold(2000 - player.gold)
+            game.civilizations.forEach { it.popupAlerts.clear(); it.notifications.clear() }
+            game.setTransients()
+            player.cities.forEach { it.cityStats.update() }
+            configure(game)
+        }
+        val file = ReligionFixtures.export(game, name)
+        return load(file) to UncivFiles.gameInfoFromString(file.readText())
+    }
+    /** 两端各自克隆规则容器后添加合成项目；不修改缓存内的基础规则对象。 */
+    private fun faithSpecial(name: String, setup: (GameInfo) -> Unit): Pair<GameSession, GameInfo> {
+        val pair = faithScenario(name)
+        for (g in listOf(pair.first.game!!, pair.second)) native(g) {
+            g.ruleset = g.ruleset.clone()
+            setup(g)
+            g.currentPlayerCiv.cities.forEach { it.cityStats.update() }
+        }
+        return pair
+    }
+
     private fun bonus(g: GameInfo, vararg uniques: String) {
         val b = Building().apply {
             name = "Economy Test Bonus"; cost = 50; ruleset = g.ruleset
@@ -372,7 +435,10 @@ class CityEconomyCommandsTest {
         val unit = expected.ruleset.units["Economy Test Unit"]!!
         assertFalse(unit.isBuildable(EconomyFixtures.capital(expected).cityConstructions))
         val option = economy(session)["purchaseOptions"]!!.jsonArray.first { it.jsonObject.text("name") == unit.name }.jsonObject
-        assertEquals(0, option.integer("goldCost")); assertTrue(option["enabled"]!!.jsonPrimitive.boolean)
+        val gold = option["quotes"]!!.jsonArray.map { it.jsonObject }.first { it.text("stat") == "Gold" }
+        assertEquals(0, gold["cost"]!!.jsonPrimitive.intOrNull)
+        assertTrue(gold["enabled"]!!.jsonPrimitive.boolean)
+        assertFalse(option["quotes"]!!.jsonArray.map { it.jsonObject }.first { it.text("stat") == "Faith" }["enabled"]!!.jsonPrimitive.boolean)
         purchase(session, expected, unit.name)
         assertEquals(2f, session.game!!.currentPlayerCiv.units.getCivUnits().first { it.name == unit.name }.currentMovement)
     }
@@ -389,6 +455,136 @@ class CityEconomyCommandsTest {
         }
         purchase(session, expected, "Warrior")
         assertEquals(2, session.game!!.currentPlayerCiv.civConstructions.boughtItemsWithIncreasingPrice["Warrior"])
+    }
+
+    /**
+     * 信仰购买传教士：价格、扣款、宗教归属、行动力罚没全部由原生 API 决定；
+     * 购买后经正常回合恢复行动力，再经网关能力入口执行同一次原生传教闭包。
+     */
+    @Test fun faithPurchaseOfMissionaryInstallsNativeReligionAndSpreads() {
+        var (session, expected) = faithScenario("faith-missionary")
+        val capital = EconomyFixtures.capital(session.game!!)
+        val before = capital.civ.religionManager.storedFaith
+        val cost = session.game!!.ruleset.units["Missionary"]!!.getStatBuyCost(capital, Stat.Faith)!!
+        assertTrue("信仰余额应足以购买传教士", cost in 1 until before)
+        purchase(session, expected, "Missionary", stat = Stat.Faith)
+        assertEquals(before - cost, session.game!!.currentPlayerCiv.religionManager.storedFaith)
+        val actual = session.game!!.currentPlayerCiv.units.getCivUnits().single { it.name == "Missionary" }
+        val nativeUnit = expected.currentPlayerCiv.units.getCivUnits().single { it.name == "Missionary" }
+        assertEquals(expected.currentPlayerCiv.religionManager.religion!!.name, actual.religion)
+        assertEquals(nativeUnit.religion, actual.religion)
+        // 原生 construct(boughtWith) 罚没行动力；传播次数来自 CanSpreadReligion 修饰符。
+        assertEquals(0f, actual.currentMovement)
+        assertEquals(nativeUnit.currentMovement, actual.currentMovement)
+        expected = NavalFixtures.apply(expected, "nextTurn")
+        run(session, "nextTurn")
+        assertGameplayEquals("购买传教士后回合", expected, session.game!!)
+        // 进入 AI 城辖地（非城中心）：使命单位的原生 unique 允许无开放边界进入，目标由 owningCity 决定。
+        val target = HexCoord(4, 0)
+        expected = NavalFixtures.apply(expected, "move", dto("unitId" to actual.id, "x" to target.x, "y" to target.y))
+        run(session, "move", "unitId" to actual.id, "x" to target.x, "y" to target.y)
+        assertGameplayEquals("传教士进入邻城辖地", expected, session.game!!)
+        // 长途移动耗尽行动力：再过一个正常回合，让原生恢复行动力后再执行传教。
+        expected = NavalFixtures.apply(expected, "nextTurn")
+        run(session, "nextTurn")
+        assertGameplayEquals("传教前回合", expected, session.game!!)
+        val options = run(session, "unitAbilityOptions", "unitId" to actual.id)["data"]!!.jsonObject
+        val spread = options["candidates"]!!.jsonArray.map { it.jsonObject }.first { it.text("type") == "spreadReligion" }
+        assertTrue("传教能力应可用：${spread.text("reason")}", spread["enabled"]!!.jsonPrimitive.boolean)
+        assertEquals(2, spread.integer("usesLeft"))
+        native(expected) {
+            UnitActions.getUnitActions(NavalFixtures.unit(expected, actual.id), UnitActionType.SpreadReligion)
+                .first { it.action != null }.action!!.invoke()
+        }
+        run(session, "unitAbility", "unitId" to actual.id,
+            "candidateId" to spread.text("id"), "token" to options.text("token"))
+        assertGameplayEquals("传教结果应与原生一致", expected, session.game!!)
+        val after = run(session, "unitAbilityOptions", "unitId" to actual.id)["data"]!!.jsonObject
+        assertEquals(1, after["candidates"]!!.jsonArray.map { it.jsonObject }
+            .first { it.text("type") == "spreadReligion" }.integer("usesLeft"))
+    }
+
+    /** 信仰建筑与合成伟人：只按原生的 CanBePurchasedWithStat／价格函数解释，不用金币公式推算。 */
+    @Test fun faithBuildingAndGreatPersonPurchaseMatchNative() {
+        val (session, expected) = faithSpecial("faith-general") { g ->
+            testBuilding(g, "Unbuildable", "Can be purchased with [Faith] [in all cities]")
+            testUnit(g, "Great Person", "Can be purchased with [Faith] [in all cities]")
+        }
+        val building = economy(session)["purchaseOptions"]!!.jsonArray.map { it.jsonObject }
+            .first { it.text("name") == "Economy Test Building" }
+        assertTrue(building["quotes"]!!.jsonArray.map { it.jsonObject }.first { it.text("stat") == "Faith" }["enabled"]!!.jsonPrimitive.boolean)
+        assertFalse(building["quotes"]!!.jsonArray.map { it.jsonObject }.first { it.text("stat") == "Gold" }["enabled"]!!.jsonPrimitive.boolean)
+        purchase(session, expected, "Economy Test Building", stat = Stat.Faith)
+        assertTrue("Economy Test Building" in EconomyFixtures.capital(session.game!!).cityConstructions.builtBuildings)
+        reject(session, "CANNOT_PURCHASE", "cityPurchase", "name" to "Economy Test Building", "stat" to "Gold", "queueIndex" to -1)
+        purchase(session, expected, "Economy Test Unit", stat = Stat.Faith)
+        assertEquals(1, session.game!!.currentPlayerCiv.units.getCivUnits().count { it.name == "Economy Test Unit" })
+    }
+
+    /** 信仰按队列索引购买：与金币共用原生命令，只替换币种；同名重复项按索引消耗对应位置。 */
+    @Test fun faithQueuePurchaseUsesExactDuplicateIndex() {
+        val (session, expected) = faithSpecial("faith-queue") { g ->
+            testUnit(g, "Can be purchased with [Faith] [in all cities]")
+            EconomyFixtures.capital(g).cityConstructions.constructionQueue =
+                arrayListOf("Warrior", "Economy Test Unit", "Economy Test Unit", "Nothing")
+        }
+        val queue = EconomyFixtures.capital(session.game!!).cityConstructions.constructionQueue.toList()
+        purchase(session, expected, "Economy Test Unit", index = 2, stat = Stat.Faith)
+        val after = EconomyFixtures.capital(session.game!!).cityConstructions.constructionQueue.toList()
+        assertEquals(queue.take(2), after.take(2))
+        assertEquals(queue[3], after[2])
+        assertEquals(1, session.game!!.currentPlayerCiv.units.getCivUnits().count { it.name == "Economy Test Unit" })
+    }
+
+    /** 连续信仰购买涨价与傀儡例外：计数与可买性均由原生 unique 解释，网关不维护自己的价格表。 */
+    @Test fun faithIncreasingPriceAndPuppetExceptionFollowNative() {
+        val (session, expected) = faithSpecial("faith-increasing") { g ->
+            testUnit(g, "Can be purchased with [Faith] [in all cities]")
+            bonus(g, "May buy [Economy Test Unit] units for [100] [Faith] [in all cities] at an increasing price ([20])")
+        }
+        purchase(session, expected, "Economy Test Unit", stat = Stat.Faith)
+        assertEquals(1, session.game!!.currentPlayerCiv.civConstructions.boughtItemsWithIncreasingPrice["Economy Test Unit"])
+        for (g in listOf(session.game!!, expected)) native(g) {
+            g.currentPlayerCiv.units.getCivUnits().first { it.name == "Economy Test Unit" && it.currentTile.isCityCenter() }.destroy()
+        }
+        purchase(session, expected, "Economy Test Unit", stat = Stat.Faith)
+        assertEquals(2, session.game!!.currentPlayerCiv.civConstructions.boughtItemsWithIncreasingPrice["Economy Test Unit"])
+        val (puppet, puppetExpected) = faithSpecial("faith-puppet") { g ->
+            EconomyFixtures.capital(g).isPuppet = true
+            testBuilding(g, "Can be purchased with [Faith] [in all cities]")
+            bonus(g, "May buy items in puppet cities")
+        }
+        purchase(puppet, puppetExpected, "Economy Test Building", stat = Stat.Faith)
+    }
+
+    /** 海军购买不再按类别禁购：内陆城由原生 canPlaceNewUnit 拒绝，沿海城购买后能原生移动。 */
+    @Test fun navalPurchaseFollowsNativeCoastalPlacement() {
+        val (inland, _) = scenario("navy-inland")
+        reject(inland, "CANNOT_PURCHASE", "cityPurchase", "name" to "Trireme", "stat" to "Gold", "queueIndex" to -1)
+        var (session, expected) = scenario("navy-coastal") { g ->
+            NavalFixtures.research(g, "Sailing")
+            for (at in listOf(HexCoord(0, -1), HexCoord(1, -1))) {
+                g.tileMap[at].baseTerrain = "Coast"
+                g.tileMap[at].setTerrainTransients()
+            }
+            // 研究前置科技会留下“科技完成”待决弹窗，导出前清空以保证 nextTurn 可达。
+            g.civilizations.forEach { it.popupAlerts.clear(); it.notifications.clear() }
+            g.setTransients()
+            g.currentPlayerCiv.cities.forEach { it.cityStats.update() }
+        }
+        assertTrue("首都应与海岸相邻", EconomyFixtures.capital(session.game!!).isCoastal())
+        purchase(session, expected, "Trireme")
+        val ship = session.game!!.currentPlayerCiv.units.getCivUnits().single { it.name == "Trireme" }
+        // 海军在沿岸城市中与原生一致地停在城市中心，购买后不能立即移动。
+        assertTrue("海军应停在沿海城中心", ship.currentTile.isCityCenter())
+        assertEquals(0f, ship.currentMovement)
+        expected = NavalFixtures.apply(expected, "nextTurn")
+        run(session, "nextTurn")
+        assertGameplayEquals("购买海军后回合", expected, session.game!!)
+        val to = listOf(HexCoord(0, -1), HexCoord(1, -1)).first { it != ship.currentTile.position }
+        expected = NavalFixtures.apply(expected, "move", dto("unitId" to ship.id, "x" to to.x, "y" to to.y))
+        run(session, "move", "unitId" to ship.id, "x" to to.x, "y" to to.y)
+        assertGameplayEquals("购买的海军应可原生移动", expected, session.game!!)
     }
 
     @Test fun puppetPurchaseUniqueDoesNotEnableOtherEditing() {

@@ -1,7 +1,7 @@
 extends "res://scripts/panels/transaction_controller.gd"
 
 # 单位主动能力事务域面板（T3.3，挂单位页）。承接内核 unitAbilityOptions 查询与 unitAbility 写命令：
-# 传教／清除异教／伟人加速研究·加速建造·城邦贸易·瞬建改良·开启黄金时代。
+# 传教／清除异教／伟人加速研究·加速建造·城邦贸易·瞬建改良·开启黄金时代·太空船部件组装。
 # 与 empire 级面板不同，本域绑定“当前选中单位”：main._resolve_unit 通过 set_context 推入 unitId 与
 # unitOptions.abilities 摘要；切换单位／推进回合／读档／刷新都会经 stamp 失效旧票据。
 #
@@ -25,6 +25,7 @@ const TYPE_LABELS := {
 	"spreadReligion": "传播宗教", "removeHeresy": "清除异教",
 	"hurryResearch": "加速研究", "hurryBuilding": "加速建造",
 	"tradeMission": "城邦贸易任务", "createImprovement": "瞬建改良", "goldenAge": "开启黄金时代",
+	"assembleSpaceship": "组装太空船部件",
 }
 
 func _init() -> void:
@@ -189,6 +190,8 @@ func warnings(candidate: Dictionary) -> PackedStringArray:
 			out.append("将改变城市宗教压力与信徒，可能触发外交标记。")
 		"goldenAge":
 			out.append("将开启黄金时代（帝国范围）。")
+		"assembleSpaceship":
+			out.append("部件将计入太空船进度；最后一件会触发原生科学胜利检查。")
 	return out
 
 func describe(candidate: Dictionary) -> String:
@@ -211,6 +214,12 @@ func describe(candidate: Dictionary) -> String:
 		lines.append("剩余次数：%s／%s" % [orchestrator._num(uses, true), orchestrator._num(maxu, true)])
 	elif uses != null:
 		lines.append("剩余次数：%s" % orchestrator._num(uses, true))
+	var ship = candidate.get("spaceship")
+	if ship is Dictionary:
+		lines.append("部件：%s（已组装 %s／需要 %s）" % [str(ship.get("part", "")),
+			orchestrator._num(ship.get("assembled"), true), orchestrator._num(ship.get("required"), true)])
+		lines.append("太空船总进度：%s／%s" % [orchestrator._num(ship.get("totalAssembled"), true),
+			orchestrator._num(ship.get("totalRequired"), true)])
 	var mc = candidate.get("movementCost")
 	if mc != null:
 		lines.append("消耗行动力：%s" % orchestrator._num(mc, true))
@@ -284,6 +293,9 @@ func submit_ability() -> void:
 	payload = {"params": {"unitId": unit_id, "candidateId": str(candidate.get("id", "")), "token": token},
 		"stamp": make_stamp(token)}
 	var text := "确认执行：%s\n目标单位 #%s\n" % [str(candidate.get("title", "")), unit_id]
+	var target = candidate.get("target")
+	if target is Dictionary and not str(target.get("city", "")).is_empty():
+		text += "目标城市：%s\n" % str(target.city)
 	var warns := warnings(candidate)
 	if not warns.is_empty():
 		for w in warns:

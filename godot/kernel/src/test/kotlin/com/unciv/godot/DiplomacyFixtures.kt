@@ -142,6 +142,99 @@ internal object DiplomacyFixtures {
             tradeDecision(g, if (choice == "mixed") "decline" else choice)
             record("trade-$choice-done", g)
         }
+        // 第 4 批：多条款、城市与第三方关系的来件交易，供真实窗口逐条核对并整笔接受。
+        val rich = start("trade-rich") { game ->
+            resource(game, game.currentPlayerCiv, "Iron", 2)
+            resource(game, enemy(game), "Furs", 2)
+            incomingTrade(game, trade(
+                our = listOf(
+                    TradeOffer(Constants.flatGold, TradeOfferType.Gold, 25, duration = -1),
+                    TradeOffer(Constants.goldPerTurn, TradeOfferType.Gold_Per_Turn, 1, 5),
+                    TradeOffer("Iron", TradeOfferType.Strategic_Resource, 1, 10)),
+                their = listOf(
+                    TradeOffer(Constants.flatGold, TradeOfferType.Gold, 75, duration = -1),
+                    TradeOffer("Furs", TradeOfferType.Luxury_Resource, 1, 10),
+                    TradeOffer(Constants.acceptEmbassy, TradeOfferType.Embassy, 1, duration = -1),
+                    TradeOffer(Constants.openBorders, TradeOfferType.Agreement, 1, 12))))
+        }
+        tradeDecision(rich, "accept")
+        record("trade-rich-done", rich)
+        val cityTrade = start("trade-city") { game ->
+            val founder = third(game)
+            val exchanged = enemy(game).cities.first { it.name == "陆战测试城" }
+            exchanged.foundingCivObject = founder
+            incomingTrade(game, trade(their = listOf(
+                TradeOffer(exchanged.id, TradeOfferType.City, 1, duration = -1))))
+            // 队列中的下一笔：接收城市后的解放待决应先阻塞它，而不是自动推进。
+            incomingTrade(game, trade(their = listOf(
+                TradeOffer(Constants.flatGold, TradeOfferType.Gold, 5, duration = -1))))
+        }
+        tradeDecision(cityTrade, "accept")
+        record("trade-city-done", cityTrade)
+        val thirdWar = start("trade-third") { game ->
+            val egypt = third(game)
+            incomingTrade(game, trade(their = listOf(
+                TradeOffer(egypt.civID, TradeOfferType.WarDeclaration, 1, duration = -1))))
+        }
+        tradeDecision(thirdWar, "accept")
+        record("trade-third-done", thirdWar)
+        val thirdPeace = start("trade-third-peace") { game ->
+            val egypt = third(game)
+            enemy(game).getDiplomacyManager(egypt)!!.declareWar()
+            game.currentPlayerCiv.popupAlerts.clear()
+            game.currentPlayerCiv.notifications.clear()
+            incomingTrade(game, trade(their = listOf(
+                TradeOffer(egypt.civID, TradeOfferType.PeaceProposal, 1, duration = -1))))
+        }
+        tradeDecision(thirdPeace, "accept")
+        record("trade-third-peace-done", thirdPeace)
+        // 第 5 批：主动报价、撤回、还价预填与再报价。
+        val send = start("trade-send")
+        native(send) {
+            val player = send.currentPlayerCiv
+            val view = TradeView(player, enemy(send), GameView(send, player))
+            view.setStagedTrade(Trade().apply {
+                ourOffers.add(TradeOffer(Constants.flatGold, TradeOfferType.Gold, 500, duration = -1))
+            })
+            check(view.tryProposeStagedTrade())
+        }
+        record("trade-send-sent", send)
+        record("trade-send-nextTurn", nextTurn(send))
+        val withdraw = start("trade-withdraw") { game -> resource(game, game.currentPlayerCiv, "Iron", 2) }
+        native(withdraw) {
+            val player = withdraw.currentPlayerCiv
+            val view = TradeView(player, enemy(withdraw), GameView(withdraw, player))
+            // 期限取原生可用报价，与原客户端加入资源条款的方式一致。
+            val source = view.ourAvailableOffers().single { it.name == "Iron" }
+            view.setStagedTrade(Trade().apply {
+                ourOffers.add(TradeOffer(source.name, source.type, 1, source.duration))
+            })
+            check(view.tryProposeStagedTrade())
+        }
+        record("trade-withdraw-sent", withdraw)
+        native(withdraw) {
+            check(TradeView(withdraw.currentPlayerCiv, enemy(withdraw),
+                GameView(withdraw, withdraw.currentPlayerCiv)).tryRetractOffer())
+        }
+        record("trade-withdraw-done", withdraw)
+        val renegotiate = start("trade-renegotiate") { game ->
+            incomingTrade(game, trade(their = listOf(
+                TradeOffer(Constants.flatGold, TradeOfferType.Gold, 40, duration = -1))))
+        }
+        native(renegotiate) {
+            renegotiate.currentPlayerCiv.tradeRequests.clear()
+            renegotiate.currentPlayerCiv.cache.updateCivResources()
+        }
+        record("trade-renegotiate-done", renegotiate)
+        native(renegotiate) {
+            val player = renegotiate.currentPlayerCiv
+            val view = TradeView(player, enemy(renegotiate), GameView(renegotiate, player))
+            view.setStagedTrade(Trade().apply {
+                theirOffers.add(TradeOffer(Constants.flatGold, TradeOfferType.Gold, 40, duration = -1))
+            })
+            check(view.tryProposeStagedTrade())
+        }
+        record("trade-renegotiate-sent", renegotiate)
         for ((type, choices) in alertChoices) {
             val file = file("diplomacy-$type") { alert(it, type) }
             for (choice in choices) {
@@ -174,6 +267,44 @@ internal object DiplomacyFixtures {
 
     fun incoming(game: GameInfo, ourGold: Int = 0, theirGold: Int = 0) {
         game.currentPlayerCiv.tradeRequests.add(TradeRequest(enemy(game).civID, peace(game, ourGold, theirGold)))
+    }
+
+    /** 任意条款的来件提案；[our] 为接收方（玩家）给出的条款，[their] 为提案方给出的条款。 */
+    fun trade(our: List<TradeOffer> = emptyList(), their: List<TradeOffer> = emptyList()): Trade = Trade().apply {
+        ourOffers.addAll(our)
+        theirOffers.addAll(their)
+    }
+
+    fun incomingTrade(game: GameInfo, trade: Trade, from: Civilization = enemy(game)) {
+        game.currentPlayerCiv.tradeRequests.add(TradeRequest(from.civID, trade))
+    }
+
+    /** 向首都中心格注入资源并刷新原生统计；自动补齐可见与开采科技，避免地块被判定为无法供给。 */
+    fun resource(game: GameInfo, civ: Civilization, name: String, amount: Int = 2) = native(game) {
+        val resource = game.ruleset.tileResources[name] ?: error("未知资源：$name")
+        resource.revealedBy?.let { civ.tech.addTechnology(it) }
+        for (improvement in resource.getImprovements())
+            game.ruleset.tileImprovements[improvement]?.techRequired?.let { civ.tech.addTechnology(it) }
+        (civ.getCapital() ?: civ.cities.first()).getCenterTile().apply {
+            tileResource = resource
+            resourceAmount = amount
+            setTerrainTransients()
+        }
+        civ.cache.updateCivResources()
+        civ.updateStatsForNextTurn()
+        // 注入资源需要补科技，给人类玩家的科技弹窗会阻断交易队列；与原生无弹窗的稳定状态对齐。
+        game.currentPlayerCiv.popupAlerts.clear()
+        game.currentPlayerCiv.notifications.clear()
+        Unit
+    }
+
+    /** 双方均已接触的主要文明第三方，并清掉接触产生的弹窗，便于直接处置交易。 */
+    fun third(game: GameInfo, name: String = "Egypt"): Civilization = native(game) {
+        val civ = addCiv(game, name, -6, -6)
+        enemy(game).diplomacyFunctions.makeCivilizationsMeet(civ)
+        game.currentPlayerCiv.popupAlerts.clear()
+        game.currentPlayerCiv.notifications.clear()
+        civ
     }
 
     /** 仅在初始场景建立城邦关系；连续回合测试不会调用此初始化或清空中途事件。 */

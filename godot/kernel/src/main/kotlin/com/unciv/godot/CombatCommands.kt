@@ -56,7 +56,10 @@ internal class CombatCommands(private val game: GameInfo) {
     }
 
     fun ensureNoBlockingBattleDecision() {
-        if (player.popupAlerts.any { it.type == AlertType.CityConquered || it.type !in GameSession.informationalAlerts })
+        // 原生会在打开下一个弹窗前移除队首连续失效事件，它们不构成阻塞；其余弹窗都会遮住地图。
+        val queue = PendingQueue(game)
+        val blocking = player.popupAlerts.filter(queue::isOpenable)
+        if (blocking.any { it.type == AlertType.CityConquered || routeOf(it.type) != AlertRoute.Informational })
             throw GatewayError("PENDING_DECISION", "请先处理待决事件；未接入的事件可保存后用原客户端处理")
     }
 

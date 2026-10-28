@@ -153,6 +153,8 @@ var tabs: TabContainer
 var unit_scroll: ScrollContainer
 var matters_scroll: ScrollContainer
 var bottom_pending := Label.new()
+# 失效待决清理：仅在快照声明可安全清理时启用，提交走 pendingCleanup 受限事务。
+var cleanup_pending_button: Button
 var _updating_pickers := false            # 重建下拉时抑制 item_selected 回调，避免误触发重新选择
 # 前端本地选择状态（不写入存档）：活动上下文、页签、选择代际与重载纪元。
 var active_context := ""        # "" | "unit" | "city" | "tile"
@@ -496,6 +498,8 @@ func _build_matters_tab() -> void:
 	page.add_child(pending)
 	victory_panel_inst.build(page)
 	button(page, "消息已阅", func(): await execute("acknowledge"))
+	cleanup_pending_button = button(page, "清理失效待决", func(): await execute("pendingCleanup"))
+	cleanup_pending_button.disabled = true
 	diplomacy_panel_inst.build_open_button(page)
 	religion_panel_inst.build_open_button(page)
 	great_person_panel_inst.build(page)
@@ -720,7 +724,7 @@ func _on_busy(is_busy: bool) -> void:
 			focus_option.disabled = true
 
 func execute(action: String, params: Dictionary = {}, committing = null) -> Dictionary:
-	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "victoryOptions", "assetDecisionOptions", "eventOptions", "combatPreview", "cityBombardPreview", "path", "unitRoute", "snapshot", "hello", "newGameOptions", "listSaves", "empireOverview", "notificationOptions", "researchOptions", "policyOptions"]
+	var query := action in ["cityOptions", "unitOptions", "diplomacyOptions", "diplomacyTradeOptions", "diplomacyTradePreview", "religionOptions", "greatPersonOptions", "diplomaticVoteOptions", "victoryOptions", "assetDecisionOptions", "eventOptions", "combatPreview", "cityBombardPreview", "path", "unitRoute", "snapshot", "hello", "newGameOptions", "listSaves", "empireOverview", "notificationOptions", "researchOptions", "policyOptions"]
 	if (game_setup.uncertain or information.uncertain) and not query:
 		return {"ok": false, "error": {"code": "STATE_UNCERTAIN", "message": "操作结果未确认，请先刷新，暂不可保存或再次切换。"}}
 	if _victory_pending() and not query and action not in ["load", "demo", "newGame", "resume", "save", "diplomaticVoteAcknowledge", "victoryContinue"]:
@@ -865,8 +869,12 @@ func _rebuild_pending(data: Dictionary) -> void:
 	var lines := PackedStringArray()
 	var actionable := 0
 	for choice in data.pending:
-		lines.append(("" if choice.supported else "[未接入] ") + str(choice.message))
-		if choice.supported:
+		var line := ("" if choice.supported else "[未接入] ") + str(choice.message)
+		var enabled := bool(choice.get("enabled", true))
+		if not enabled:
+			line += "（被待处理弹窗阻挡）" if str(choice.get("blockedBy", "")) == "alert" else "（当前不可执行）"
+		lines.append(line)
+		if choice.supported and enabled:
 			actionable += 1
 		if choice.kind == "cityCapture" and choice.supported:
 			capture_id = str(choice.target)
@@ -883,6 +891,12 @@ func _rebuild_pending(data: Dictionary) -> void:
 			asset_panel_inst.render_pending_choice(choice)
 	pending.text = "\n".join(lines) if not lines.is_empty() else "无强制选择；可以结束回合。"
 	bottom_pending.text = ("待办 %d 项（其中 %d 项已接入，详见「事项」页）" % [data.pending.size(), actionable]) if not data.pending.is_empty() else "无强制选择；可以结束回合。"
+	var cleanup: Dictionary = data.get("pendingCleanup", {})
+	if is_instance_valid(cleanup_pending_button):
+		var cleanup_allowed := bool(cleanup.get("available", false))
+		cleanup_pending_button.set_meta("allowed", cleanup_allowed)
+		cleanup_pending_button.disabled = not cleanup_allowed
+		cleanup_pending_button.tooltip_text = str(cleanup.get("reason", ""))
 	for p in panels:
 		p.on_snapshot_pending(data.pending)
 	# 待决占城优先显示处置区。

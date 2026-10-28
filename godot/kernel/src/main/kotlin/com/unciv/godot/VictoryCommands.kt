@@ -54,6 +54,20 @@ internal class VictoryCommands(private val game: GameInfo, private val session: 
     private fun checkKeys(request: JsonObject, keys: Set<String>) {
         ensure((request.keys - envelope - keys).isEmpty(), "INVALID_ARGUMENT", "含未支持的胜利参数")
     }
+
+    /** 太空船组装进度：只在启用中的胜利定义了部件时给出，需求数量完全来自 ruleset。 */
+    private fun spaceshipProgress(): JsonObject? {
+        val victory = player.victoryManager.getAvailableVictories()
+            .firstOrNull { it.requiredSpaceshipParts.isNotEmpty() } ?: return null
+        val required = victory.requiredSpaceshipPartsAsCounter
+        val built = player.victoryManager.currentsSpaceshipParts
+        return dto("name" to victory.name,
+            "parts" to required.keys.map { name ->
+                dto("name" to name, "built" to built[name], "required" to required[name])
+            },
+            "built" to built.sumValues(), "required" to required.sumValues())
+    }
+
     fun options(request: JsonObject): JsonObject {
         checkKeys(request, emptySet())
         scope()
@@ -81,7 +95,7 @@ internal class VictoryCommands(private val game: GameInfo, private val session: 
         return JsonObject(snapshotSummary() + dto("description" to description.tr(hideIcons = true),
             "score" to player.calculateTotalScore(), "difficulty" to game.difficulty, "speed" to game.gameParameters.speed,
             "maxTurns" to if (player.victoryManager.getAvailableVictories().any { it.enablesMaxTurns() }) game.gameParameters.maxTurns else null,
-            "progress" to progress, "continue" to dto("enabled" to (problem == null), "code" to (problem?.code ?: ""),
+            "progress" to progress, "spaceship" to spaceshipProgress(), "continue" to dto("enabled" to (problem == null), "code" to (problem?.code ?: ""),
                 "reason" to (problem?.message ?: ""), "token" to if (problem == null) token() else null)))
     }
     fun prepare(request: JsonObject): () -> Unit {

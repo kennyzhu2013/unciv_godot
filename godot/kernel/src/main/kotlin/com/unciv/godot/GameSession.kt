@@ -50,6 +50,7 @@ internal class GameSession(root: File, private val saveDirectory: File =
         contributeCityCombat(this, this@GameSession)
         CityStateWire.contribute(this, this@GameSession)
         DiplomacyWire.contribute(this, this@GameSession)
+        TradeWire.contribute(this, this@GameSession)
         EmpireInformation.contribute(this, this@GameSession)
         contributeUnitOrders(this, this@GameSession)
         contributeUnitAbilities(this, this@GameSession)
@@ -244,15 +245,15 @@ internal class GameSession(root: File, private val saveDirectory: File =
                 val latest = saves.latest()
                 // 继续按钮确认时绑定已展示的文件，不能静默切换为外部新增的另一份存档。
                 ensure(ctx.request.text("path") == latest.absolutePath, "SAVE_CHANGED", "最新存档已变化，请重新打开存档列表")
-                saves.load(latest)
+                loaded { saves.load(latest) }
             }, executeFn = { ctx, _ -> ctx.autoSave = true })
         registry.effect("load", source = CandidateSource.LOADED, inPlace = false, allowedDuringVictory = true,
-            openCandidate = { ctx -> saves.load(File(ctx.request.text("path"))) },
+            openCandidate = { ctx -> loaded { saves.load(File(ctx.request.text("path"))) } },
             executeFn = { ctx, _ -> ctx.autoSave = true })
         registry.effect("demo", source = CandidateSource.LOADED, inPlace = false, allowedDuringVictory = true, openCandidate = {
             val demo = File(saveDirectory, "demo.json")
             if (!demo.exists()) saves.save(KernelRuntime.createDemo(), demo)
-            saves.load(demo)
+            loaded { saves.load(demo) }
         })
         registry.effect("save", source = CandidateSource.CURRENT, inPlace = false, checksVictory = false, allowedDuringVictory = true, executeFn = { ctx, _ ->
             val name = ctx.request.text("name")
@@ -276,17 +277,35 @@ internal class GameSession(root: File, private val saveDirectory: File =
             })
         registry.effect("acknowledge",
             prepareFn = { _ ->
-                val alert = requireGame().currentPlayerCiv.popupAlerts.firstOrNull() ?: throw GatewayError("NO_ALERT", "没有待确认消息")
-                ensure(alert.type in informationalAlerts, "UNSUPPORTED", "此事件需要选择，不能跳过处置")
+                val alert = PendingQueue(requireGame()).openableHead() ?: throw GatewayError("NO_ALERT", "没有待确认消息")
+                ensure(routeOf(alert.type) == AlertRoute.Informational, "UNSUPPORTED", "此事件需要选择，不能跳过处置")
                 val thunk: () -> Unit = { }
                 thunk
             },
             executeFn = { ctx, _ ->
-                val civ = ctx.candidate.currentPlayerCiv
-                val alert = civ.popupAlerts.firstOrNull() ?: throw GatewayError("NO_ALERT", "没有待确认消息")
-                ensure(alert.type in informationalAlerts, "UNSUPPORTED", "此事件需要尚未接入的选择界面")
-                civ.popupAlerts.removeAt(0)
+                val alert = PendingQueue(ctx.candidate).openableHead() ?: throw GatewayError("NO_ALERT", "没有待确认消息")
+                ensure(routeOf(alert.type) == AlertRoute.Informational, "UNSUPPORTED", "此事件需要尚未接入的选择界面")
+                ctx.candidate.currentPlayerCiv.popupAlerts.remove(alert)
             })
+        // 只移除原生不会打开的队首事件，以及在弹窗清空后确认失效的交易；不设拒绝冷却、不转移资产。
+        registry.effect("pendingCleanup",
+            prepareFn = { _ ->
+                PendingQueue.problem(requireGame())?.let { throw it }
+                val thunk: () -> Unit = { }
+                thunk
+            },
+            executeFn = { ctx, _ ->
+                PendingQueue.problem(ctx.candidate)?.let { throw it }
+                PendingQueue(ctx.candidate).cleanup()
+            })
+    }
+
+    /**
+     * 读档后重算派生速率：statsForNextTurn 不入存档，缺失时每回合金、购买与科研/金收益都按 0 判定。
+     * 只重算统计，不推进回合、不产生可见事件，与原生读档后进入世界界面的状态一致。
+     */
+    private fun loaded(build: () -> GameInfo): GameInfo = build().also { candidate ->
+        for (civ in candidate.civilizations) civ.updateStatsForNextTurn()
     }
 
     companion object {

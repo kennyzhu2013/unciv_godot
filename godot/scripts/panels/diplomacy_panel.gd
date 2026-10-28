@@ -20,6 +20,20 @@ var gold_box := VBoxContainer.new()       # 原 diplomacy_gold_box
 var open_button: Button                   # 原 diplomacy_open_button（挂在事项页）
 var civ_id := ""                          # 原 diplomacy_civ_id
 
+# --- 第 5 批：主动交易构建器（主要文明）---
+# 候选与上限来自内核 diplomacyTradeOptions（原生 TradeLogic），此处只拼装草稿。
+var trade_box := VBoxContainer.new()
+var trade_options: Dictionary = {}       # 最近一次 diplomacyTradeOptions 的 data
+var trade_staged: Array = []             # [{side,type,name,amount,duration}]
+var trade_preview_data: Dictionary = {}  # 最近一次 diplomacyTradePreview 的 data
+var trade_prefill: Dictionary = {}       # 还价：移除来件后要预填的原始草稿
+var trade_side_index := 0                # 0=我方给出，1=对方给出
+var trade_query_generation := 0
+var trade_load_pending := 0              # 已排队/在途的候选查询数：外部落定等待依此避开竞态
+var trade_side_picker: OptionButton
+var trade_clause_picker: OptionButton
+var trade_amount_spin: SpinBox
+
 func _init() -> void:
 	confirmation = ConfirmationDialog.new()
 	refresh_order = 3   # event=0 → vote=1 → great_person=2 → diplomacy=3 → religion=4
@@ -54,6 +68,9 @@ func build_tab() -> void:
 	content.add_child(pending)
 	content.add_child(details)
 	content.add_child(gold_box)
+	trade_box.name = "TradeBuilder"
+	trade_box.add_theme_constant_override("separation", 6)
+	content.add_child(trade_box)
 	for pair in [["我方支付（一次性金币）", our_gold, "OurGold"], ["对方支付（一次性金币）", their_gold, "TheirGold"]]:
 		orchestrator._diplomacy_text(gold_box, pair[0])
 		var spin: SpinBox = pair[1]
@@ -97,12 +114,18 @@ func open_diplomacy() -> void:
 		orchestrator.tabs.current_tab = orchestrator.TAB_DIPLOMACY
 
 # --- 失效（逐字搬运 _invalidate_diplomacy：额外清零双方金币输入）---
+# 草稿是本地输入，普通刷新（含保存、回合切换）保留；预览票据绑定修订号，状态一变即作废。
 func invalidate() -> void:
 	generation += 1
 	stamp = {}
 	data = {}
 	our_gold.value = 0
 	their_gold.value = 0
+	trade_query_generation += 1
+	trade_options = {}
+	trade_preview_data = {}
+	if is_instance_valid(trade_box):
+		orchestrator._clear_dynamic(trade_box)
 	cancel()
 
 # --- 状态戳（逐字搬运 _diplomacy_state_stamp）---
@@ -156,6 +179,13 @@ func query() -> void:
 		uncertain = true
 		invalidate()
 		populate()
+		return
+	# 主要文明且无待决事件时串行取一次交易候选（内核会整笔拦截 PENDING_DECISION）；
+	# 有来件时仍需取（还价入口、双边报价都来自候选），仅待决外交事件不取。
+	# 放在 query 内而非 populate 里即发即忘，否则残留在途查询会与后续命令争单一通道。
+	var civ := diplomacy_civ()
+	if civ.get("type", "") == "major" and not data.get("pendingAlert") is Dictionary:
+		await load_trade_options()
 
 # 旧响应注入测试也调用本入口；不将注入声称为网络乱序。
 func apply_response(res: Dictionary, s: Dictionary) -> bool:
@@ -186,8 +216,17 @@ func select_diplomacy_civ(index: int) -> void:
 	generation += 1
 	our_gold.value = 0
 	their_gold.value = 0
+	# 草稿绑定原对象：切换文明即作废，避免把旧条款发给新对象。
+	trade_query_generation += 1
+	trade_options = {}
+	trade_staged.clear()
+	trade_preview_data = {}
+	trade_prefill = {}
 	stamp = make_stamp()
 	populate()
+	# 同步信号回调里只能即发即忘；候选仅在主要文明时有意义（内部会退避到空闲）。
+	if diplomacy_civ().get("type", "") == "major":
+		load_trade_options()
 
 func diplomacy_civ() -> Dictionary:
 	for civ in data.get("civilizations", []):
@@ -195,14 +234,317 @@ func diplomacy_civ() -> Dictionary:
 			return civ
 	return {}
 
+func trade_clause(item: Dictionary) -> String:
+	var text := str(item.get("text", item.get("label", "")))
+	if not bool(item.get("supported", true)):
+		text += "（不支持：%s）" % str(item.get("problem", ""))
+	return text
+
 func trade_terms(trade: Dictionary) -> String:
 	var lines := PackedStringArray()
 	for side in [["ourOffers", "我方给出"], ["theirOffers", "对方给出"]]:
 		var terms := PackedStringArray()
 		for item in trade.get(side[0], []):
-			terms.append("%s ×%s%s" % [item.label, orchestrator._num(item.get("amount"), true), "（%s 回合）" % orchestrator._num(item.duration, true) if item.get("duration") != null else ""])
-		lines.append("%s：%s" % [side[1], "、".join(terms) if not terms.is_empty() else "无"])
+			terms.append("· " + trade_clause(item))
+		lines.append("%s：\n%s" % [side[1], "\n".join(terms) if not terms.is_empty() else "无"])
+	for entry in [["effects", "即时效果"], ["risks", "风险"]]:
+		var items: Array = trade.get(entry[0], [])
+		if not items.is_empty():
+			lines.append(entry[1] + "：\n" + "\n".join(items.map(func(item): return "· " + str(item))))
 	return "\n".join(lines)
+
+# 完整条款在待决区展示；确认框只放整笔摘要，避免长文本把原生确认按钮挤到无法点击。
+func trade_confirm(trade: Dictionary, choice: Dictionary) -> String:
+	var lines := PackedStringArray([str(trade.get("name", "")), str(choice.get("label", ""))])
+	for side in [["ourOffers", "我方给出"], ["theirOffers", "对方给出"]]:
+		var labels := PackedStringArray()
+		for item in trade.get(side[0], []):
+			labels.append(str(item.get("label", item.get("text", ""))))
+		lines.append("%s %d 项：%s" % [side[1], labels.size(), "、".join(labels) if not labels.is_empty() else "无"])
+	lines.append("整笔结算；即时效果 %d 条、风险 %d 条，完整条款见待决区。" % [
+		trade.get("effects", []).size(), trade.get("risks", []).size()])
+	return "\n".join(lines)
+
+# --- 第 5 批：主动交易构建器（条款选择、预览、发送、撤回、还价）---
+
+func trade_text(parent: Node, text: String, node_name := "") -> Label:
+	var line := Label.new()
+	line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	line.text = text
+	if not node_name.is_empty():
+		line.name = node_name
+	parent.add_child(line)
+	return line
+
+# 候选查询是详情落定后的二次查询：先等客户端空闲，代际和 civId 双重校验，丢弃过期响应。
+func load_trade_options() -> void:
+	trade_load_pending += 1
+	# 与后续命令共争单一 HTTP 通道：未空闲就退避，避免被 BUSY 拒后停留在空候选。
+	var deadline := Time.get_ticks_msec() + 60000
+	while orchestrator.client.busy and Time.get_ticks_msec() < deadline:
+		await orchestrator.get_tree().process_frame
+	var target := civ_id
+	trade_query_generation += 1
+	var query_generation := trade_query_generation
+	var res: Dictionary = await orchestrator.client.command("diplomacyTradeOptions", {"civId": target})
+	trade_load_pending -= 1
+	if query_generation != trade_query_generation or target != civ_id or uncertain:
+		return
+	if not res.get("ok", false) or not res.get("data") is Dictionary:
+		trade_options = {}
+		orchestrator._clear_dynamic(trade_box)
+		trade_text(trade_box, "交易候选不可用：" + str(res.get("error", {}).get("message", "未知错误")), "TradeError")
+		orchestrator._on_busy(orchestrator.client.busy)
+		return
+	trade_options = res.data
+	populate_trade()
+
+func populate_trade() -> void:
+	orchestrator._clear_dynamic(trade_box)
+	trade_side_picker = null
+	trade_clause_picker = null
+	trade_amount_spin = null
+	var civ := diplomacy_civ()
+	if civ.get("type", "") != "major" or trade_options.is_empty():
+		orchestrator._on_busy(orchestrator.client.busy)
+		return
+	apply_trade_prefill()
+	trade_text(trade_box, "主动交易 · 候选、金额上限与期限来自原生可用报价", "TradeHeading")
+	var pending := str(trade_options.get("pending", ""))
+	if not pending.is_empty():
+		trade_text(trade_box, "已发提案等待对方回合；发送新提案前必须先撤回。", "TradePending")
+		var withdraw: Button = orchestrator.button(trade_box, "撤回已发提案", trade_withdraw)
+		withdraw.name = "TradeWithdraw"
+		withdraw.set_meta("allowed", stamp_valid(stamp))
+	var incoming = trade_options.get("incoming")
+	if incoming is Dictionary:
+		trade_text(trade_box, "收到该文明的提案。还价会先移除来件（不写原生拒绝冷却），再把原条款预填到下方；取消草稿不会自动恢复来件。", "TradeIncoming")
+		var renegotiate: Button = orchestrator.button(trade_box, "还价：移除来件并预填", trade_renegotiate)
+		renegotiate.name = "TradeRenegotiate"
+		renegotiate.set_meta("allowed", stamp_valid(stamp))
+	trade_build_composer()
+	trade_build_staged()
+	orchestrator._on_busy(orchestrator.client.busy)
+
+func trade_candidates() -> Array:
+	var key := "ourOffers" if trade_side_index == 0 else "theirOffers"
+	var result := []
+	for item in trade_options.get(key, []):
+		if item is Dictionary and bool(item.get("tradable", false)):
+			result.append(item)
+	return result
+
+func trade_candidate_at(index: int) -> Dictionary:
+	var candidates := trade_candidates()
+	if index < 0 or index >= candidates.size():
+		return {}
+	return candidates[index]
+
+func trade_build_composer() -> void:
+	var row := HBoxContainer.new()
+	row.name = "TradeSideRow"
+	trade_box.add_child(row)
+	trade_side_picker = OptionButton.new()
+	trade_side_picker.name = "TradeSide"
+	trade_side_picker.add_item("我方给出")
+	trade_side_picker.add_item("对方给出")
+	trade_side_picker.select(trade_side_index)
+	row.add_child(trade_side_picker)
+	trade_side_picker.item_selected.connect(trade_change_side)
+	trade_clause_picker = OptionButton.new()
+	trade_clause_picker.name = "TradeClausePicker"
+	trade_clause_picker.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	trade_clause_picker.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(trade_clause_picker)
+	var candidates := trade_candidates()
+	for item in candidates:
+		trade_clause_picker.add_item(str(item.get("text", item.get("label", ""))))
+	if candidates.is_empty():
+		trade_clause_picker.add_item("当前没有可交易条款")
+		trade_clause_picker.disabled = true
+	trade_clause_picker.item_selected.connect(trade_change_clause)
+	trade_amount_spin = SpinBox.new()
+	trade_amount_spin.name = "TradeAmount"
+	trade_amount_spin.min_value = 1
+	trade_amount_spin.step = 1
+	trade_amount_spin.rounded = true
+	trade_amount_spin.custom_minimum_size.y = 34
+	row.add_child(trade_amount_spin)
+	trade_sync_amount(0)
+	var add: Button = orchestrator.button(row, "加入条款", trade_add_clause)
+	add.name = "TradeAdd"
+	add.set_meta("allowed", not candidates.is_empty() and stamp_valid(stamp))
+
+func trade_change_side(index: int) -> void:
+	trade_side_index = index
+	trade_preview_data = {}
+	populate_trade()
+
+func trade_change_clause(index: int) -> void:
+	trade_preview_data = {}
+	trade_sync_amount(index)
+
+func trade_sync_amount(index: int) -> void:
+	if trade_amount_spin == null or not is_instance_valid(trade_amount_spin):
+		return
+	var candidate := trade_candidate_at(index)
+	var upper: int = max(1, int(candidate.get("maxAmount", 1)))
+	trade_amount_spin.max_value = upper
+	trade_amount_spin.value = 1
+	trade_amount_spin.editable = upper > 1
+
+func trade_staged_text(staged: Dictionary) -> String:
+	var side := "我方给出" if staged.get("side") == "ourOffers" else "对方给出"
+	var candidate := {}
+	for key in ["ourOffers", "theirOffers"]:
+		for item in trade_options.get(key, []):
+			if item is Dictionary and item.get("type") == staged.get("type") and item.get("rawName") == staged.get("name"):
+				candidate = item
+				break
+		if not candidate.is_empty():
+			break
+	var label := str(candidate.get("label", staged.get("type", "")))
+	var duration := int(staged.get("duration", -1))
+	var suffix := "" if duration <= 0 else "（%d 回合）" % duration
+	return "%s：%s ×%d%s" % [side, label, int(staged.get("amount", 1)), suffix]
+
+func trade_add_clause() -> void:
+	if orchestrator._input_locked() or trade_clause_picker == null or trade_clause_picker.selected < 0:
+		return
+	var candidate := trade_candidate_at(trade_clause_picker.selected)
+	if candidate.is_empty():
+		return
+	for staged in trade_staged:
+		if staged.type == str(candidate.get("type")) and staged.name == str(candidate.get("rawName")):
+			orchestrator.message.text = "该条款已加入，请先移除后再修改。"
+			return
+	trade_staged.append({
+		"side": "ourOffers" if trade_side_index == 0 else "theirOffers",
+		"type": str(candidate.get("type", "")),
+		"name": str(candidate.get("rawName", "")),
+		"amount": int(trade_amount_spin.value) if trade_amount_spin != null else 1,
+		"duration": int(candidate.get("defaultDuration", -1))})
+	trade_preview_data = {}
+	populate_trade()
+
+func trade_remove_clause(index: int) -> void:
+	if index < 0 or index >= trade_staged.size():
+		return
+	trade_staged.remove_at(index)
+	trade_preview_data = {}
+	populate_trade()
+
+func trade_build_staged() -> void:
+	if trade_staged.is_empty():
+		trade_text(trade_box, "尚未加入条款；加入后先预览，再发送。", "TradeEmpty")
+	for index in range(trade_staged.size()):
+		var row := HBoxContainer.new()
+		row.name = "TradeRow%d" % index
+		trade_box.add_child(row)
+		trade_text(row, trade_staged_text(trade_staged[index]), "TradeRowText%d" % index)
+		var remove: Button = orchestrator.button(row, "移除", trade_remove_clause.bind(index))
+		remove.name = "TradeRemove%d" % index
+		remove.set_meta("allowed", stamp_valid(stamp))
+	var actions := HBoxContainer.new()
+	actions.name = "TradeActions"
+	trade_box.add_child(actions)
+	var preview: Button = orchestrator.button(actions, "预览提案", trade_run_preview)
+	preview.name = "TradePreview"
+	preview.set_meta("allowed", not trade_staged.is_empty() and stamp_valid(stamp))
+	var send: Button = orchestrator.button(actions, "发送提案", trade_send)
+	send.name = "TradeSend"
+	send.set_meta("allowed", bool(trade_options.get("canSend", false)) and bool(trade_preview_data.get("supported", false)) and stamp_valid(stamp))
+	if trade_preview_data.is_empty():
+		return
+	var supported := bool(trade_preview_data.get("supported", false))
+	trade_text(trade_box, "预览：可发送（金额与期限按原生规范化）" if supported else "预览：不可发送", "TradePreviewStatus")
+	for problem in trade_preview_data.get("problems", []):
+		trade_text(trade_box, "· " + str(problem), "TradeProblem")
+	trade_text(trade_box, trade_terms(trade_preview_data), "TradeTerms")
+
+func trade_draft() -> Dictionary:
+	var ours := []
+	var theirs := []
+	for staged in trade_staged:
+		var clause := {"type": staged.type, "name": staged.name,
+			"amount": int(staged.amount), "duration": int(staged.duration)}
+		if staged.side == "ourOffers":
+			ours.append(clause)
+		else:
+			theirs.append(clause)
+	return {"ourOffers": ours, "theirOffers": theirs}
+
+func apply_trade_prefill() -> void:
+	if trade_prefill.is_empty():
+		return
+	for key in ["ourOffers", "theirOffers"]:
+		for clause in trade_prefill.get(key, []):
+			if not clause is Dictionary:
+				continue
+			trade_staged.append({"side": key, "type": str(clause.get("type", "")),
+				"name": str(clause.get("name", "")), "amount": int(clause.get("amount", 1)),
+				"duration": int(clause.get("duration", -1))})
+	trade_prefill = {}
+
+func trade_run_preview() -> void:
+	if orchestrator._input_locked() or trade_staged.is_empty() or civ_id.is_empty():
+		return
+	var target := civ_id
+	orchestrator._on_busy(true)
+	var res: Dictionary = await orchestrator.client.command("diplomacyTradePreview", {"civId": target, "draft": trade_draft()})
+	orchestrator._on_busy(orchestrator.client.busy)
+	if target != civ_id:
+		return
+	if not res.get("ok", false) or not res.get("data") is Dictionary:
+		trade_preview_data = {}
+		orchestrator.message.text = str(res.get("error", {}).get("message", "提案预览失败"))
+		populate_trade()
+		return
+	trade_preview_data = res.data
+	populate_trade()
+
+func trade_send() -> void:
+	if orchestrator._input_locked() or trade_preview_data.is_empty():
+		return
+	if not bool(trade_preview_data.get("supported", false)):
+		return
+	var preview := trade_preview_data.duplicate(true)
+	await open_diplomacy_confirmation({
+		"action": "diplomacyTradeSend",
+		"params": {"civId": civ_id, "draft": preview.get("draft", {}), "tradeToken": str(preview.get("tradeToken", ""))},
+		"stamp": stamp.duplicate(true),
+		"description": "向 %s 发送整笔提案\n%s\n\n发送不会立即成交；对方会在其回合接受、还价或拒绝。" % [str(trade_options.get("name", "")), trade_terms(preview)]})
+
+func trade_withdraw() -> void:
+	var pending := str(trade_options.get("pending", ""))
+	if pending.is_empty():
+		return
+	await open_diplomacy_confirmation({
+		"action": "diplomacyTradeWithdraw",
+		"params": {"civId": civ_id, "tradeToken": pending},
+		"stamp": stamp.duplicate(true),
+		"description": "%s\n撤回已发提案（恢复资源可用性，不写拒绝冷却）。" % str(trade_options.get("name", ""))})
+
+# 还价：先移除来件（不写拒绝冷却），同一草稿在刷新后预填回构建器。
+func trade_renegotiate() -> void:
+	var incoming = trade_options.get("incoming")
+	if not incoming is Dictionary or orchestrator._input_locked():
+		return
+	var token := str(incoming.get("tradeToken", ""))
+	if token.is_empty() or not stamp_valid(stamp):
+		await refresh()
+		return
+	trade_prefill = incoming.get("draft", {}).duplicate(true)
+	transaction = true
+	orchestrator._on_busy(true)
+	var res: Dictionary = await orchestrator.execute("diplomacyTradeRenegotiate", {"tradeToken": token}, self)
+	transaction = false
+	orchestrator._on_busy(orchestrator.client.busy)
+	if not res.get("ok", false):
+		trade_prefill = {}
+		orchestrator.message.text = str(res.get("error", {}).get("message", "还价失败"))
+		return
+	orchestrator.message.text = "已移除来件并预填原条款；调整后预览并发送。"
 
 func diplomacy_choice(parent: Node, option: Dictionary, action: String, params: Dictionary, description: String) -> Button:
 	var p := {"action": action, "params": params.duplicate(true), "description": description,
@@ -218,6 +560,7 @@ func diplomacy_choice(parent: Node, option: Dictionary, action: String, params: 
 func populate() -> void:
 	orchestrator._clear_dynamic(pending)
 	orchestrator._clear_dynamic(details)
+	orchestrator._clear_dynamic(trade_box)
 	picker.clear()
 	if uncertain:
 		orchestrator._diplomacy_text(pending, "外交状态未确认，旧选择已禁用。恢复连接后请刷新；不会自动重新提交。")
@@ -239,9 +582,11 @@ func populate() -> void:
 	if trade is Dictionary:
 		orchestrator._diplomacy_text(pending, "收到 %s 的提案\n%s" % [trade.name, trade_terms(trade)])
 		if not trade.get("supported", false):
-			orchestrator._diplomacy_text(pending, "含未支持条件：需原客户端接受，不能仅接受部分条款。")
+			orchestrator._diplomacy_text(pending, "含未支持或不一致的条款，整笔不能接受；可拒绝或等其失效后清理。")
+			for problem in trade.get("problems", []):
+				orchestrator._diplomacy_text(pending, "· " + str(problem))
 		for choice in trade.get("choices", []):
-			diplomacy_choice(pending, choice, "diplomacyTradeDecision", {"tradeToken": str(trade.tradeToken), "choice": str(choice.id)}, "%s\n%s\n%s" % [trade.name, choice.label, trade_terms(trade)])
+			diplomacy_choice(pending, choice, "diplomacyTradeDecision", {"tradeToken": str(trade.tradeToken), "choice": str(choice.id)}, trade_confirm(trade, choice))
 	if not alert is Dictionary and not trade is Dictionary:
 		orchestrator._diplomacy_text(pending, "没有外交待决。其他强制选择请查看事项页。")
 	var civ := diplomacy_civ()
@@ -269,6 +614,7 @@ func populate() -> void:
 		for offer in civ.get("outgoingTrades", []):
 			orchestrator._diplomacy_text(details, "已发提案（等待对方回合）\n" + trade_terms(offer))
 			diplomacy_choice(details, offer.retract, "diplomacyRetractPeace", {"civId": str(civ.civId), "tradeToken": str(offer.tradeToken)}, "%s\n撤回提案\n%s" % [civ.name, trade_terms(offer)])
+		# 交易候选不再在这里即发即忘：刷新链内由 query 串行等待，切换文明时由本面板直调。
 	orchestrator._on_busy(orchestrator.client.busy)
 
 func populate_city_state(civ: Dictionary) -> void:
@@ -377,7 +723,20 @@ func confirm_diplomacy() -> void:
 	transaction = false
 	orchestrator._on_busy(orchestrator.client.busy)
 	if res.get("ok", false):
-		orchestrator.message.text = "提案已发送，当前仍在战争中，等待对方回合。" if p.action == "diplomacyProposePeace" else "外交操作完成 · 状态版本 %s" % orchestrator.client.revision
+		match str(p.action):
+			"diplomacyProposePeace":
+				orchestrator.message.text = "提案已发送，当前仍在战争中，等待对方回合。"
+			"diplomacyTradeSend":
+				# 草稿已变成对方的待决提案：清空条款、预览与还价预填，避免同一笔条款被重复编辑。
+				trade_staged.clear()
+				trade_prefill = {}
+				trade_preview_data = {}
+				populate_trade()
+				orchestrator.message.text = "交易提案已发送，等待对方回合处理。"
+			"diplomacyTradeWithdraw", "diplomacyRetractPeace":
+				orchestrator.message.text = "提案已撤回。"
+			_:
+				orchestrator.message.text = "外交操作完成 · 状态版本 %s" % orchestrator.client.revision
 	else:
 		orchestrator.message.text = str(res.get("error", {}).get("message", "外交操作失败"))
 
@@ -386,6 +745,12 @@ func apply_busy(is_busy: bool) -> void:
 	picker.disabled = is_busy or picker.item_count == 0
 	for spin in [our_gold, their_gold]:
 		spin.editable = not is_busy and gold_box.visible
+	if trade_side_picker != null and is_instance_valid(trade_side_picker):
+		trade_side_picker.disabled = is_busy
+	if trade_clause_picker != null and is_instance_valid(trade_clause_picker):
+		trade_clause_picker.disabled = is_busy or trade_clause_picker.item_count == 0
+	if trade_amount_spin != null and is_instance_valid(trade_amount_spin):
+		trade_amount_spin.editable = not is_busy and trade_amount_spin.max_value > 1
 
 func should_refresh(active_tab: int) -> bool:
 	return transaction or active_tab == orchestrator.TAB_DIPLOMACY
@@ -407,6 +772,9 @@ func reset_selection() -> void:
 	uncertain = false
 	invalidate()
 	civ_id = ""
+	# 读档／新开局：草稿属于原来那一局，整份作废（预填与已加入条款都不再可用）。
+	trade_staged.clear()
+	trade_prefill = {}
 
 func busy_confirmation_message() -> String:
 	return "请先确认或取消外交选择"

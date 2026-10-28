@@ -32,7 +32,7 @@ internal class CityCaptureCommands(private val game: GameInfo) {
     }
 
     fun prepare(id: String, choice: String): () -> Unit {
-        val alert = player.popupAlerts.firstOrNull()
+        val alert = PendingQueue(game).openableHead()
         if (alert == null || alert.type != AlertType.CityConquered || alert.value != id)
             throw GatewayError("CITY_DECISION", "没有对应的当前占城决策")
         val city = city(alert) ?: throw GatewayError("CITY_DECISION", "城市不处于待处置状态")

@@ -14,6 +14,7 @@ extends "res://scripts/panels/transaction_controller.gd"
 
 var economy_scroll: ScrollContainer
 var economy_balance := Label.new()
+var economy_stat := OptionButton.new()
 var economy_filter := LineEdit.new()
 var economy_picker := OptionButton.new()
 var economy_detail := Label.new()
@@ -47,8 +48,19 @@ func build_tab() -> void:
 	page.add_child(economy_tile_card)
 	buy_tile_button = orchestrator.button(page, "购买选中地块", request_buy_tile)
 	buy_tile_button.name = "BuySelectedTile"
-	orchestrator.label(page, "金币购买（独立于生产队列资格）")
-	economy_filter.placeholder_text = "筛选金币购买项目…"
+	orchestrator.label(page, "购买货币（金币／信仰，报价由内核逐币种给出）")
+	economy_stat.name = "EconomyStat"
+	economy_stat.fit_to_longest_item = false
+	economy_stat.custom_minimum_size.y = 34
+	economy_stat.add_item("金币")
+	economy_stat.set_item_metadata(0, "Gold")
+	economy_stat.add_item("信仰")
+	economy_stat.set_item_metadata(1, "Faith")
+	economy_stat.select(0)
+	# 切换币种只重算预览与按钮可用性，不触发任何查询或写入。
+	economy_stat.item_selected.connect(func(_index): populate_economy_picker())
+	page.add_child(economy_stat)
+	economy_filter.placeholder_text = "筛选购买项目…"
 	economy_filter.name = "EconomyFilter"
 	economy_filter.text_changed.connect(func(_text): populate_economy_picker())
 	page.add_child(economy_filter)
@@ -59,7 +71,7 @@ func build_tab() -> void:
 	economy_picker.item_selected.connect(func(_index): preview_purchase())
 	page.add_child(economy_picker)
 	page.add_child(economy_detail)
-	purchase_button = orchestrator.button(page, "金币购买所选项目", request_purchase)
+	purchase_button = orchestrator.button(page, "购买所选项目", request_purchase)
 	purchase_button.name = "PurchaseConstruction"
 	orchestrator.label(page, "已建建筑")
 	page.add_child(economy_buildings)
@@ -106,10 +118,28 @@ func populate_buy_tile() -> void:
 		orchestrator._dash(tile.get("terrain")) if visible else "当前不可见", orchestrator._num(quote.get("cost"), true),
 		orchestrator._num(orchestrator._economy().get("gold"), true), str(quote.get("reason", "目标不可购买或当前不可见"))]
 
+# --- 当前选择的购买货币（默认金币）---
+func selected_stat() -> String:
+	if economy_stat.selected < 0:
+		return "Gold"
+	var meta = economy_stat.get_item_metadata(economy_stat.selected)
+	return str(meta) if meta != null else "Gold"
+
+func stat_label(stat: String) -> String:
+	return "信仰" if stat == "Faith" else "金币"
+
+# --- 从内核报价中取当前币种一项；前端不自行换算价格或推断资格 ---
+func quote_of(item: Dictionary) -> Dictionary:
+	for quote in item.get("quotes", []):
+		if str(quote.get("stat", "")) == selected_stat():
+			return quote
+	return {}
+
 # --- 经济子页填充（逐字搬运 _populate_economy）---
 func populate_economy() -> void:
 	var data: Dictionary = orchestrator._economy()
-	economy_balance.text = "余额：%s 金币%s\n%s" % [orchestrator._num(data.get("gold"), true),
+	economy_balance.text = "余额：%s 金币 · %s 信仰%s\n%s" % [orchestrator._num(data.get("gold"), true),
+		orchestrator._num(data.get("faith"), true),
 		" · godMode（各动作遵循原生规则）" if data.get("godMode", false) else "", data.get("blockedReason", "")]
 	buy_mode_button.set_meta("allowed", not data.is_empty())
 	orchestrator.map.set_buy_tiles(data.get("buyTiles", []) if orchestrator.buy_tile_mode else [])
@@ -137,7 +167,7 @@ func economy_selection() -> Dictionary:
 	var item = economy_picker.get_item_metadata(economy_picker.selected)
 	return item if item is Dictionary else {}
 
-# --- 金币购买下拉填充（逐字搬运 _populate_economy_picker；局部 filter 改名 filter_text 避免遮蔽内建）---
+# --- 购买下拉填充（逐字搬运 _populate_economy_picker；局部 filter 改名 filter_text 避免遮蔽内建）---
 func populate_economy_picker() -> void:
 	var previous := str(economy_selection().get("name", ""))
 	var filter_text := economy_filter.text.strip_edges().to_lower()
@@ -154,37 +184,42 @@ func populate_economy_picker() -> void:
 			economy_picker.add_item(str(item.name))
 			var index := economy_picker.item_count - 1
 			economy_picker.set_item_metadata(index, item.duplicate(true))
-			economy_picker.set_item_tooltip(index, str(item.get("reason", "")))
+			economy_picker.set_item_tooltip(index, str(quote_of(item).get("reason", "")))
 			if item.name == previous:
 				restored = index
 	# 禁用项目仍可选择查看原因；无有效旧选择时保持明确未选择。
 	economy_picker.select(restored)
 	preview_purchase()
 
-# --- 购买预览（逐字搬运 _preview_purchase）---
+# --- 购买预览（逐字搬运 _preview_purchase，改为逐币种报价）---
 func preview_purchase() -> void:
 	var item := economy_selection()
-	economy_detail.text = "请选择项目查看内核报价。" if item.is_empty() else "%s · %s 金币\n%s" % [
-		item.name, orchestrator._num(item.get("goldCost"), true), item.get("reason", "")]
+	var quote := quote_of(item)
+	economy_detail.text = "请选择项目查看内核报价。" if item.is_empty() else "%s · %s %s\n%s" % [
+		item.name, orchestrator._num(quote.get("cost"), true), stat_label(selected_stat()),
+		quote.get("reason", "该项目没有该币种报价")]
 	if purchase_button:
-		purchase_button.set_meta("allowed", item.get("enabled", false))
+		purchase_button.set_meta("allowed", not item.is_empty() and quote.get("enabled", false))
 	orchestrator._on_busy(orchestrator.client.busy)
 
-# --- 经济按钮元数据（逐字搬运 _economy_button_metadata）---
-func economy_button_metadata(control: Button, item: Dictionary, index: int) -> void:
+# --- 经济按钮元数据（逐字搬运 _economy_button_metadata；quote 为空时回退到当前币种）---
+func economy_button_metadata(control: Button, item: Dictionary, index: int, quote := {}) -> void:
 	control.set_meta("cityId", orchestrator.city_id)
 	control.set_meta("projectName", str(item.get("name", "")))
 	control.set_meta("queueIndex", index)
 	control.set_meta("revision", orchestrator.client.revision)
-	control.set_meta("allowed", item.get("enabled", false))
-	control.tooltip_text = str(item.get("reason", ""))
+	var effective: Dictionary = quote if not quote.is_empty() else quote_of(item)
+	control.set_meta("allowed", effective.get("enabled", false))
+	control.tooltip_text = str(effective.get("reason", ""))
 
-# --- 构造经济请求 payload（逐字搬运 _economy_request）---
+# --- 构造经济请求 payload（逐字搬运 _economy_request；同时冻结两种余额供确认框展示）---
 func economy_request(action: String, params: Dictionary, price) -> Dictionary:
 	var args := params.duplicate(true)
 	args.cityId = orchestrator.city_id
+	var data: Dictionary = orchestrator._economy()
 	return {"action": action, "params": args, "stamp": orchestrator.city_stamp.duplicate(true), "price": price,
-		"gold": orchestrator._economy().get("gold"), "cityName": orchestrator.city_data.get("name", "")}
+		"gold": data.get("gold"), "faith": data.get("faith"), "stat": str(args.get("stat", "")),
+		"cityName": orchestrator.city_data.get("name", "")}
 
 # --- 请求购买地块（逐字搬运 _request_buy_tile）---
 func request_buy_tile() -> void:
@@ -192,11 +227,13 @@ func request_buy_tile() -> void:
 	if orchestrator.buy_tile_mode and quote.get("enabled", false):
 		await open_economy(economy_request("cityBuyTile", orchestrator.buy_tile_target, quote.get("cost")))
 
-# --- 请求金币购买（逐字搬运 _request_purchase）---
+# --- 请求购买（逐字搬运 _request_purchase，改为按当前币种报价提交）---
 func request_purchase() -> void:
 	var item := economy_selection()
-	if item.get("enabled", false):
-		await open_economy(economy_request("cityPurchase", {"name": str(item.name), "stat": "Gold", "queueIndex": -1}, item.get("goldCost")))
+	var quote := quote_of(item)
+	if quote.get("enabled", false):
+		await open_economy(economy_request("cityPurchase",
+			{"name": str(item.name), "stat": selected_stat(), "queueIndex": -1}, quote.get("cost")))
 
 # --- 打开经济确认框（逐字搬运 _open_economy；形参 payload 改名 request 避免遮蔽基类成员）---
 func open_economy(request: Dictionary) -> void:
@@ -214,9 +251,11 @@ func open_economy(request: Dictionary) -> void:
 		description = "地块 (%s, %s)" % [args.x, args.y]
 	elif int(args.get("queueIndex", -1)) >= 0:
 		description += " · 队列第 %d 项" % (int(args.queueIndex) + 1)
-	confirmation.dialog_text = "%s\n%s\n%s：%s 金币 · 当前余额：%s%s" % [request.cityName,
+	confirmation.dialog_text = "%s\n%s\n%s：%s %s · 当前余额：%s%s" % [request.cityName,
 		description, "出售收入" if request.action == "citySellBuilding" else "价格", orchestrator._num(request.price, true),
-		orchestrator._num(request.gold, true), "\n出售不可撤销。" if request.action == "citySellBuilding" else ""]
+		stat_label(str(request.get("stat", ""))),
+		orchestrator._num(request.get("faith") if str(request.get("stat", "")) == "Faith" else request.get("gold"), true),
+		"\n出售不可撤销。" if request.action == "citySellBuilding" else ""]
 	confirmation.dialog_autowrap = true
 	confirmation.popup_centered(Vector2i(mini(480, int(orchestrator.size.x) - 48), 230))
 
@@ -251,6 +290,7 @@ func gates_on_confirmation_visible() -> bool:
 # 复刻 _on_busy 中经济控件的禁用/可编辑分支。
 func apply_busy(is_busy: bool) -> void:
 	economy_picker.disabled = is_busy or economy_picker.item_count == 0
+	economy_stat.disabled = is_busy
 	economy_filter.editable = not is_busy
 
 # STALE_STATE 等业务错误码：原 execute 仅 _cancel_economy()（无独立 data/stamp/代际失效）。

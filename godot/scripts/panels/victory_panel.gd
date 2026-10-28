@@ -49,7 +49,7 @@ func build(page: Node) -> void:
 	progress.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.add_child(progress)
 	panel.add_child(scroll)
-	orchestrator._religion_text(panel, "尚未接入：新游戏配置、排名、历史曲线、回放、胜利插画与音效。\n部分胜利所需的主动操作（如太空船组装）尚未接入。")
+	orchestrator._religion_text(panel, "尚未接入：新游戏配置、排名、历史曲线、回放、胜利插画与音效。\n太空船部件由单位页“使用单位能力”在首都组装。")
 	confirmation.name = "VictoryConfirmation"
 	confirmation.title = "继续这场游戏？"
 	confirmation.dialog_autowrap = true
@@ -152,6 +152,12 @@ func populate() -> void:
 			for milestone in victory.get("milestones", []):
 				var status: String = {"Completed": "已完成", "Partially": "当前目标", "Incomplete": "未完成"}.get(str(milestone.get("status", "")), "未知")
 				orchestrator._religion_text(progress, "[%s] %s" % [status, milestone.get("text", "")])
+		# 部件数量只展示内核从 ruleset 与胜利管理器读出的值，不在前端推算。
+		var ship = data.get("spaceship")
+		if ship is Dictionary:
+			orchestrator._religion_text(progress, "太空船组装：%s／%s" % [orchestrator._num(ship.get("built"), true), orchestrator._num(ship.get("required"), true)])
+			for part in ship.get("parts", []):
+				orchestrator._religion_text(progress, "%s：%s／%s" % [part.get("name", ""), orchestrator._num(part.get("built"), true), orchestrator._num(part.get("required"), true)])
 	if uncertain:
 		result_text.text = "状态未确认，继续按钮已禁用。请恢复连接后刷新；不会自动重新提交。\n" + result_text.text
 	continue_button.set_meta("allowed", not uncertain and stamp_valid(stamp) and data.get("continue", {}).get("enabled", false))

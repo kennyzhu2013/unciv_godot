@@ -98,6 +98,7 @@ internal class PlayerSnapshot(private val game: GameInfo) {
         "policies" to if (civ.policies.canAdoptPolicy())
             game.ruleset.policies.values.filter { civ.policies.isAdoptable(it) }.map { it.name } else emptyList<String>(),
         "pending" to pending(),
+        "pendingCleanup" to PendingQueue(game).cleanupSummary(),
         "religion" to ReligionCommands(game).snapshotSummary(),
         "diplomaticVote" to DiplomaticVoteCommands(game).snapshotSummary(),
         "victory" to VictoryCommands(game).snapshotSummary(),
@@ -105,17 +106,20 @@ internal class PlayerSnapshot(private val game: GameInfo) {
     )
 
     fun pending(): List<JsonObject> = buildList {
-        fun add(kind: String, message: String, supported: Boolean = true, target: String = "") {
-            add(dto("kind" to kind, "message" to message, "supported" to supported, "target" to target))
+        fun add(kind: String, message: String, supported: Boolean = true, target: String = "",
+                action: String = "", blockedBy: String = "") {
+            add(dto("kind" to kind, "message" to message, "supported" to supported, "target" to target,
+                "action" to action, "blockedBy" to blockedBy))
         }
+        fun routed(entry: JsonObject, action: String) { add(JsonObject(entry + dto("action" to action))) }
         val vote = DiplomaticVoteCommands(game).pending()
         if (vote?.text("kind") == "voteResult") add(vote)
         VictoryCommands(game).pending()?.let { add(it) }
         for (city in view.civView.cities())
             if (!city.isPuppet() && city.currentConstructionName().isEmpty())
-                add("production", "${city.name} 需要选择生产")
-        if (view.civView.shouldOpenTechPicker()) add("research", "请选择科技")
-        if (view.civView.shouldShowPolicyPicker()) add("policy", "请选择政策，或明确暂缓")
+                add("production", "${city.name} 需要选择生产", target = city.id, action = "production")
+        if (view.civView.shouldOpenTechPicker()) add("research", "请选择科技", action = "researchOptions")
+        if (view.civView.shouldShowPolicyPicker()) add("policy", "请选择政策，或明确暂缓", action = "policyOptions")
         GreatPersonCommands(game).pending()?.let { add(it) }
         if (view.civView.canFoundPantheon() || view.civView.canExpandPantheon() || view.civView.isFoundingReligion()
             || view.civView.isEnhancingReligion() || view.civView.hasFreeBeliefs())
@@ -123,17 +127,17 @@ internal class PlayerSnapshot(private val game: GameInfo) {
         if (vote?.text("kind") == "vote") add(vote)
         val diplomacy = DiplomacyCommands(game)
         diplomacy.pendingTrade()?.let { add(it) }
-        if (civ.popupAlerts.isNotEmpty()) {
-            val alert = civ.popupAlerts.first()
-            if (alert.type == com.unciv.logic.civilization.AlertType.CityConquered)
-                add(CityCaptureCommands(game).pending(alert))
-            else if (alert.type in AssetDecisionCommands.alertTypes) add(AssetDecisionCommands(game).pending(alert))
-            else if (alert.type in DiplomacyCommands.alertTypes) add(diplomacy.pendingAlert(alert))
-            // 有效触发事件返回结构化选项；无效事件返回 null（复刻原生直接移除，不阻塞结束回合）。
-            else if (alert.type == com.unciv.logic.civilization.AlertType.Event) EventCommands(game).pending(alert)?.let { add(it) }
-            else add("alert", "${alert.type}：${alert.value}" +
-                (if (alert.type in GameSession.informationalAlerts) "" else "；此选择尚未接入，请保存后用原客户端处理"),
-                alert.type in GameSession.informationalAlerts)
+        // 原生 WorldScreen.update 只处理队首：连续失效事件会被直接移除，实际打开的是其后第一个弹窗。
+        val queue = PendingQueue(game)
+        val head = queue.openableHead()
+        if (head != null) when (val route = routeOf(head.type)) {
+            AlertRoute.CityCapture -> routed(CityCaptureCommands(game).pending(head), alertAction(route))
+            AlertRoute.AssetDecision -> routed(AssetDecisionCommands(game).pending(head), alertAction(route))
+            AlertRoute.Diplomacy -> routed(diplomacy.pendingAlert(head), alertAction(route))
+            // 有效触发事件返回结构化选项；返回 null 时由队列清理，不进入待办。
+            AlertRoute.Event -> EventCommands(game).pending(head)?.let { routed(it, alertAction(route)) }
+            AlertRoute.Informational -> add("alert", "${head.type}：${head.value}",
+                head.type in GameSession.informationalAlerts, action = alertAction(route))
         }
     }
 

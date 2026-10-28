@@ -75,6 +75,9 @@ internal class EventCommands(private val game: GameInfo, private val session: St
         return if (withToken) JsonObject(fields + ("token" to JsonPrimitive(token(resolved)))) else fields
     }
 
+    /** 对应 AlertPopup.addEvent() 的返回值：false 时原生直接移除队首弹窗。 */
+    fun isOpenable(alert: PopupAlert): Boolean = alert.type == AlertType.Event && !resolve(alert).invalid
+
     /** 快照待决：有效事件返回结构化摘要（不含票据）；无效事件返回 null（不阻塞结束回合，由回合推进后清理）。 */
     fun pending(alert: PopupAlert): JsonObject? {
         val resolved = resolve(alert)
@@ -86,7 +89,8 @@ internal class EventCommands(private val game: GameInfo, private val session: St
     fun options(request: JsonObject): JsonObject {
         checkKeys(request, emptySet())
         GameSession.validateGame(game)
-        val resolved = player.popupAlerts.firstOrNull()?.takeIf { it.type == AlertType.Event }?.let { resolve(it) }
+        // 与原生一致：队首连续失效事件会先被移除，实际打开的是其后第一个会打开的弹窗。
+        val resolved = PendingQueue(game).openableHead()?.takeIf { it.type == AlertType.Event }?.let { resolve(it) }
         return dto("decision" to resolved?.takeIf { !it.invalid }?.let { decision(it, true) })
     }
 
@@ -94,7 +98,12 @@ internal class EventCommands(private val game: GameInfo, private val session: St
         checkKeys(request, setOf("eventToken", "index"))
         val suppliedToken = text(request, "eventToken")
         GameSession.validateGame(game)
-        val alert = player.popupAlerts.firstOrNull()?.takeIf { it.type == AlertType.Event }
+        val queue = PendingQueue(game)
+        val head = queue.openableHead()
+        // 队首只有失效事件时仍按原生语义报告失效，而不是“没有事件”。
+        if (head == null && queue.invalidEventHead().isNotEmpty())
+            throw GatewayError("EVENT_INVALID", "此事件已失效，将在结束回合后自动清理")
+        val alert = head?.takeIf { it.type == AlertType.Event }
             ?: throw GatewayError("EVENT", "没有对应的队首事件弹窗")
         val resolved = resolve(alert)
         if (resolved.invalid) throw GatewayError("EVENT_INVALID", "此事件已失效，将在结束回合后自动清理")

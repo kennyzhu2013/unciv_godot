@@ -22,10 +22,7 @@ import java.security.MessageDigest
 /** 玩家可见外交边界；报价／选择只读，所有玩法效果委托原生内核。 */
 internal class DiplomacyCommands(private val game: GameInfo, private val session: String = "", private val revision: Int = -1) {
     private val player = game.currentPlayerCiv
-    private data class Choice(val id: String, val label: String, val problem: GatewayError?, val description: String = "") {
-        fun dto() = dto("id" to id, "label" to label, "enabled" to (problem == null),
-            "reason" to (problem?.message ?: ""), "description" to description)
-    }
+    private val trades = TradeCommands(game, session, revision)
     private data class AlertParties(val other: Civilization?, val cityState: Civilization?)
 
     /** 复合引用只按原生 civID 解析；格式错误或未接触的对象不向 DTO 暴露。 */
@@ -71,66 +68,13 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
         ensure(TradeEvaluation().isTradeValid(peace(ourGold, theirGold), player, other), "CANNOT_PROPOSE_PEACE", "原生规则判定提案无效")
     }
 
-    /** 严格白名单；不能只看 isPeaceTreaty，否则会接受夹带的城市或第三方战争。 */
-    private fun supported(trade: Trade): Boolean {
-        fun side(offers: List<TradeOffer>): Boolean = offers.count { it.type == TradeOfferType.Treaty } == 1
-            && offers.count { it.type == TradeOfferType.Gold } <= 1
-            && offers.all {
-                when (it.type) {
-                    TradeOfferType.Treaty -> it.name == Constants.peaceTreaty && it.amount == 1 && it.duration > 0
-                    TradeOfferType.Gold -> it.name == Constants.flatGold && it.amount > 0 && it.duration == -1
-                    else -> false
-                }
-            }
-        return side(trade.ourOffers) && side(trade.theirOffers)
-            && trade.ourOffers.first { it.type == TradeOfferType.Treaty }.duration == trade.theirOffers.first { it.type == TradeOfferType.Treaty }.duration
-    }
-    private fun expired(request: TradeRequest, other: Civilization) = other.isDefeated()
-        || !TradeEvaluation().isTradeValid(request.trade, player, other)
-
     private fun fingerprint(kind: String, owner: String, index: Int, source: String, contents: JsonObject): String {
         val text = dto("session" to session, "revision" to revision, "gameId" to game.gameId, "player" to player.civID,
             "kind" to kind, "owner" to owner, "index" to index, "source" to source, "contents" to contents).toString()
         return MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
     }
-    private fun rawOffers(offers: List<TradeOffer>) = offers.map { dto("type" to it.type.name, "name" to it.name, "amount" to it.amount, "duration" to it.duration) }
-    private fun tradeToken(request: TradeRequest, owner: Civilization, index: Int, outgoing: Boolean) = fingerprint(
-        if (outgoing) "outgoing" else "incoming", owner.civID, index, request.requestingCiv,
-        dto("ourOffers" to rawOffers(request.trade.ourOffers), "theirOffers" to rawOffers(request.trade.theirOffers)))
     private fun alertToken(alert: PopupAlert) = fingerprint("alert", player.civID, 0, alert.value, dto("type" to alert.type.name, "value" to alert.value))
 
-    private fun safeOffers(offers: List<TradeOffer>) = offers.map {
-        val label = when {
-            it.type == TradeOfferType.Treaty && it.name == Constants.peaceTreaty -> "和平条约"
-            it.type == TradeOfferType.Gold && it.name == Constants.flatGold -> "一次性金币"
-            else -> "未支持条件（${it.type.name}，需原客户端接受）"
-        }
-        dto("type" to it.type.name, "label" to label, "amount" to it.amount.takeIf { amount -> amount >= 0 },
-            "duration" to it.duration.takeIf { duration -> duration > 0 })
-    }
-
-    private fun tradeChoices(request: TradeRequest): List<Choice> {
-        val other = known(request.requestingCiv)
-        val base = checked {
-            GameSession.validateGame(game)
-            major(request.requestingCiv)
-            ensure(player.popupAlerts.isEmpty(), "PENDING_DECISION", "请先处理当前弹窗事件，再处理交易")
-        }
-        val supported = supported(request.trade)
-        val expired = supported && other != null && expired(request, other)
-        return listOf(
-            Choice("accept", "接受和平提案", base ?: when {
-                !supported -> problem("UNSUPPORTED", "包含未支持或不一致的条款，不能接受部分交易")
-                expired || !relationshipsCanChange() -> problem("CANNOT_ACCEPT_TRADE", "提案已失效或规则不允许议和")
-                else -> null
-            }),
-            Choice("decline", "拒绝提案", base ?: if (expired) problem("CANNOT_ACCEPT_TRADE", "提案已过期，请清理") else null),
-            Choice("dismiss", "清理过期提案", base ?: when {
-                !supported -> problem("UNSUPPORTED", "此交易不能作为受支持的过期和平提案清理")
-                !expired -> problem("DIPLOMACY_REQUEST", "提案尚未过期，请选择接受或拒绝")
-                else -> null
-            }))
-    }
     private fun alertChoices(alert: PopupAlert): List<Choice> {
         if (alert.type !in alertTypes) return emptyList()
         val (other, cityState) = alertParties(alert)
@@ -174,7 +118,7 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
     private fun retractProblem(other: Civilization, request: TradeRequest): GatewayError? = checked {
         ordinary()
         major(other.civID)
-        ensure(other.tradeRequests.count { it.requestingCiv == player.civID } == 1 && supported(request.trade),
+        ensure(other.tradeRequests.count { it.requestingCiv == player.civID } == 1 && trades.supported(request.trade.reverse(), other),
             "UNSUPPORTED", "重复或混合提案不能安全撤回，请使用原客户端处理")
     }
 
@@ -209,32 +153,15 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
                 val other = major(id)
                 val entry = other.tradeRequests.withIndex().firstOrNull { it.value.requestingCiv == player.civID }
                     ?: throw problem("DIPLOMACY_REQUEST", "没有对应的已发提案")
-                ensure(token == tradeToken(entry.value, other, entry.index, true), "DIPLOMACY_REQUEST", "提案已变化，请重新确认")
+                ensure(token == trades.token(entry.value, other, entry.index, true), "DIPLOMACY_REQUEST", "提案已变化，请重新确认")
                 retractProblem(other, entry.value)?.let { throw it }
                 return { check(TradeView(player, other, GameView(game, player)).tryRetractOffer()) }
-            }
-            DiplomacyWire.TradeDecision -> {
-                val token = request.requiredDiplomacyText("tradeToken")
-                val choice = request.requiredDiplomacyText("choice")
-                val pending = player.tradeRequests.firstOrNull() ?: throw problem("DIPLOMACY_REQUEST", "没有当前交易提案")
-                ensure(token == tradeToken(pending, player, 0, false), "DIPLOMACY_REQUEST", "提案已变化，请重新确认")
-                requireChoice(tradeChoices(pending), choice)
-                val other = major(pending.requestingCiv)
-                return {
-                    when (choice) {
-                        "accept" -> TradeLogic(player, other).apply { currentTrade.set(pending.trade) }.acceptTrade()
-                        "decline" -> pending.decline(player)
-                    }
-                    player.tradeRequests.remove(pending)
-                    if (choice != "dismiss") other.addNotification(
-                        "[${player.civName}] has ${if (choice == "accept") "accepted" else "denied"} your trade request",
-                        NotificationCategory.Trade, player.civName, NotificationIcon.Trade)
-                }
             }
             DiplomacyWire.AlertDecision -> {
                 val token = request.requiredDiplomacyText("alertToken")
                 val choice = request.requiredDiplomacyText("choice")
-                val alert = player.popupAlerts.firstOrNull() ?: throw problem("DIPLOMACY_REQUEST", "没有当前外交事件")
+                val alert = PendingQueue(game).openableHead()
+                    ?: throw problem("DIPLOMACY_REQUEST", "没有当前外交事件")
                 ensure(token == alertToken(alert), "DIPLOMACY_REQUEST", "事件已变化，请重新确认")
                 ensure(alert.type in alertTypes, "UNSUPPORTED", "此事件尚未接入")
                 requireChoice(alertChoices(alert), choice)
@@ -325,19 +252,14 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
                     "proposePeace" to Choice("proposePeace", "发送和平提案", checked { proposeCheck(other, 0, 0) }).dto())
                 fields["warWarnings"] = warWarnings(other)
                 fields["outgoingTrades"] = other.tradeRequests.withIndex().filter { it.value.requestingCiv == player.civID }.map { (index, request) ->
-                    val trade = request.trade.reverse()
-                    dto("tradeToken" to tradeToken(request, other, index, true), "ourOffers" to safeOffers(trade.ourOffers),
-                        "theirOffers" to safeOffers(trade.theirOffers), "supported" to supported(trade),
-                        "retract" to Choice("retract", "撤回提案", retractProblem(other, request)).dto())
+                    JsonObject(trades.tradeDto(request, other, index, true).toMutableMap().apply {
+                        put("retract", Choice("retract", "撤回提案", retractProblem(other, request)).dto())
+                    })
                 }
             }
             dto(*fields.toList().toTypedArray())
         }.toList(), "incomingTrade" to player.tradeRequests.firstOrNull()?.let { request ->
-            val other = known(request.requestingCiv)
-            dto("civId" to other?.civID, "name" to (other?.civName ?: "不可用的外交对象"),
-                "tradeToken" to tradeToken(request, player, 0, false), "supported" to supported(request.trade),
-                "ourOffers" to safeOffers(request.trade.ourOffers), "theirOffers" to safeOffers(request.trade.theirOffers),
-                "choices" to tradeChoices(request).map { it.dto() })
+            trades.tradeDto(request, known(request.requestingCiv), 0, false)
         }, "pendingAlert" to player.popupAlerts.firstOrNull()?.takeIf { it.type in alertTypes }?.let { alert ->
             val (other, cityState) = alertParties(alert)
             dto("civId" to other?.civID, "name" to (other?.civName ?: "不可用的外交对象"), "type" to alert.type.name,
@@ -367,11 +289,16 @@ internal class DiplomacyCommands(private val game: GameInfo, private val session
     }
     fun pendingTrade(): JsonObject? = player.tradeRequests.firstOrNull()?.let {
         val other = known(it.requestingCiv)
+        // 原生在弹窗队列清空后才打开交易；被弹窗遮住时只展示，不提供可执行入口。
+        val blocked = PendingQueue(game).openableHead() != null
         dto("kind" to "trade", "message" to "${other?.civName ?: "不可用的外交对象"} 提议交易；请到外交页查看完整条件并处理",
-            "target" to (other?.civID ?: ""), "supported" to (other?.isMajorCiv() == true && other.isAI()), "diplomacy" to true)
+            "target" to (other?.civID ?: ""), "supported" to (other?.isMajorCiv() == true && other.isAI()),
+            "enabled" to !blocked, "blockedBy" to if (blocked) "alert" else "", "action" to "diplomacyOptions",
+            "diplomacy" to true)
     }
     fun pendingAlert(alert: PopupAlert): JsonObject = dto("kind" to "diplomacyAlert", "message" to alertMessage(alert),
-        "target" to (alertParties(alert).other?.civID ?: ""), "supported" to alertChoices(alert).any { it.problem == null }, "diplomacy" to true)
+        "target" to (alertParties(alert).other?.civID ?: ""), "supported" to alertChoices(alert).any { it.problem == null },
+        "enabled" to alertChoices(alert).any { it.problem == null }, "action" to "diplomacyAlertDecision", "diplomacy" to true)
 
     companion object {
         private val cityStateAlertTypes = setOf(AlertType.BulliedProtectedMinor, AlertType.AttackedProtectedMinor, AlertType.AttackedAllyMinor)
@@ -394,7 +321,6 @@ internal enum class DiplomacyWire(val wireName: String, val keys: Set<String>) {
     DeclareWar("diplomacyDeclareWar", setOf("civId")),
     ProposePeace("diplomacyProposePeace", setOf("civId", "ourGold", "theirGold")),
     RetractPeace("diplomacyRetractPeace", setOf("civId", "tradeToken")),
-    TradeDecision("diplomacyTradeDecision", setOf("tradeToken", "choice")),
     AlertDecision("diplomacyAlertDecision", setOf("alertToken", "choice")),
     ;
 

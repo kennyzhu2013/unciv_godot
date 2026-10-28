@@ -107,7 +107,7 @@ internal class AssetDecisionCommands(private val game: GameInfo, private val ses
     fun options(request: JsonObject): JsonObject {
         checkKeys(request, emptySet())
         GameSession.validateGame(game)
-        val alert = player.popupAlerts.firstOrNull()?.takeIf { it.type in alertTypes }
+        val alert = PendingQueue(game).openableHead()?.takeIf { it.type in alertTypes }
         return dto("decision" to alert?.let { decision(it, true) })
     }
 
@@ -116,7 +116,7 @@ internal class AssetDecisionCommands(private val game: GameInfo, private val ses
         val ticket = text(request, "decisionToken")
         val choice = text(request, "choice")
         GameSession.validateGame(game)
-        val alert = player.popupAlerts.firstOrNull()?.takeIf { it.type in alertTypes }
+        val alert = PendingQueue(game).openableHead()?.takeIf { it.type in alertTypes }
             ?: throw GatewayError("ASSET_DECISION", "没有对应的队首资产处置事件")
         val subject = subject(alert)
         val choices = choices(alert, subject)

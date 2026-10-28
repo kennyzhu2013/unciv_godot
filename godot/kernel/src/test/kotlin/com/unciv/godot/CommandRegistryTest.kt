@@ -30,7 +30,8 @@ class CommandRegistryTest {
         val queries = catalog.filterValues { it is QueryCommand }.keys
         assertEquals(setOf(
             "victoryOptions", "eventOptions", "greatPersonOptions", "assetDecisionOptions", "diplomaticVoteOptions",
-            "religionOptions", "combatPreview", "diplomacyOptions", "unitOptions", "cityOptions", "cityBombardPreview", "path", "unitRoute", "unitAbilityOptions", "newGameOptions", "listSaves",
+            "religionOptions", "combatPreview", "diplomacyOptions", "diplomacyTradeOptions", "diplomacyTradePreview",
+            "unitOptions", "cityOptions", "cityBombardPreview", "path", "unitRoute", "unitAbilityOptions", "newGameOptions", "listSaves",
             "empireOverview", "notificationOptions", "researchOptions", "policyOptions"),
             queries)
 
@@ -64,6 +65,7 @@ class CommandRegistryTest {
 
         val domainWires = CityStateWire.entries.map { it.wireName } +
             DiplomacyWire.entries.map { it.wireName } +
+            TradeWire.entries.map { it.wireName } +
             ReligionWire.entries.map { it.wireName } +
             DiplomaticVoteWire.entries.map { it.wireName }
         assertEquals(domainWires.size, domainWires.toSet().size)

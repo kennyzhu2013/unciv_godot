@@ -283,6 +283,53 @@ func verify_sizes() -> bool:
 	await smoke.get_tree().process_frame
 	return true
 
+# 太空船组装：部件驻首都→预览部件需求与目标首都→确认消耗→能力面板清除→胜利页部件进度更新。
+func verify_spaceship_assembly() -> bool:
+	var unit := await _load_and_select("unit-abilities-spaceship", "SS Booster")
+	if unit.is_empty(): return false
+	if not await _open(): return false
+	var panel = _panel()
+	var id := int(unit.id)
+	var ship := _index_of(panel, "assembleSpaceship")
+	if not smoke.check(ship >= 0, "太空船：候选含组装部件"): return false
+	var meta: Dictionary = panel.picker.get_item_metadata(ship)
+	if not smoke.check(bool(meta.get("enabled", false)) and bool(meta.get("consumesUnit", false)), "驻己方首都的部件可组装且消耗单位"): return false
+	var info: Dictionary = meta.get("spaceship", {})
+	if not smoke.check(str(info.get("part", "")) == "SS Booster" and int(info.get("required", -1)) == 3 and int(info.get("assembled", -1)) == 0, "候选投影部件与需求数量"): return false
+	if not smoke.check(str(meta.get("target", {}).get("city", "")).length() > 0, "候选指向目标首都"): return false
+	if not await smoke.click_option(panel.picker, ship): return false
+	if not smoke.check(panel.description.text.contains("部件：SS Booster") and panel.description.text.contains("需要 3"), "预览展示部件数量与总进度"): return false
+	await smoke.screenshot("smoke-unit-abilities-spaceship.png")
+	var original: Vector2i = app.get_window().size
+	if DisplayServer.get_name() != "headless":
+		app.get_window().size = Vector2i(1280, 800)
+		await smoke.get_tree().process_frame
+		await smoke.get_tree().process_frame
+		if not smoke.check(panel.panel.visible and panel.description.text.contains("SS Booster"), "太空船组装面板适配 1280x800"): return false
+		await smoke.screenshot("smoke-unit-abilities-spaceship-1280x800.png")
+		app.get_window().size = original
+		await smoke.get_tree().process_frame
+	var revision: int = app.client.revision
+	if not await smoke.click_control(panel.submit): return false
+	if not smoke.check(panel.confirmation.visible, "太空船：确认框已打开"): return false
+	if not smoke.check(panel.confirmation.dialog_text.contains("目标城市") and panel.confirmation.dialog_text.contains("科学胜利"), "确认框复述目标首都与胜利后果"): return false
+	if not await _click_dialog(true): return false
+	if not smoke.check(app.client.revision == revision + 1, "组装仅一次写入"): return false
+	if not smoke.check(_unit(id).is_empty(), "组装后部件单位消失"): return false
+	if not smoke.check(not panel.panel.visible and panel.unit_id == -1, "组装后能力面板与选中清除"): return false
+	# 胜利页部件进度来自内核投影，前端不自行推算。
+	app.tabs.current_tab = app.TAB_MATTERS
+	await app.victory_panel_inst.open_victory()
+	await smoke.settle()
+	var progress := ""
+	for child in app.victory_panel_inst.progress.get_children():
+		if child is Label: progress += str(child.text) + "\n"
+	if not smoke.check(progress.contains("太空船组装：1／6") and progress.contains("SS Booster：1／3"), "胜利页显示部件组装进度"): return false
+	await smoke.screenshot("smoke-unit-abilities-spaceship-progress.png")
+	app.victory_panel_inst.panel.hide()
+	evidence.append({"step": "spaceship-assembly", "revision": app.client.revision, "progress": progress})
+	return true
+
 func run(harness) -> bool:
 	smoke = harness
 	app = smoke.app
@@ -293,6 +340,7 @@ func run(harness) -> bool:
 	if not await verify_stale_ticket(): return false
 	if not await verify_double_click_single_write(): return false
 	if not await verify_drop_response_retry(): return false
+	if not await verify_spaceship_assembly(): return false
 	if not await verify_sizes(): return false
-	smoke.steps.append("单位能力面板：选择仅预览（含消耗单位／宗教压力等醒目说明）、独立按钮确认弹框、取消／关闭零写入、消耗型能力执行后清除选中、传教非消耗次数递减、禁用候选展示原因、旧票据失效、双击最多一次写入、丢响应同 requestId 重试与三尺寸截图")
+	smoke.steps.append("单位能力面板：选择仅预览（含消耗单位／宗教压力等醒目说明）、独立按钮确认弹框、取消／关闭零写入、消耗型能力执行后清除选中、传教非消耗次数递减、禁用候选展示原因、旧票据失效、双击最多一次写入、丢响应同 requestId 重试、太空船部件组装与胜利页进度、三尺寸截图")
 	return true
