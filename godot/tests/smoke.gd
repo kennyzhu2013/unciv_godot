@@ -1971,17 +1971,15 @@ func verify_great_person_flow() -> bool:
 		if not await choose_great_person("Great Scientist", true, true) or not await great_person_matches(kind + "-granted"):
 			return false
 		var granted_panel = app.great_person_panel_inst
+		# 领取时的“不重复提交”第二击可能在确认框关闭后飘到地图→自动跳到单位页。
+		# 定位入口在事项页，故先切回事项页（面板与已选单位状态由面板自身保留）。
+		if not await click_tab(app.tabs, app.TAB_MATTERS):
+			return false
 		if not check(granted_panel.panel.visible and granted_panel.locate.visible and granted_panel.unit_id >= 0,
 				"领取后定位入口可用：panel=%s locate=%s unit=%d 现有=%s" % [str(granted_panel.panel.visible), str(granted_panel.locate.visible),
 					granted_panel.unit_id, str(app.client.snapshot.get("units", []).filter(func(u): return u.own).map(func(u): u.id))]):
 			return false
-		if not await click_control(granted_panel.locate):
-			await screenshot("smoke-gp-locate-fail-" + kind + ".png")
-			var pend_kinds: Array = app.client.snapshot.get("pending", []).map(func(i): return str(i.get("kind", "")))
-			return check(false, "定位点击后面板状态：panel=%s locate=%s unit=%d tree=%s tab=%d paneltree=%s ctx=%s appunit=%d pending=%s" % [str(granted_panel.panel.visible), str(granted_panel.locate.visible),
-				granted_panel.unit_id, str(granted_panel.locate.is_visible_in_tree()), app.tabs.current_tab, str(granted_panel.panel.is_visible_in_tree()),
-				app.active_context, app.unit_id, str(pend_kinds)])
-		if not check(app.unit_id == app.great_person_panel_inst.unit_id, "按新快照定位伟人"):
+		if not await click_control(granted_panel.locate) or not check(app.unit_id == app.great_person_panel_inst.unit_id, "按新快照定位伟人"):
 			return false
 		if not await perform("load", {"path": app.last_saved_path}) or not await great_person_matches(kind + "-granted-reload"):
 			return false
