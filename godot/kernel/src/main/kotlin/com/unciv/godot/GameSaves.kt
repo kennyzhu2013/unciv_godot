@@ -6,7 +6,9 @@ import com.unciv.logic.GameInfo
 import com.unciv.logic.files.UncivFiles
 import kotlinx.serialization.json.JsonObject
 import java.io.File
+import java.nio.file.AccessDeniedException
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.UUID
 
@@ -65,10 +67,27 @@ internal class GameSaves(val directory: File) {
         val temporary = Files.createTempFile(target.parentFile.toPath(), "save-", ".tmp")
         try {
             Files.writeString(temporary, UncivFiles.gameInfoToString(game, true))
-            // 不降级为先删除再写入；原子替换失败时保留上一个可恢复的存档并拒绝提交。
-            Files.move(temporary, target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            replaceAtomically(temporary, target)
         } finally {
             Files.deleteIfExists(temporary)
+        }
+    }
+
+    /**
+     * 不降级为先删除再写入；原子替换失败时保留上一个可恢复的存档并拒绝提交。
+     * Windows 上刚写入的文件可能被杀毒或索引服务短暂占用（AccessDeniedException），
+     * 这里只对瞬时拒绝做有限次重试，仍是同一个原子替换语义。
+     */
+    private fun replaceAtomically(source: Path, target: File) {
+        var attempt = 0
+        while (true) {
+            try {
+                Files.move(source, target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                return
+            } catch (error: AccessDeniedException) {
+                if (++attempt >= 5) throw error
+                Thread.sleep(40L * attempt)
+            }
         }
     }
 }

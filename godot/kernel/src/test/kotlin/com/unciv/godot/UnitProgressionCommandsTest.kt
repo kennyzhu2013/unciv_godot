@@ -159,10 +159,38 @@ class UnitProgressionCommandsTest {
         reject(session, request(session, "unitPromote", "unitId" to id, "promotion" to "Shock I"), "CANNOT_PROMOTE")
     }
 
-    @Test fun airUnitsStayUnsupportedForProgression() {
-        val game = NavalFixtures.game().also { g -> native(g) { add(g, "Fighter", 0, 0); NavalFixtures.ready(g) } }
-        val session = scenario(game, "diff-progression-air").session
+    /** 空军（含舰载机）的晋升与升级已与原生弹窗对齐；核武仍不开放主动操作。 */
+    @Test fun airUnitsExposeNativeProgression() {
+        val game = NavalFixtures.game().also { g -> native(g) {
+            add(g, "Fighter", 0, 0).promotions.XP = 300
+            // Jet Fighter 需 Lasers 与铝矿：升级动作在原生 takeIf 里会再查一次资源。
+            NavalFixtures.research(g, "Lasers")
+            DiplomacyFixtures.resource(g, g.currentPlayerCiv, "Aluminum", 2)
+            NavalFixtures.ready(g)
+        } }
+        val d = scenario(game, "diff-progression-air")
         val id = idOf(game, "Fighter")
+        val progression = progressionOf(d.session, id)
+        assertTrue(progression["supported"]!!.jsonPrimitive.boolean)
+        assertEquals("", progression.text("reason"))
+        val jet = option(progression, "upgrades", "Jet Fighter")
+        assertTrue(jet.toString(), jet["enabled"]!!.jsonPrimitive.boolean)
+        // 非法目标先拒绝，避免升级重建后单位 id 变化干扰用例。
+        reject(d.session, request(d.session, "unitUpgrade", "unitId" to id, "targetUnit" to "Caravel"), "CANNOT_UPGRADE")
+        reject(d.session, request(d.session, "unitUpgrade", "unitId" to id, "targetUnit" to "NotAUnit"), "INVALID_ARGUMENT")
+        val promotion = progression["promotions"]!!.jsonArray.map { it.jsonObject }
+            .first { it["enabled"]!!.jsonPrimitive.boolean }
+        promote(d, "空军晋升", id, promotion.text("name"))
+        // 晋升后重新取一次 DTO：升级候选仍由原生 UnitActionsUpgrade 给出。
+        assertTrue(option(progressionOf(d.session, id), "upgrades", "Jet Fighter")["enabled"]!!.jsonPrimitive.boolean)
+        upgrade(d, "空军升级 Jet Fighter", id, "Jet Fighter")
+        roundtrip(d, "空军升级重载", "test-progression-air")
+    }
+
+    @Test fun nuclearWeaponsStayUnsupportedForProgression() {
+        val game = NavalFixtures.game().also { g -> native(g) { add(g, "Atomic Bomb", 0, 0); NavalFixtures.ready(g) } }
+        val session = scenario(game, "diff-progression-nuclear").session
+        val id = idOf(game, "Atomic Bomb")
         assertFalse(progressionOf(session, id)["supported"]!!.jsonPrimitive.boolean)
         reject(session, request(session, "unitPromote", "unitId" to id, "promotion" to "Shock I"), "UNSUPPORTED")
         reject(session, request(session, "unitUpgrade", "unitId" to id, "targetUnit" to "Caravel"), "UNSUPPORTED")

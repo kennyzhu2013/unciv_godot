@@ -168,4 +168,69 @@ class CityCaptureCommandsTest {
             assertFalse(ai.popupAlerts.any { it.type == AlertType.CityConquered })
         }
     }
+
+    /** 占城处置为傀儡后，后续吞并与原生 City.annexCity 同构：包括 puppet 取消、人口重分配、统计刷新。 */
+    @Test fun annexPuppetAfterPuppetMatchesNativeAnnexCity() {
+        val source = file("city-annex-puppet")
+        val session = load(source)
+        val expected = UncivFiles.gameInfoFromString(source.readText())
+        capture(expected, session)
+        val sessionId = target(session.game!!).id
+        val expectedId = target(expected).id
+        run(session, "cityDecision", "cityId" to sessionId, "choice" to "puppet")
+        native(expected) { target(expected).puppetCity(expected.currentPlayerCiv); expected.currentPlayerCiv.popupAlerts.removeAt(0) }
+        assertGameplayEquals("先占为傀儡", expected, session.game!!)
+        assertTrue(target(session.game!!).isPuppet)
+        run(session, "annexPuppet", "cityId" to sessionId)
+        native(expected) { target(expected).annexCity() }
+        assertGameplayEquals("傀儡后续吞并应与原生 annexCity 一致", expected, session.game!!)
+        assertFalse(target(session.game!!).isPuppet)
+        val rejected = session.handle(request(session, "annexPuppet", "cityId" to sessionId))
+        assertEquals("CITY_STATUS", rejected["error"]!!.jsonObject.text("code"))
+        assertGameplayEquals("重复吞并无副作用", expected, session.game!!)
+        assertEquals(expectedId, sessionId)
+    }
+
+    /** 占城处置为焚城后，停止焚城与原生 trySetRazing(false) 同构：仅翻转标志，不重新处理人口／建筑。 */
+    @Test fun stopRazingAfterRazeMatchesNativeFlagFlip() {
+        val source = file("city-stop-raze")
+        val session = load(source)
+        val expected = UncivFiles.gameInfoFromString(source.readText())
+        capture(expected, session)
+        val sessionId = target(session.game!!).id
+        run(session, "cityDecision", "cityId" to sessionId, "choice" to "raze")
+        native(expected) {
+            val c = target(expected); val p = expected.currentPlayerCiv
+            c.puppetCity(p); c.annexCity(); c.isBeingRazed = true
+            p.popupAlerts.removeAt(0)
+        }
+        assertGameplayEquals("先焚城", expected, session.game!!)
+        assertTrue(target(session.game!!).isBeingRazed)
+        run(session, "stopRazing", "cityId" to sessionId)
+        native(expected) { target(expected).isBeingRazed = false }
+        assertGameplayEquals("停止焚城与原生标志翻转一致", expected, session.game!!)
+        assertFalse(target(session.game!!).isBeingRazed)
+        val rejected = session.handle(request(session, "stopRazing", "cityId" to sessionId))
+        assertEquals("CITY_STATUS", rejected["error"]!!.jsonObject.text("code"))
+    }
+
+    /** 非傀儡不能吞并，非焚毁中不能停止；拒绝不得产生写入与回滚重建。 */
+    @Test fun annexPuppetAndStopRazingRejectOutsideApplicableState() {
+        val session = load(file())
+        val game = session.game!!
+        run(session, "attack", "unitId" to unit(game, "Warrior").id, "x" to 1, "y" to 0)
+        run(session, "cityDecision", "cityId" to target(game).id, "choice" to "puppet")
+        val own = game.currentPlayerCiv.cities.first { it.location.x == -6 && it.location.y == 0 } // 本方首都，非傀儡
+        val before = UncivFiles.gameInfoToString(game, false)
+        val revision = session.revision
+        val r1 = session.handle(request(session, "annexPuppet", "cityId" to own.id))
+        assertEquals("CITY_STATUS", r1["error"]!!.jsonObject.text("code"))
+        val r2 = session.handle(request(session, "stopRazing", "cityId" to own.id))
+        assertEquals("CITY_STATUS", r2["error"]!!.jsonObject.text("code"))
+        assertSame(game, session.game)
+        assertEquals(before, UncivFiles.gameInfoToString(game, false))
+        assertEquals(revision, session.revision)
+        val r3 = session.handle(request(session, "annexPuppet", "cityId" to "forged"))
+        assertEquals("NOT_OWNED", r3["error"]!!.jsonObject.text("code"))
+    }
 }

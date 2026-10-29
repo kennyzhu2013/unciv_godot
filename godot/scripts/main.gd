@@ -66,6 +66,16 @@ var combat_preview: Dictionary = {}
 var preview_revision := -1
 var move_stamp: Dictionary = {}
 var combat_stamp: Dictionary = {}
+# 当前选中单位为空军：只能用转场候选与空中目标交互，不得回退到陆海路径预览。
+var unit_air := false
+# 空降已就绪（原生 action==Paradrop）：地块点击只走落点预览与 paradrop 写入。
+var unit_paradrop := false
+# 当前选中单位为核武：攻击目标可无可见敌人，搬运走 airRebase，执行前须二次确认。
+var unit_nuke: Dictionary = {}
+# 核打击为不可逆且带外交代价的动作：记录确认时的版本戳与目标，任一变化即作废。
+var nuke_confirmation := ConfirmationDialog.new()
+var nuke_stamp: Dictionary = {}
+var nuke_target: Dictionary = {}
 var unit_read_generation := 0
 var unit_transaction := false
 var unit_state_uncertain := false
@@ -73,6 +83,10 @@ var capture_panel := VBoxContainer.new()
 var capture_id := ""
 var raze_confirmation := ConfirmationDialog.new()
 var raze_revision := -1
+# 解散单位为不可逆操作，沿用与焚城一致的独立确认框；确认前记录目标单位与版本戳，任一变化即作废。
+var disband_confirmation := ConfirmationDialog.new()
+var disband_unit_id := -1
+var disband_revision := -1
 # 资产处置沿用占城显示区域 capture_panel（与 cityCapture 共享，仍归 main 持有），但确认、票据和事务独立。
 # 资产事务域已迁移至 panels/asset_panel.gd（TransactionController 子类）；main 仅持有实例引用。
 var asset_panel_inst = AssetPanelScript.new()
@@ -115,6 +129,13 @@ var city_tabs: TabContainer:
 var city_summary: Label:
 	get:
 		return city_dev.city_summary
+# 已占城后续入口（傀儡吞并／停止焚城）：面板持有节点，main 转发供 smoke 与布局测试访问。
+var annex_button: Button:
+	get:
+		return city_dev.annex_button
+var stop_raze_button: Button:
+	get:
+		return city_dev.stop_raze_button
 var breakdown_box: VBoxContainer:
 	get:
 		return city_dev.breakdown_box
@@ -191,13 +212,14 @@ var _execute_depth := 0
 var event_panel_inst = EventPanelScript.new()
 
 const ACTION_NAMES := {"skip": "跳过／取消跳过本回合", "fortify": "驻防", "fortifyUntilHealed": "驻防至恢复",
-	"sleep": "休眠", "sleepUntilHealed": "休眠至恢复", "setUp": "架设"}
+	"sleep": "休眠", "sleepUntilHealed": "休眠至恢复", "setUp": "架设", "disband": "解散单位", "airSweep": "空中扫荡",
+	"paradrop": "空降"}
 const CAPTURE_NAMES := {"annex": "吞并", "puppet": "傀儡", "raze": "焚城", "liberate": "解放"}
 # 候选生产分类展示顺序（对应内核 constructionType）：单位／建筑／持续／其他。
 const PRODUCTION_CATEGORIES := [["unit", "单位"], ["building", "建筑"], ["perpetual", "持续"], ["other", "其他"]]
 # 写命令 → 音效键（android/assets/sounds 下的 mp3 名）；只读查询不列入，保持静默。
 const ACTION_SOUNDS := {
-	"moveTo": "whoosh", "move": "whoosh", "unitOrder": "whoosh",
+	"moveTo": "whoosh", "move": "whoosh", "unitOrder": "whoosh", "paradrop": "whoosh",
 	"unitAction": "fortify", "foundCity": "construction", "workerOrder": "construction",
 	"unitPromote": "promote", "unitUpgrade": "upgrade", "production": "construction",
 	"cityPurchase": "coin", "cityBuyTile": "coin",
@@ -374,6 +396,25 @@ func _build_ui() -> void:
 	raze_confirmation.dialog_text = "焚城会持续减少人口直至城市消失，确定执行？"
 	raze_confirmation.confirmed.connect(_confirm_raze)
 	raze_confirmation.canceled.connect(func(): raze_revision = -1)
+	add_child(disband_confirmation)
+	disband_confirmation.title = "确认解散单位"
+	disband_confirmation.dialog_text = "解散后该单位将永久消失（本方领土内会按原生返还少量金币），确定执行？"
+	disband_confirmation.dialog_autowrap = true
+	# AcceptDialog 会按主题重置按钮尺寸；与其它确认框一致设 34px 触点高度，保证真实点击命中。
+	var disband_theme := Theme.new()
+	disband_theme.set_constant("buttons_min_height", "AcceptDialog", 34)
+	disband_confirmation.theme = disband_theme
+	disband_confirmation.confirmed.connect(_confirm_disband)
+	disband_confirmation.canceled.connect(func(): disband_unit_id = -1)
+	add_child(nuke_confirmation)
+	nuke_confirmation.title = "确认核打击"
+	nuke_confirmation.dialog_autowrap = true
+	# 与其它确认框一致：主题重置按钮尺寸后显式设 34px 触点高度，保证真实点击命中。
+	var nuke_theme := Theme.new()
+	nuke_theme.set_constant("buttons_min_height", "AcceptDialog", 34)
+	nuke_confirmation.theme = nuke_theme
+	nuke_confirmation.confirmed.connect(_confirm_nuke)
+	nuke_confirmation.canceled.connect(_cancel_nuke)
 	asset_panel_inst.build(null)
 	resized.connect(_apply_right_width)
 	_apply_right_width()
@@ -634,7 +675,7 @@ func _unhandled_key_input(event: InputEvent) -> void:
 	if focus is LineEdit or focus is TextEdit or focus is SpinBox:
 		return
 	# 模态弹窗自行处理 Esc（关闭），此处不叠加取消预览或退出城市模式。
-	if confirmation.visible or raze_confirmation.visible or file_dialog.visible or unit_progression.confirmation_visible():
+	if confirmation.visible or raze_confirmation.visible or disband_confirmation.visible or file_dialog.visible or unit_progression.confirmation_visible():
 		return
 	if _input_locked():
 		return
@@ -973,6 +1014,8 @@ func _refresh_active_context() -> void:
 		else:
 			active_context = ""
 			unit_id = -1
+			unit_air = false
+			unit_paradrop = false
 			_clear_dynamic(unit_actions)
 			_clear_dynamic(worker_panel)
 			worker_panel.hide()
@@ -1114,6 +1157,9 @@ func _activate_unit(id: int) -> void:
 func _resolve_unit(id: int, generation: int) -> void:
 	if generation != selection_generation or id != unit_id:
 		return
+	unit_air = false
+	unit_paradrop = false
+	unit_nuke.clear()
 	target.clear()
 	_clear_combat()
 	_clear_dynamic(unit_actions)
@@ -1128,6 +1174,16 @@ func _resolve_unit(id: int, generation: int) -> void:
 		return
 	if result.get("ok", false):
 		map.set_reachable(result.data)
+		# 空军专属只读投影：转场候选与扫荡目标由内核给出，前端只负责展示与跳转。
+		var air = result.data.get("air")
+		unit_air = air is Dictionary
+		var paradrop = result.data.get("paradrop")
+		unit_paradrop = paradrop is Dictionary and bool(paradrop.get("active", false))
+		# 核武独立投影：PlayerSnapshot 对核武把 air 置空，搬运复用 airBases，攻击目标仍在 attackTargets。
+		unit_nuke.clear()
+		var nuke = result.data.get("nuke")
+		if nuke is Dictionary:
+			unit_nuke = nuke
 		for option in result.data.get("actions", []):
 			var option_id := str(option.id)
 			var text := str(ACTION_NAMES.get(option_id, option_id)) + (" ✓" if option.current else "")
@@ -1149,6 +1205,34 @@ func _resolve_unit(id: int, generation: int) -> void:
 					unit.action if unit.action else "待命", "是" if unit.due else "否", _num(unit.attacksThisTurn, true)]
 				var domain := str({"water": "海军", "land": "陆地单位", "air": "空军"}.get(unit.get("domain", "land"), "未知领域"))
 				details.text += "\n%s%s" % [domain, " · 已登船" if unit.get("embarked", false) else ""]
+				# 空军状态：射程／航程／攻击次数／扫荡与拦截资格均来自内核只读投影。
+				if air is Dictionary:
+					details.text += "\n空军：射程 %s · 转场航程 %s · 本回合攻击 %s/%s" % [
+						_num(air.get("range", 0), true), _num(air.get("rebaseRange", 0), true),
+						_num(air.get("attacksThisTurn", 0), true), _num(air.get("maxAttacks", 0), true)]
+					var sweep: Dictionary = air.get("sweep", {})
+					if sweep.get("available", false):
+						details.text += " · 扫荡：%s" % ("准备中（点击射程内地块预览）" if sweep.get("active", false) else "可准备")
+					var intercept: Dictionary = air.get("intercept", {})
+					if intercept.get("available", false):
+						details.text += " · 拦截 %s 格 %s%%（%s）" % [_num(intercept.get("range", 0), true),
+							_num(intercept.get("chance", 0), true), "可用" if intercept.get("enabled", false) else "本回合不可用"]
+					if bool(air.get("canRebase", false)) and not result.data.get("airBases", []).is_empty():
+						details.text += "\n点击青色圆环内的己方空位城市或运输单位可转场（消耗全部行动力）。"
+				if paradrop is Dictionary:
+					details.text += "\n空降：最远 %s 格 · %s" % [_num(paradrop.get("range", 0), true),
+						"落点已就绪，点击绿色地块预览后确认" if paradrop.get("active", false)
+						else ("可准备（点击「空降」开启落点选择）" if paradrop.get("enabled", false) else "本回合已移动，不可准备")]
+				# 核武状态：射程／爆炸半径／攻击次数／自毁与不可拦截均取内核只读投影，风险由预览给出。
+				if not unit_nuke.is_empty():
+					details.text += "\n核武：射程 %s · 爆炸半径 %s 格 · 本回合攻击 %s/%s%s%s" % [
+						_num(unit_nuke.get("range", 0), true), _num(unit_nuke.get("blastRadius", 0), true),
+						_num(unit_nuke.get("attacksThisTurn", 0), true), _num(unit_nuke.get("maxAttacks", 0), true),
+						" · 攻击后自毁" if unit_nuke.get("selfDestructs", false) else "",
+						"" if unit_nuke.get("interceptable", true) else " · 不可拦截"]
+					details.text += "\n点击红色目标框预览核打击（需二次确认）；波及 %s 个已知文明会承受核武外交惩罚。" % _num(unit_nuke.get("knownCivs", 0), true)
+					if not result.data.get("airBases", []).is_empty():
+						details.text += "\n点击青色圆环内的己方空位城市或运输单位可布署／转场（消耗本回合剩余行动）。"
 				if not result.data.get("combatSupported", false):
 					details.text += "\n" + str(result.data.get("combatReason", ""))
 				# 原生移动指令格式 "moveTo x,y"（含负坐标）：据此启用「停止移动」并展示目的地。
@@ -1344,6 +1428,8 @@ func _activate_city(id: String) -> void:
 	_set_bombard_mode(false)
 	target.clear()
 	_clear_combat()
+	unit_air = false
+	unit_paradrop = false
 	_clear_dynamic(unit_actions)
 	_clear_dynamic(worker_panel)
 	worker_panel.hide()
@@ -1516,7 +1602,14 @@ func _commit_move() -> void:
 		return
 	var parameters := target.duplicate()
 	parameters.unitId = unit_id
-	await _unit_write("moveTo", parameters)
+	# 空军转场与空降都是单次落地语义：复用「确认移动」按钮，但分别走原生命令。
+	# 核武同样以空军运行（快照 air 为 null），搬运／布署必须显式走 airRebase 而非陆海 moveTo。
+	if unit_paradrop:
+		await _unit_write("paradrop", parameters)
+	elif not unit_nuke.is_empty():
+		await _unit_write("airRebase", parameters)
+	else:
+		await _unit_write("airRebase" if unit_air else "moveTo", parameters)
 
 # 停止移动：下达原生 unitOrder/stopMovement（清空 moveTo 指令）；成功后经 execute→_refresh_active_context 重解析单位面板。
 func _stop_movement() -> void:
@@ -1565,13 +1658,19 @@ func _clear_combat() -> void:
 	combat_stamp.clear()
 	combat_preview.clear()
 	preview_revision = -1
+	if is_instance_valid(attack_button):
+		attack_button.text = "确认攻击"
 	combat_panel.hide()
 	map.attack_from.clear()
 	map.route.clear()
 	map.future_route.clear()
+	map.blast_tiles.clear()
 	map.queue_redraw()
 	raze_confirmation.hide()
 	raze_revision = -1
+	nuke_confirmation.hide()
+	nuke_stamp.clear()
+	nuke_target.clear()
 
 func _cancel_attack() -> void:
 	_clear_combat()
@@ -1581,8 +1680,22 @@ func _cancel_attack() -> void:
 func _unit_action(type: String) -> void:
 	if _input_locked() or unit_id < 0:
 		return
+	# 解散为不可逆写入：先弹独立确认框，确认后才下命令；取消零写入。
+	if type == "disband":
+		disband_unit_id = unit_id
+		disband_revision = client.revision
+		disband_confirmation.popup_centered()
+		return
 	# 成功后由 execute → _refresh_active_context 重解析单位面板，无需显式重选（避免二次查询）。
 	await _unit_write("unitAction", {"unitId": unit_id, "type": type})
+
+func _confirm_disband() -> void:
+	if _input_locked() or disband_unit_id < 0 or disband_revision != client.revision or not _own_unit_exists(disband_unit_id):
+		disband_unit_id = -1
+		return
+	var id := disband_unit_id
+	disband_unit_id = -1
+	await _unit_write("unitAction", {"unitId": id, "type": "disband"})
 
 func _preview_target(tile: Dictionary) -> void:
 	# 轰击模式：右键一律交给城市轰击面板（候选预览，非候选不回退为单位移动）。
@@ -1591,10 +1704,66 @@ func _preview_target(tile: Dictionary) -> void:
 		return
 	if city_mode or buy_tile_mode or _input_locked() or tabs.current_tab == TAB_DIPLOMACY:
 		return
-	if map.attack_targets.has(Vector2i(int(tile.x), int(tile.y))):
+	var coord := Vector2i(int(tile.x), int(tile.y))
+	# 核武的合法目标覆盖射程内全部已探索地块，会与己方布署城市重叠：与原生“点击即搬运”一致地
+	# 优先把青圈内的己方空位城市视为布署；核打击请选其以外的红框目标。
+	if not unit_nuke.is_empty() and map.air_bases.has(coord):
+		await _preview_rebase(tile)
+	# 空降落点优先：准备态普通可达为空，落点只来自内核的原生可达计算。
+	elif map.paradrop_targets.has(coord):
+		await _preview_paradrop(tile)
+	# 扫荡目标与空袭目标共用攻击预览；转场候选单独走无路径预览，避免套用陆地寻路。
+	elif map.attack_targets.has(coord) or map.sweep_targets.has(coord):
 		await _preview_attack(tile)
+	elif map.air_bases.has(coord):
+		await _preview_rebase(tile)
+	elif unit_paradrop:
+		_clear_combat()
+		message.text = "空降只能落在绿色外框内的地块；点击候选后确认，或再次点击「空降」取消。"
+		_on_busy(false)
+	# 核武不得回退到陆海路径预览：只能布署到青圈或核打击红框目标。
+	elif not unit_nuke.is_empty():
+		_clear_combat()
+		message.text = "核武只能布署到青色圆环内的己方空位城市／运输单位，或对红色目标框执行核打击（需二次确认）。"
+		_on_busy(false)
+	elif unit_air:
+		_clear_combat()
+		message.text = "空军只能转场到青色圆环内的己方空位城市／运输单位，或对红色目标执行空袭／扫荡。"
+		_on_busy(false)
 	else:
 		await _preview_move(tile)
+
+# 空降落点预览：只确认目标，不套用陆地路径；写入由「确认移动」触发 paradrop。
+func _preview_paradrop(tile: Dictionary) -> void:
+	if _input_locked() or unit_id < 0:
+		return
+	_clear_combat()
+	target.clear()
+	move_stamp = _unit_stamp()
+	target = {"x": int(tile.x), "y": int(tile.y)}
+	map.route.clear()
+	map.future_route.clear()
+	map.queue_redraw()
+	message.text = "空降到 (%s, %s)：落地消耗 1 点行动力并计为一次攻击；点击「确认移动」执行。" % [
+		_num(tile.x, true), _num(tile.y, true)]
+	_on_busy(false)
+
+# 空军转场预览：不绘制陆地路线，只确认落点；写入由「确认移动」触发 airRebase。
+func _preview_rebase(tile: Dictionary) -> void:
+	if _input_locked() or unit_id < 0:
+		return
+	_clear_combat()
+	target.clear()
+	move_stamp = _unit_stamp()
+	target = {"x": int(tile.x), "y": int(tile.y)}
+	map.route.clear()
+	map.future_route.clear()
+	map.queue_redraw()
+	# 核武的 airRebase 就是搬运／布署，文案与空军转场区分，避免玩家误以为是普通飞行。
+	var verb := "布署" if not unit_nuke.is_empty() else "转场"
+	message.text = "%s到 (%s, %s)：本次%s将消耗全部行动力；点击「确认移动」执行。" % [
+		verb, _num(tile.x, true), _num(tile.y, true), verb]
+	_on_busy(false)
 
 func _preview_attack(tile: Dictionary) -> void:
 	if _input_locked() or unit_id < 0 or not capture_id.is_empty():
@@ -1619,6 +1788,44 @@ func _preview_attack(tile: Dictionary) -> void:
 			_num(p.attackFrom.x, true), _num(p.attackFrom.y, true), p.path.size(), "可占城" if p.canCaptureCity else "不可占城", "\n".join(modifiers)]
 		if p.get("kind", "combat") == "captureCivilian":
 			combat_details.text = "%s → %s\n尝试俘获海上平民；归属、转化或离场由原生规则结算，不按伤害区间承诺扣血。\n攻击起点 (%s, %s)" % [p.attacker.name, p.defender.name, _num(p.attackFrom.x, true), _num(p.attackFrom.y, true)]
+		elif p.get("kind", "combat") == "airSweep":
+			# 扫荡不指定防守方：拦截单位与伤害均由原生随机结算，不展示具体数值。
+			combat_details.text = "%s HP %s/%s · 战力 %s\n向 (%s, %s) 执行空中扫荡\n射程内敌方拦截机将按原生规则交战，伤害结果未知。\n攻击起点 (%s, %s)\n%s" % [
+				p.attacker.name, _num(p.attacker.health, true), _num(p.attacker.maxHealth, true), _num(p.attacker.finalStrength),
+				_num(p.target.x, true), _num(p.target.y, true),
+				_num(p.attackFrom.x, true), _num(p.attackFrom.y, true), "\n".join(modifiers)]
+			attack_button.text = "确认扫荡"
+		elif p.get("kind", "combat") == "nuke":
+			# 核打击无固定防守方：只展示爆炸半径与外交风险，伤害与 Fallout 全由原生随机结算。
+			var risk: Dictionary = p.get("risk", {})
+			var civs := PackedStringArray()
+			for civ_name in risk.get("civs", []):
+				civs.append(str(civ_name))
+			var hits := PackedStringArray()
+			for city in risk.get("cities", []):
+				hits.append("城市 %s（%s，人口 %s）" % [str(city.name), str(city.civ), _num(city.population, true)])
+			for hit in risk.get("units", []):
+				hits.append("单位 %s（%s）" % [str(hit.name), str(hit.civ)])
+			var notes := PackedStringArray()
+			if risk.get("selfDestructs", false):
+				notes.append("攻击后本单位按原生 Self-destructs 自毁。")
+			if not risk.get("interceptable", true):
+				notes.append("该武器不可被拦截。")
+			var known := int(risk.get("knownCivs", 0))
+			if known > 0:
+				notes.append("将对 %s 个已知文明施加核武外交惩罚。" % _num(known, true))
+			notes.append("伤害、Fallout 与改良破坏由原生结算，预览不承诺数值。")
+			combat_details.text = "%s HP %s/%s · 战力 %s\n目标 (%s, %s) · 爆炸半径 %s 格（波及 %s 格）\n波及文明：%s\n%s\n%s" % [
+				p.attacker.name, _num(p.attacker.health, true), _num(p.attacker.maxHealth, true), _num(p.attacker.finalStrength),
+				_num(p.target.x, true), _num(p.target.y, true), _num(p.blastRadius, true), _num(p.blast.size(), true),
+				"、".join(civs) if not civs.is_empty() else "无外文明目标",
+				"\n".join(hits) if not hits.is_empty() else "爆炸圈内暂无可见单位或城市",
+				"\n".join(notes)]
+			attack_button.text = "确认核打击"
+			# 爆炸圈仅由内核 blast 字段决定，前端不自行推算半径。
+			map.blast_tiles.clear()
+			for cell in p.get("blast", []):
+				map.blast_tiles[Vector2i(int(cell.x), int(cell.y))] = true
 		combat_panel.show()
 		map.route = p.path
 		map.attack_from = p.attackFrom
@@ -1632,7 +1839,57 @@ func _commit_attack() -> void:
 	# Godot 将响应中的 JSON 数字读成 float；命令坐标必须重新转为整数。
 	var params := {"unitId": int(combat_preview.unitId),
 		"x": int(combat_preview.target.x), "y": int(combat_preview.target.y)}
-	# 攻击表现所需坐标须在 await 前捕获：写入成功会经 _apply_snapshot → _clear_combat 清空 combat_preview。
+	# 核打击不可逆且带外交代价：确认前不写命令，只记下目标与版本戳供 _confirm_nuke 复核。
+	if str(combat_preview.get("kind", "combat")) == "nuke":
+		if nuke_confirmation.visible:
+			return
+		nuke_stamp = combat_stamp.duplicate()
+		nuke_target = params
+		nuke_confirmation.dialog_text = _nuke_warning()
+		nuke_confirmation.popup_centered()
+		return
+	await _execute_attack(params)
+
+# 二次确认期间世界可能推进：版本戳、目标或单位存续任一变化即作废，零写入。
+func _confirm_nuke() -> void:
+	var params := nuke_target.duplicate()
+	nuke_target.clear()
+	if _input_locked() or params.is_empty() or not _unit_stamp_valid(nuke_stamp) or not _own_unit_exists(int(params.unitId)):
+		nuke_stamp.clear()
+		message.text = "核打击已作废：单位或世界状态已变化，请重新预览。"
+		return
+	nuke_stamp.clear()
+	await _execute_attack(params)
+
+func _cancel_nuke() -> void:
+	nuke_stamp.clear()
+	nuke_target.clear()
+	if not combat_preview.is_empty():
+		message.text = "已取消核打击，游戏状态未改变。"
+
+# 二次确认文案：只罗列预览已确认的可见风险，执行后的真实伤害仍由原生结算。
+func _nuke_warning() -> String:
+	var risk: Dictionary = combat_preview.get("risk", {})
+	var lines := PackedStringArray()
+	lines.append("爆炸半径 %s 格内单位、城市与改良将按原生 Nuke 规则结算：" % _num(combat_preview.get("blastRadius", 0), true))
+	for city in risk.get("cities", []):
+		lines.append("· 城市 %s（%s）人口 %s · 城防 %s" % [str(city.name), str(city.civ),
+			_num(city.population, true), _num(city.health, true)])
+	for hit in risk.get("units", []):
+		lines.append("· 单位 %s（%s）于 (%s, %s)" % [str(hit.name), str(hit.civ),
+			_num(hit.position.x, true), _num(hit.position.y, true)])
+	if risk.get("selfDestructs", false):
+		lines.append("· 攻击后本单位自毁。")
+	if risk.get("interceptable", true):
+		lines.append("· 目标上方可能遭原生拦截。")
+	var known := int(risk.get("knownCivs", 0))
+	if known > 0:
+		lines.append("· 将对 %s 个已知文明造成核武外交惩罚。" % _num(known, true))
+	lines.append("该操作不可撤销，确定执行？")
+	return "\n".join(lines)
+
+# 实际攻击写入：表现所需坐标在 await 前捕获（写入成功会经 _apply_snapshot → _clear_combat）。
+func _execute_attack(params: Dictionary) -> void:
 	var af: Dictionary = combat_preview.get("attackFrom", {})
 	var flash_from := Vector2i(int(af.get("x", params.x)), int(af.get("y", params.y)))
 	var flash_to := Vector2i(int(params.x), int(params.y))
@@ -1643,13 +1900,22 @@ func _commit_attack() -> void:
 		map.flash_attack(flash_from, flash_to)
 		sfx.play(_attack_sound(attacker_name))
 		var battle: Dictionary = result.battleResult
+		var after_ids: Array = client.snapshot.units.map(func(u): return int(u.id))
 		if battle.outcome == "movedOnly":
 			message.text = "仅完成移动或架设，当前未能攻击；已保留实际行动结果。"
+		elif battle.outcome == "nuked":
+			message.text = "核打击已结算：爆炸圈内单位与城市按原生 Nuke 规则处理，外交惩罚同步生效。"
+			if bool(battle.get("unitLost", false)):
+				message.text += " 核武已自毁或被拦截而离场。"
+			for previous in before:
+				if not int(previous.id) in after_ids:
+					message.text += " %s 离场。" % previous.name
+		elif battle.outcome == "swept":
+			message.text = "空中扫荡已结算：是否遭遇拦截由原生 AirInterception 决定，请查看单位状态与战报。"
 		elif battle.get("kind", "combat") == "captureCivilian":
 			message.text = "海上平民俘获动作已结算；请查看单位归属及待决事项。"
 		else:
 			message.text = "战斗结算：敌方损失 %s HP，我方损失 %s HP。" % [_num(battle.damageToDefender, true), _num(battle.damageToAttacker, true)]
-			var after_ids: Array = client.snapshot.units.map(func(u): return int(u.id))
 			for previous in before:
 				if not int(previous.id) in after_ids:
 					message.text += " %s 离场（阵亡或离开视野）。" % previous.name

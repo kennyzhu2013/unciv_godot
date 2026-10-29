@@ -454,4 +454,38 @@ class UnitAbilityCommandsTest {
         assertEquals("重复提交不得二次组装", revision, session.revision)
         assertEquals(1, session.game!!.currentPlayerCiv.victoryManager.currentsSpaceshipParts["SS Booster"])
     }
+
+    // —— 赠送城邦 ——
+    /** 军事单位强制落在城邦中心，与原生 getGiftActions 完全同构：执行后单位移交城邦、获得影响力、不销毁。 */
+    @Test fun giftMilitaryUnitToCityStateTransfersControlAndMatchesNative() {
+        val game = UnitAbilityFixtures.game(cityState = true)
+        native(game) { game.currentPlayerCiv.diplomacyFunctions.makeCivilizationsMeet(game.civilizations.first { it.isCityState }) }
+        val unit = UnitAbilityFixtures.placeAt(game, "Warrior", cityStateAt)
+        val id = unit.id
+        val session = sessionFor(game)
+        val expected = expectedFor(game)
+        val sessionCS = session.game!!.civilizations.first { it.isCityState }
+        val influenceBefore = sessionCS.getDiplomacyManager(session.game!!.currentPlayerCiv)!!.getInfluence()
+        val data = options(session, id)
+        val c = candidate(data, "giftUnit")
+        assertTrue("城邦中心格可赠送：${c.text("reason")}", c.boolean("enabled"))
+        assertTrue("赠送虽不销毁但离开控制，需按消耗单位预览", c.boolean("consumesUnit"))
+        assertEquals("目标为城邦文明", sessionCS.civName, c["target"]!!.jsonObject.text("civ"))
+        useAbility(session, id, data, "giftUnit")
+        UnitAbilityFixtures.nativeAbility(expected, own(expected, id), UnitActionType.GiftUnit)
+        assertGameplayEquals("赠送城邦应与原生移交完全一致", expected, session.game!!)
+        assertTrue("单位不再属于我方", session.game!!.currentPlayerCiv.units.getCivUnits().none { it.id == id })
+        assertTrue("单位已归属城邦", sessionCS.units.getCivUnits().any { it.id == id })
+        assertTrue("获得影响力应提升", sessionCS.getDiplomacyManager(session.game!!.currentPlayerCiv)!!.getInfluence() > influenceBefore)
+    }
+
+    /** 中立地块无 recipient，原生不产生 giftUnit 候选，前端不展示。 */
+    @Test fun giftUnitAbsentOnNeutralTile() {
+        val game = UnitAbilityFixtures.game(cityState = true).also { add(it, "Warrior", HexCoord(2, 0)) }
+        val id = game.currentPlayerCiv.units.getCivUnits().first().id
+        val session = sessionFor(game)
+        val data = options(session, id)
+        assertFalse("中立地块不得展示 giftUnit 候选",
+            data["candidates"]!!.jsonArray.map { it.jsonObject }.any { it.text("type") == "giftUnit" })
+    }
 }

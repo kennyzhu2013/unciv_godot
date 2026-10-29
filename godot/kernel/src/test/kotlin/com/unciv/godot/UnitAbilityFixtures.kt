@@ -85,16 +85,16 @@ internal object UnitAbilityFixtures {
     fun add(game: GameInfo, name: String, coord: HexCoord): MapUnit = BattleFixtures.add(game, name, coord.x, coord.y)
 
     /**
-     * 强制把平民单位落在指定地块（含敌方城市中心），仅用于构造原生归属拒绝场景。
-     * 先在无主空地创建，再绕过 canMoveTo 强制落位；敌方领土与城市中心原生会拒绝平民进入，
-     * 强制落位只存在于测试 fixture，不进入生产网关。
+     * 强制把单位落在指定地块（含敌方城市中心或城邦中心），仅用于构造原生归属拒绝／移交场景。
+     * 先在无主空地创建，再绕过 canMoveTo 强制落位；敌方领土与城市中心原生会拒绝进入，
+     * 强制落位只存在于测试 fixture，不进入生产网关。军事单位写入 militaryUnit 槽位，平民写入 civilianUnit。
      */
     fun placeAt(game: GameInfo, name: String, coord: HexCoord, staging: HexCoord = HexCoord(2, 2)): MapUnit = native(game) {
         val unit = BattleFixtures.add(game, name, staging.x, staging.y)
         val tile = game.tileMap[coord]
         if (unit.currentTile.position != coord) {
             unit.removeFromTile()
-            tile.civilianUnit = unit
+            if (unit.isCivilian()) tile.civilianUnit = unit else tile.militaryUnit = unit
             unit.currentTile = tile
         }
         unit
@@ -144,6 +144,19 @@ internal object UnitAbilityFixtures {
             add(spaceship, "SS Booster", center)
         }
         export(spaceship, "unit-abilities-spaceship")
+        // 赠送城邦：军事单位强制落在城邦中心（绕过进入限制），双方已互相认识；窗口只验证真实交互与状态反馈。
+        val gift = game(cityState = true)
+        native(gift) {
+            val cityState = gift.civilizations.first { it.isCityState }
+            gift.currentPlayerCiv.diplomacyFunctions.makeCivilizationsMeet(cityState)
+            val unit = BattleFixtures.add(gift, "Warrior", 2, 2)
+            val tile = gift.tileMap[cityStateAt]
+            unit.removeFromTile()
+            tile.militaryUnit = unit
+            unit.currentTile = tile
+            gift.civilizations.forEach { it.popupAlerts.clear(); it.notifications.clear() }
+        }
+        export(gift, "unit-abilities-gift")
     }
 
     /** 期望端：取该类型唯一可执行原生动作（可按标题／关联 Unique 过滤）并调用一次。 */

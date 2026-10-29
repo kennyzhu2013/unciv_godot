@@ -8,6 +8,7 @@ import com.unciv.models.ruleset.IConstruction
 import com.unciv.models.ruleset.INonPerpetualConstruction
 import com.unciv.models.ruleset.PerpetualConstruction
 import com.unciv.models.ruleset.unit.BaseUnit
+import com.unciv.models.ruleset.unique.UniqueType
 import com.unciv.models.stats.Stats
 import com.unciv.view.CityView
 import com.unciv.view.GameView
@@ -238,6 +239,10 @@ internal class CityDevelopmentCommands(private val game: GameInfo) {
             "name" to cv.name,
             "editable" to canEdit,
             "reason" to reason,
+            "puppet" to cv.isPuppet(),
+            "beingRazed" to cv.isBeingRazed(),
+            "canAnnex" to (cv.isPuppet() && player.isCurrentPlayer() && !player.hasUnique(UniqueType.MayNotAnnexCities)),
+            "canStopRazing" to (cv.isBeingRazed() && player.isCurrentPlayer() && cv.isOwnedByViewer()),
             "population" to cv.getPopulationCount(),
             "growth" to dto(
                 "foodStored" to cv.getFoodStored(),

@@ -251,6 +251,38 @@ class CombatCommandsTest {
         run(session, "save", "name" to "unsupported-civilian")
     }
 
+    /** 陆上解散：本方领土上解散按原生 MapUnit.disband 返还黄金并推进统计，与直接执行原生逻辑逐字段一致。 */
+    @Test fun disbandOnOwnTerritoryMatchesNativeAndRefundsGold() {
+        val fixture = file("disband-duel") { game ->
+            game.civilizations.forEach { civ -> civ.units.getCivUnits().toList().forEach { it.destroy() } }
+            add(game, "Warrior", -6, 0) // 已方首都地块，触发本方领土返还黄金分支
+        }
+        val session = load(fixture)
+        val expected = UncivFiles.gameInfoFromString(fixture.readText())
+        val id = native(expected) { unit(expected, "Warrior").id }
+        native(expected) { val u = unit(expected, "Warrior"); u.disband(); u.civ.updateStatsForNextTurn() }
+        val result = run(session, "unitAction", "unitId" to id, "type" to "disband")
+        assertTrue(result["ok"]!!.jsonPrimitive.boolean)
+        assertGameplayEquals("解散单位应与原生一致", expected, session.game!!)
+        assertTrue("单位已消失", session.game!!.currentPlayerCiv.units.getCivUnits().none { it.id == id })
+        val replay = session.handle(request(session, "unitAction", "unitId" to id, "type" to "disband"))
+        assertEquals("NOT_OWNED", replay["error"]!!.jsonObject.text("code"))
+    }
+
+    @Test fun disbandRejectedWhenUnitHasNoMovement() {
+        val session = load(duel())
+        val game = session.game!!
+        val warrior = unit(game, "Warrior")
+        warrior.currentMovement = 0f
+        val before = UncivFiles.gameInfoToString(game, false)
+        val revision = session.revision
+        val result = session.handle(request(session, "unitAction", "unitId" to warrior.id, "type" to "disband"))
+        assertEquals(result.toString(), "UNIT_ACTION", result["error"]!!.jsonObject.text("code"))
+        assertSame("拒绝不得触发回滚重建", game, session.game)
+        assertEquals(before, UncivFiles.gameInfoToString(game, false))
+        assertEquals(revision, session.revision)
+    }
+
     @Test fun generateGraphicalCombatFixture() {
         val fixture = file()
         val session = load(fixture)

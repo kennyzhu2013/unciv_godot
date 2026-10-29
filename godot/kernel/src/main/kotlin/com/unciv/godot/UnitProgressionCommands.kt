@@ -3,6 +3,7 @@ package com.unciv.godot
 import com.unciv.logic.GameInfo
 import com.unciv.logic.map.mapunit.MapUnit
 import com.unciv.models.UpgradeUnitAction
+import com.unciv.models.ruleset.unique.GameContext
 import com.unciv.models.ruleset.unit.BaseUnit
 import com.unciv.models.ruleset.unit.Promotion
 import com.unciv.models.ruleset.unique.UniqueType
@@ -21,10 +22,10 @@ internal class UnitProgressionCommands(private val game: GameInfo) {
     fun ownedUnit(id: Int): MapUnit = player.units.getCivUnits().firstOrNull { it.id == id }
         ?: throw GatewayError("NOT_OWNED", "找不到己方单位")
 
-    /** 空军、舰载机与核武器的主动操作尚未接入；其成长入口一并拒绝，避免进入不支持的领域。 */
+    /** 核武器的主动操作尚未接入；空军（含舰载机）的晋升与升级已与原生弹窗对齐，一并开放。 */
     private fun ensurePlannedUnit(unit: MapUnit) {
-        if (unit.baseUnit.isAirUnit() || unit.isNuclearWeapon())
-            throw GatewayError("UNSUPPORTED", "空军与核武器主动操作尚未接入")
+        if (unit.isNuclearWeapon())
+            throw GatewayError("UNSUPPORTED", "核武器主动操作尚未接入")
     }
 
     /** 晋升整体门槛：复刻 canPromoteNow 中不依赖 GUI 状态的部分（可改状态由网关事务保证）。 */
@@ -41,8 +42,8 @@ internal class UnitProgressionCommands(private val game: GameInfo) {
         val xp = promotions.XP
         val xpNeeded = promotions.xpForNextPromotion()
         return dto(
-            "supported" to (!unit.baseUnit.isAirUnit() && !unit.isNuclearWeapon()),
-            "reason" to if (unit.baseUnit.isAirUnit() || unit.isNuclearWeapon()) "空军与核武器主动操作尚未接入" else "",
+            "supported" to !unit.isNuclearWeapon(),
+            "reason" to if (unit.isNuclearWeapon()) "核武器主动操作尚未接入" else "",
             "xp" to xp,
             "xpForNextPromotion" to xpNeeded,
             "numberOfPromotions" to promotions.numberOfPromotions,
@@ -89,8 +90,9 @@ internal class UnitProgressionCommands(private val game: GameInfo) {
                     "enabled" to enabled, "reason" to reason)
             }.toList()
 
-    /** 升级目标过滤：空军／舰载机不接入；核武器没有常规单位升级路径，一并排除以防未来规则。 */
-    private fun isPlannedUpgradeTarget(target: BaseUnit): Boolean = !target.isAirUnit()
+    /** 升级目标过滤：核武器没有常规单位升级路径，一并排除以防未来规则；空军升级已开放。 */
+    private fun isPlannedUpgradeTarget(target: BaseUnit): Boolean =
+        !target.hasUnique(UniqueType.NuclearWeapon, GameContext.IgnoreConditionals)
 
     /** 复刻 [UpgradeUnitAction] 的 takeIf 条件，逐项解释当前不可升级的原因。 */
     private fun upgradeRejectReason(unit: MapUnit, upgrade: UpgradeUnitAction): String = when {

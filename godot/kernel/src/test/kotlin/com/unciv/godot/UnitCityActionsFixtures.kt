@@ -60,6 +60,21 @@ internal object UnitCityActionsFixtures {
         NavalFixtures.ready(game)
     } }
 
+    /** 己方首都已占为傀儡：与占城 select puppet 后的状态一致，可随时吞并。 */
+    fun annexPuppet(): GameInfo = game().also { game -> native(game) {
+        game.currentPlayerCiv.cities.first().apply {
+            isPuppet = true
+            cityConstructions.constructionQueue = arrayListOf()
+        }
+        NavalFixtures.ready(game)
+    } }
+
+    /** 己方首都处于焚毁中：与占城 raze 后 isBeingRazed=true 的状态一致。 */
+    fun stopRazing(): GameInfo = game().also { game -> native(game) {
+        game.currentPlayerCiv.cities.first().isBeingRazed = true
+        NavalFixtures.ready(game)
+    } }
+
     fun apply(original: GameInfo, action: String, params: JsonObject = dto()): GameInfo = native(original) {
         var game = original
         when (action) {
@@ -109,6 +124,16 @@ internal object UnitCityActionsFixtures {
                     .first { it.title == "Create [$name]" }
                 check(waterAction.action != null)
                 waterAction.action!!.invoke()
+            }
+            "annexPuppet" -> {
+                val city = game.currentPlayerCiv.cities.first { it.id == params.text("cityId") }
+                check(city.isPuppet && !game.currentPlayerCiv.hasUnique(UniqueType.MayNotAnnexCities))
+                city.annexCity()
+            }
+            "stopRazing" -> {
+                val city = game.currentPlayerCiv.cities.first { it.id == params.text("cityId") }
+                check(city.isBeingRazed)
+                city.isBeingRazed = false
             }
             else -> error("未知原生重放操作：$action")
         }
@@ -162,6 +187,14 @@ internal object UnitCityActionsFixtures {
         val boat = workboat.currentPlayerCiv.units.getCivUnits().first { it.name == "Work Boats" }
         record("workboat", workboat, listOf(
             "createWaterImprovement" to dto("unitId" to boat.id, "name" to "Fishing Boats"),
+            "reload" to dto(), "nextTurn" to dto()))
+        val puppet = annexPuppet()
+        record("annex-puppet", puppet, listOf(
+            "annexPuppet" to dto("cityId" to puppet.currentPlayerCiv.cities.first().id),
+            "reload" to dto(), "nextTurn" to dto()))
+        val razing = stopRazing()
+        record("stop-razing", razing, listOf(
+            "stopRazing" to dto("cityId" to razing.currentPlayerCiv.cities.first().id),
             "reload" to dto(), "nextTurn" to dto()))
         File(root, "godot/.local/tests/unitcity-expected.json").writeText(dto("scenarios" to scenarios,
             "setFields" to GameplayAssertions.setFields.toList(), "mapOfSetFields" to GameplayAssertions.mapOfSetFields.toList()).toString())

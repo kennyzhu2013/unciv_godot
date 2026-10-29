@@ -25,7 +25,7 @@ const TYPE_LABELS := {
 	"spreadReligion": "传播宗教", "removeHeresy": "清除异教",
 	"hurryResearch": "加速研究", "hurryBuilding": "加速建造",
 	"tradeMission": "城邦贸易任务", "createImprovement": "瞬建改良", "goldenAge": "开启黄金时代",
-	"assembleSpaceship": "组装太空船部件",
+	"assembleSpaceship": "组装太空船部件", "giftUnit": "赠送单位",
 }
 
 func _init() -> void:
@@ -179,13 +179,17 @@ func apply_response(res: Dictionary, s: Dictionary) -> bool:
 func warnings(candidate: Dictionary) -> PackedStringArray:
 	var out := PackedStringArray()
 	var type := str(candidate.get("type", ""))
-	if candidate.get("consumesUnit", false):
+	if type == "giftUnit":
+		out.append("本单位将移交他国并离开你的控制（获得影响力）；不会被销毁但不再属于你的军队。")
+	elif candidate.get("consumesUnit", false):
 		out.append("本次将消耗该单位，执行后单位消失。")
 	match type:
 		"createImprovement":
 			out.append("将在当前地块瞬建改良：可能覆盖既有改良；堡垒等会改变领土归属（夺地）。")
 		"tradeMission":
 			out.append("将在城邦完成贸易任务，影响外交（金币与影响力）。")
+		"giftUnit":
+			out.append("仅当单位站在外国领土（城邦需为军事单位且非交战中）时方可赠送。")
 		"spreadReligion", "removeHeresy":
 			out.append("将改变城市宗教压力与信徒，可能触发外交标记。")
 		"goldenAge":
@@ -205,6 +209,9 @@ func describe(candidate: Dictionary) -> String:
 		var tname := str(target.get("city", ""))
 		if not tname.is_empty():
 			lines.append("目标城市：" + tname)
+		var tciv := str(target.get("civ", ""))
+		if not tciv.is_empty():
+			lines.append("目标文明：" + tciv)
 		var pos = target.get("position")
 		if pos is Dictionary:
 			lines.append("目标位置：(%s, %s)" % [orchestrator._num(pos.get("x"), true), orchestrator._num(pos.get("y"), true)])
@@ -294,8 +301,12 @@ func submit_ability() -> void:
 		"stamp": make_stamp(token)}
 	var text := "确认执行：%s\n目标单位 #%s\n" % [str(candidate.get("title", "")), unit_id]
 	var target = candidate.get("target")
-	if target is Dictionary and not str(target.get("city", "")).is_empty():
-		text += "目标城市：%s\n" % str(target.city)
+	if target is Dictionary:
+		if not str(target.get("city", "")).is_empty():
+			text += "目标城市：%s\n" % str(target.city)
+		# 赠送城邦等以文明为目标的动作，确认框同样复述接收方。
+		if not str(target.get("civ", "")).is_empty():
+			text += "目标文明：%s\n" % str(target.civ)
 	var warns := warnings(candidate)
 	if not warns.is_empty():
 		for w in warns:

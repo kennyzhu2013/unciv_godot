@@ -15,6 +15,13 @@ var textures: Dictionary = {}
 var unit_nodes: Dictionary = {}
 var reachable: Dictionary = {}
 var attack_targets: Dictionary = {}
+# 空军转场候选（己方空位城市/运输单位）与准备扫荡后的射程目标，均来自内核只读投影。
+var air_bases: Dictionary = {}
+var sweep_targets: Dictionary = {}
+# 空降落点：仅准备态由内核给出，绿色双环与普通可达圈、空军转场青圈区分。
+var paradrop_targets: Dictionary = {}
+# 核打击预览的爆炸波及圈：由内核 combatPreview.blast 给出，红橙实心填充 + 虚线外框。
+var blast_tiles: Dictionary = {}
 var attack_from: Dictionary = {}
 var route: Array = []
 # 后续回合落点（原生估算）：与本回合实线路线 route 区分绘制，仅用于预览。
@@ -82,6 +89,10 @@ func set_snapshot(data: Dictionary, focus := false) -> void:
 		tiles[Vector2i(int(tile.x), int(tile.y))] = tile
 	reachable.clear()
 	attack_targets.clear()
+	air_bases.clear()
+	sweep_targets.clear()
+	paradrop_targets.clear()
+	blast_tiles.clear()
 	attack_from.clear()
 	route.clear()
 	future_route.clear()
@@ -206,6 +217,16 @@ func set_reachable(options: Dictionary) -> void:
 	attack_targets.clear()
 	for tile in options.get("attackTargets", []):
 		attack_targets[Vector2i(int(tile.x), int(tile.y))] = true
+	# 空军专属候选：转场落点与扫荡目标与陆海可达/攻击目标分开绘制，避免混用陆地路径语义。
+	air_bases.clear()
+	for tile in options.get("airBases", []):
+		air_bases[Vector2i(int(tile.x), int(tile.y))] = true
+	sweep_targets.clear()
+	for tile in options.get("sweepTargets", []):
+		sweep_targets[Vector2i(int(tile.x), int(tile.y))] = true
+	paradrop_targets.clear()
+	for tile in options.get("paradropTargets", []):
+		paradrop_targets[Vector2i(int(tile.x), int(tile.y))] = true
 	queue_redraw()
 
 # 进入城市地块管理模式时由主界面注入；退出时传空数组清除覆盖。
@@ -332,6 +353,28 @@ func _draw_overlay(ov: Node2D) -> void:
 		var outline := _polygon(hex_to_pixel(coord), RADIUS * 0.85)
 		outline.append(outline[0])
 		ov.draw_polyline(outline, Color("ff7265"), 3)
+	# 空中扫荡：与空袭同为红色目标框，但加内圈虚线区分“无确定防守方”的射程目标。
+	for coord: Vector2i in sweep_targets:
+		var sweep_outline := _polygon(hex_to_pixel(coord), RADIUS * 0.72)
+		sweep_outline.append(sweep_outline[0])
+		ov.draw_polyline(sweep_outline, Color("ff9f6a"), 2)
+		ov.draw_arc(hex_to_pixel(coord), RADIUS * 0.5, 0, TAU, 18, Color(0.9, 0.55, 0.35, 0.85), 1.5)
+	# 空军转场：青色虚线圆环，与陆海可达圈（实线）区分。
+	for coord: Vector2i in air_bases:
+		ov.draw_arc(hex_to_pixel(coord), RADIUS * 0.7, 0, TAU, 24, Color(0.45, 0.85, 0.95, 0.9), 2)
+	# 空降落点：绿色外框加中心圆点，与空袭红框、扫荡橙框、转场青圈区分。
+	for coord: Vector2i in paradrop_targets:
+		var drop_outline := _polygon(hex_to_pixel(coord), RADIUS * 0.8)
+		drop_outline.append(drop_outline[0])
+		ov.draw_polyline(drop_outline, Color("8ce27a"), 2)
+		ov.draw_circle(hex_to_pixel(coord), RADIUS * 0.22, Color(0.55, 0.89, 0.48, 0.6))
+	# 核爆波及圈：半透明红橙填充 + 虚线外框，先于攻击起点/路线绘制以免遮挡。
+	for coord: Vector2i in blast_tiles:
+		var blast_outline := _polygon(hex_to_pixel(coord), RADIUS * 0.92)
+		ov.draw_colored_polygon(blast_outline, Color(0.95, 0.36, 0.24, 0.22))
+		blast_outline.append(blast_outline[0])
+		_draw_dashed(ov, blast_outline, Color(1.0, 0.55, 0.35, 0.95), 2.5)
+		ov.draw_circle(hex_to_pixel(coord), RADIUS * 0.14, Color(1.0, 0.62, 0.36, 0.5))
 	if not attack_from.is_empty():
 		ov.draw_circle(hex_to_pixel(Vector2i(int(attack_from.x), int(attack_from.y))), 6, Color("fff0ad"))
 	if route.size() > 1:

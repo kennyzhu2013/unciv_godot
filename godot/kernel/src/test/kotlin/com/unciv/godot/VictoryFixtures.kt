@@ -48,11 +48,76 @@ internal object VictoryFixtures {
         game.civilizations.forEach { it.popupAlerts.clear(); it.notifications.clear() }
     } }
     fun export(game: GameInfo, name: String): File = DiplomaticVoteFixtures.export(game, "victory-$name")
+
+    /** 第五分支（传统）只差一项时留给真实政策命令的那一项：requires 图里没有后继依赖的汇点。 */
+    fun traditionPolicy(game: GameInfo): String {
+        val normal = game.ruleset.policyBranches["Tradition"]!!.policies.dropLast(1)
+        val requiredByOthers = normal.flatMap { it.requires.orEmpty() }.toSet()
+        return normal.last { it.name !in requiredByOthers }.name
+    }
+
+    /** 文化“动作前”边界：四项政策分支由原生 adopt 预置完成，第五分支只差一项，乌托邦工程差 1 点生产力。 */
+    fun cultural(): GameInfo = game().also { game -> native(game) {
+        game.gameParameters.victoryTypes = arrayListOf("Cultural")
+        val player = game.currentPlayerCiv
+        player.policies.freePolicies = 1000
+        for (name in listOf("Honor", "Piety", "Commerce", "Order")) {
+            val branch = game.ruleset.policyBranches[name]!!
+            if (!player.policies.isAdopted(branch.name)) player.policies.adopt(branch)
+            for (item in branch.policies.dropLast(1))
+                if (!player.policies.isAdopted(item.name)) player.policies.adopt(item)
+        }
+        val tradition = game.ruleset.policyBranches["Tradition"]!!
+        if (!player.policies.isAdopted(tradition.name)) player.policies.adopt(tradition)
+        val last = traditionPolicy(game)
+        while (true) {
+            val next = tradition.policies.dropLast(1).firstOrNull {
+                it.name != last && !player.policies.isAdopted(it.name) && player.policies.isAdoptable(it)
+            } ?: break
+            player.policies.adopt(next)
+        }
+        check(player.policies.isAdoptable(game.ruleset.policies[last]!!)) { "第五分支应只差 $last" }
+        check(player.policies.completedBranches.size == 4) { "预置后应正好四个完整分支" }
+        val city = player.cities.first()
+        val utopia = game.ruleset.buildings["Utopia Project"]!!
+        city.cityConstructions.inProgressConstructions[utopia.name] = utopia.getProductionCost(player, city) - 1
+        player.policies.freePolicies = 1
+        player.policies.storedCulture = 0
+        player.policies.shouldOpenPolicyPicker = false
+        game.setTransients()
+        game.civilizations.forEach { it.popupAlerts.clear(); it.notifications.clear() }
+    } }
+
+    /** 时间“动作前”边界：只差一次真实 nextTurn 跨过回合上限；领先方由原生分数严格决定。 */
+    fun time(playerLeads: Boolean): GameInfo = GreatPersonFixtures.game(free = 0).also { game -> native(game) {
+        game.gameParameters.victoryTypes = arrayListOf("Time")
+        game.gameParameters.maxTurns = game.turns + 1
+        val leader = if (playerLeads) game.currentPlayerCiv else BattleFixtures.enemy(game)
+        leader.cities.first().population.setPopulation(6)
+        game.setTransients()
+        check(game.civilizations.filter { it != leader }.all { it.calculateTotalScore() < leader.calculateTotalScore() })
+        game.civilizations.forEach { it.popupAlerts.clear(); it.notifications.clear() }
+    } }
+
+    /** 灭亡“动作前”边界：唯一城市 1 点血量，相邻敌军已宣战；夺取发生在真实原生回合里。 */
+    fun lastStand(): GameInfo = GreatPersonFixtures.game(free = 0).also { game -> native(game) {
+        game.gameParameters.victoryTypes = arrayListOf("Domination")
+        val player = game.currentPlayerCiv
+        val rival = BattleFixtures.enemy(game)
+        if (!player.knows(rival)) player.diplomacyFunctions.makeCivilizationsMeet(rival)
+        player.getDiplomacyManager(rival)!!.declareWar()
+        player.cities.first().health = 1
+        BattleFixtures.add(game, "Warrior", -1, 0, rival)
+        game.setTransients()
+        game.civilizations.forEach { it.popupAlerts.clear(); it.notifications.clear() }
+    } }
     fun apply(original: GameInfo, action: String, params: JsonObject = dto()): GameInfo = native(original) {
         var game = original
         when (action) {
             "reload" -> game = copy(game)
             "nextTurn" -> game = DiplomaticVoteFixtures.nextTurn(game)
+            // 与政策面板选择同一原生入口；分支完成时的 Complete 政策由 adopt 内部递归采纳。
+            "policy" -> game.currentPlayerCiv.policies.adopt(game.ruleset.policies[params.text("name")]!!)
             "victoryContinue" -> game.oneMoreTurnMode = true
             "attack" -> {
                 val unit = game.currentPlayerCiv.units.getCivUnits().first { it.id == params.integer("unitId") }

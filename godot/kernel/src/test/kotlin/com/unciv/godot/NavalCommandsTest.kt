@@ -107,10 +107,47 @@ class NavalCommandsTest {
         val (session, preview) = compareAttack(game, game.currentPlayerCiv.units.getCivUnits().first().id, 1, -1)
         assertEquals("captureCivilian", preview.text("kind"))
         assertTrue(session.game!!.currentPlayerCiv.units.getCivUnits().any { it.name == "Worker" })
-        val land = NavalFixtures.game().also { native(it) { add(it, "Warrior", 1, 0); add(it, "Worker", 2, 0, enemy(it)); NavalFixtures.ready(it) } }
-        val landSession = load(land)
-        reject(landSession, request(landSession, "combatPreview", "unitId" to land.currentPlayerCiv.units.getCivUnits().first().id,
-            "x" to 2, "y" to 0), "CANNOT_ATTACK")
+    }
+
+    /** 陆上平民：近战移动进入即俘获（开拓者转工人），远程只是造成伤害，有军事单位护卫时不能以平民为目标。 */
+    @Test fun landCivilianCaptureRangedAndGuardMatchNative() {
+        fun land(attacker: String, civilian: String): Pair<GameInfo, Int> {
+            val game = NavalFixtures.game(technology = null).also { native(it) {
+                add(it, attacker, 1, 0); add(it, civilian, 2, 0, enemy(it)); NavalFixtures.ready(it)
+            } }
+            return game to game.currentPlayerCiv.units.getCivUnits().first { it.name == attacker }.id
+        }
+
+        // compareAttack 内部对入参做 load 得到新 session 并在此上执行攻击，归属断言必须用其返回的 session。
+        val (workerGame, workerId) = land("Warrior", "Worker")
+        val (workerSession, workerPreview) = compareAttack(workerGame, workerId, 2, 0)
+        assertEquals("captureCivilian", workerPreview.text("kind"))
+        assertEquals("可俘获目标不得预告为销毁", "capture", workerPreview.text("civilianOutcome"))
+        assertTrue("俘获的平民归属我方", workerSession.game!!.currentPlayerCiv.units.getCivUnits()
+            .any { it.name == "Worker" && it.isCivilian() })
+
+        val (settlerGame, settlerId) = land("Warrior", "Settler")
+        val (settlerSession, _) = compareAttack(settlerGame, settlerId, 2, 0)
+        val owner = settlerSession.game!!.currentPlayerCiv
+        assertTrue("开拓者被俘后按原生转为工人", owner.units.getCivUnits().any { it.name == "Worker" })
+        assertFalse("不得保留敌方开拓者", owner.units.getCivUnits().any { it.name == "Settler" })
+
+        val (archerGame, archerId) = land("Archer", "Worker")
+        val (archerSession, archerPreview) = compareAttack(archerGame, archerId, 2, 0)
+        assertEquals("远程攻击平民不按俘获结算", "combat", archerPreview.text("kind"))
+        assertTrue(archerPreview["damageToDefender"]!!.jsonObject.integer("max") > 0)
+        assertTrue("远程仅造成伤害不俘获", enemy(archerSession.game!!).units.getCivUnits().any { it.name == "Worker" })
+
+        val guarded = NavalFixtures.game(technology = null).also { native(it) {
+            add(it, "Warrior", 1, 0); add(it, "Warrior", 2, 0, enemy(it)); add(it, "Worker", 2, 0, enemy(it)); NavalFixtures.ready(it)
+        } }
+        val guardedId = guarded.currentPlayerCiv.units.getCivUnits().first { it.name == "Warrior" }.id
+        val guardedSession = load(guarded)
+        val guardedPreview = run(guardedSession, "combatPreview", "unitId" to guardedId, "x" to 2, "y" to 0)["data"]!!.jsonObject
+        assertEquals("有军事单位护卫时目标是军事单位而非平民", "combat", guardedPreview.text("kind"))
+        native(guarded) { Battle.getMapCombatantOfTile(guarded.tileMap[2, 0])!!.let { combatant ->
+            assertTrue(combatant is MapUnitCombatant && !combatant.unit.isCivilian())
+        } }
     }
 
     @Test fun amphibiousAttackAndRangedEmbarkRestrictionUseNativeCandidates() {
@@ -230,15 +267,50 @@ class NavalCommandsTest {
         reject(visibleSession, request(visibleSession, "attack", "unitId" to ship.id, "x" to 1, "y" to -1), "CANNOT_ATTACK")
     }
 
-    @Test fun airAndNuclearActiveOperationsStayUnsupported() {
-        for (name in listOf("Fighter", "Atomic Bomb")) {
-            val game = NavalFixtures.game().also { native(it) { add(it, name, 0, 0); NavalFixtures.ready(it) } }
-            val session = load(game)
-            val id = game.currentPlayerCiv.units.getCivUnits().first().id
-            for (action in listOf("path", "move", "attack", "combatPreview"))
-                reject(session, request(session, action, "unitId" to id, "x" to 1, "y" to -1), "UNSUPPORTED")
-            assertFalse(run(session, "unitOptions", "unitId" to id)["data"]!!.jsonObject["combatSupported"]!!.jsonPrimitive.boolean)
-        }
+    /** 核武已接入专用命令：航线／移动仍不承接，核打击走原生 Nuke，摘要为独立 nuke 投影。 */
+    @Test fun nuclearUnitsUseDedicatedCommands() {
+        val game = NavalFixtures.game().also { native(it) { add(it, "Atomic Bomb", 0, 0); NavalFixtures.ready(it) } }
+        val session = load(game)
+        val id = game.currentPlayerCiv.units.getCivUnits().first { it.name == "Atomic Bomb" }.id
+        // 航线与移动是陆海入口，核武只能 airRebase 搬运或直接核打击。
+        for (action in listOf("path", "move"))
+            reject(session, request(session, action, "unitId" to id, "x" to 1, "y" to -1), "UNSUPPORTED")
+        // 同格目标由原生 mayUseNuke 拒绝：核打击合法性继续由 core 判定，网关不自证。
+        for (action in listOf("attack", "combatPreview"))
+            reject(session, request(session, action, "unitId" to id, "x" to 0, "y" to 0), "CANNOT_ATTACK")
+        val options = run(session, "unitOptions", "unitId" to id)["data"]!!.jsonObject
+        assertTrue(options["combatSupported"]!!.jsonPrimitive.boolean)
+        assertEquals("", options.text("combatReason"))
+        assertTrue("核武不提供基础动作", options["actions"]!!.jsonArray.isEmpty())
+        assertTrue("核武不使用空军投影", options["air"] is JsonNull)
+        val nuke = options["nuke"]!!.jsonObject
+        assertEquals(10, nuke.integer("range"))
+        assertEquals(2, nuke.integer("blastRadius"))
+        assertTrue(nuke["selfDestructs"]!!.jsonPrimitive.boolean)
+    }
+
+    /** 空军已接入专用命令：转场走 airRebase，空袭／扫荡共享原生 TargetHelper 与 Battle；陆海移动入口仍不承接。 */
+    @Test fun airUnitsUseDedicatedAirCommands() {
+        val game = NavalFixtures.game().also { native(it) { add(it, "Fighter", 0, 0); NavalFixtures.ready(it) } }
+        val session = load(game)
+        val id = game.currentPlayerCiv.units.getCivUnits().first { it.name == "Fighter" }.id
+        // 航线与移动是陆海入口，空军只能用 airRebase 校验航程与降落点。
+        for (action in listOf("path", "move"))
+            reject(session, request(session, action, "unitId" to id, "x" to 1, "y" to -1), "UNSUPPORTED")
+        // 空海格没有可攻击目标：校验与预览都交由原生可攻击性判定，而不是网关自证。
+        for (action in listOf("attack", "combatPreview"))
+            reject(session, request(session, action, "unitId" to id, "x" to 1, "y" to -1), "CANNOT_ATTACK")
+        val options = run(session, "unitOptions", "unitId" to id)["data"]!!.jsonObject
+        assertTrue(options["combatSupported"]!!.jsonPrimitive.boolean)
+        assertEquals("", options.text("combatReason"))
+        assertEquals(listOf("airSweep"), options["actions"]!!.jsonArray.map { it.jsonObject.text("id") })
+        assertEquals(16, options["air"]!!.jsonObject.integer("rebaseRange"))
+        // 空中扫荡是原生准备态开关：未准备时没有候选地块，准备后由原生射程与视野给出。
+        assertTrue(options["sweepTargets"]!!.jsonArray.isEmpty())
+        run(session, "unitAction", "unitId" to id, "type" to "airSweep")
+        val prepared = run(session, "unitOptions", "unitId" to id)["data"]!!.jsonObject
+        assertTrue("准备扫荡后应有候选地块", prepared["sweepTargets"]!!.jsonArray.isNotEmpty())
+        assertTrue(prepared["air"]!!.jsonObject["sweep"]!!.jsonObject["active"]!!.jsonPrimitive.boolean)
     }
 
     @Test fun coastalProductionAndDepartureMatchNative() {
@@ -459,6 +531,9 @@ class NavalCommandsTest {
                 } else if (step.text("action") == "victoryContinue") {
                     val options = run(session, "victoryOptions")["data"]!!.jsonObject
                     run(session, "victoryContinue", "resultToken" to options["continue"]!!.jsonObject.text("token"))
+                } else if (step.text("action") == "disband") {
+                    // 解散经统一单位动作命令派发，不是独立命令名。
+                    run(session, "unitAction", "unitId" to step["params"]!!.jsonObject.integer("unitId"), "type" to "disband")
                 } else run(session, step.text("action"), *step["params"]!!.jsonObject.toList().toTypedArray())
                 assertEquals("导出窗口序列 ${scenario.text("name")}/${step.text("step")}",
                     scenario["states"]!!.jsonObject[step.text("step")], GameplayAssertions.gameplay(session.game!!))

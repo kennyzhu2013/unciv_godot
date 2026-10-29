@@ -22,8 +22,9 @@ class UnitCityActionsFixturesTest {
         val exported = Json.parseToJsonElement(java.io.File(UnitCityActionsFixtures.root,
             "godot/.local/tests/unitcity-expected.json").readText()).jsonObject
         val scenarios = exported["scenarios"]!!.jsonArray.map { it.jsonObject }
-        assertEquals(listOf("promotion", "upgrade", "bombard", "workboat"), scenarios.map { it.text("name") })
-        // 原生重放逐步成功即证明四项均可无 UI 调用；期望状态与 raw 证据已落盘。
+        assertEquals(listOf("promotion", "upgrade", "bombard", "workboat", "annex-puppet", "stop-razing"),
+            scenarios.map { it.text("name") })
+        // 原生重放逐步成功即证明六项均可无 UI 调用；期望状态与 raw 证据已落盘。
         for (scenario in scenarios) {
             val states = scenario["states"]!!.jsonObject
             assertTrue(states.keys.contains("initial"))
@@ -65,6 +66,24 @@ class UnitCityActionsFixturesTest {
         val response = session.handle(request(session, "workerOrder",
             "unitId" to unit.id, "type" to "createWaterImprovement", "name" to "Fishing Boats"))
         assertTrue(response.toString(), response["ok"]!!.jsonPrimitive.boolean)
+    }
+
+    @Test fun annexPuppetCommandRegistered() {
+        val session = GameSession(UnitCityActionsFixtures.root)
+        BattleFixtures.run(session, "load", "path" to fixture("annex-puppet"))
+        val city = session.game!!.currentPlayerCiv.cities.first()
+        val response = session.handle(request(session, "annexPuppet", "cityId" to city.id))
+        assertTrue(response.toString(), response["ok"]!!.jsonPrimitive.boolean)
+        assertTrue(!session.game!!.currentPlayerCiv.cities.first().isPuppet)
+    }
+
+    @Test fun stopRazingCommandRegistered() {
+        val session = GameSession(UnitCityActionsFixtures.root)
+        BattleFixtures.run(session, "load", "path" to fixture("stop-razing"))
+        val city = session.game!!.currentPlayerCiv.cities.first()
+        val response = session.handle(request(session, "stopRazing", "cityId" to city.id))
+        assertTrue(response.toString(), response["ok"]!!.jsonPrimitive.boolean)
+        assertTrue(!session.game!!.currentPlayerCiv.cities.first().isBeingRazed)
     }
 
     private fun fixture(name: String) = java.io.File(UnitCityActionsFixtures.root,

@@ -50,11 +50,42 @@ internal class CityCaptureCommands(private val game: GameInfo) {
             player.popupAlerts.remove(alert)
         }
     }
+
+    /** 已归本方城市归属（不依赖占城提示）。 */
+    private fun ownedCity(id: String): City = game.getCities().firstOrNull {
+        it.id == id && it.civ == player
+    } ?: throw GatewayError("NOT_OWNED", "找不到己方城市")
+
+    /** 傀儡后续吞并：与 CityScreen 的 Annex city 同源（mayAnnex + isPuppet）；不冒用占城队列授权。 */
+    fun prepareAnnexPuppet(id: String): () -> Unit {
+        CombatCommands(game).ensureNoBlockingBattleDecision()
+        val city = ownedCity(id)
+        if (!city.isPuppet) throw GatewayError("CITY_STATUS", "此城市不是傀儡，无需吞并")
+        if (!mayAnnex()) throw GatewayError("CITY_STATUS", "此文明不能吞并城市")
+        return { city.annexCity() }
+    }
+
+    /** 停止焚城：与 CityView.trySetRazing(false) 同构，仅翻转原生标志。 */
+    fun prepareStopRazing(id: String): () -> Unit {
+        CombatCommands(game).ensureNoBlockingBattleDecision()
+        val city = ownedCity(id)
+        if (city.civ != player) throw GatewayError("NOT_OWNED", "只能处理本方城市")
+        if (!city.isBeingRazed) throw GatewayError("CITY_STATUS", "此城市当前未在焚毁")
+        return { city.isBeingRazed = false }
+    }
 }
 
 internal fun contributeCityCapture(registry: CommandRegistry, session: GameSession) {
     registry.effect("cityDecision") {
         GameSession.validateGame(session.requireGame())
         CityCaptureCommands(session.requireGame()).prepare(it.request.text("cityId"), it.request.text("choice"))
+    }
+    registry.effect("annexPuppet") {
+        GameSession.validateGame(session.requireGame())
+        CityCaptureCommands(session.requireGame()).prepareAnnexPuppet(it.request.text("cityId"))
+    }
+    registry.effect("stopRazing") {
+        GameSession.validateGame(session.requireGame())
+        CityCaptureCommands(session.requireGame()).prepareStopRazing(it.request.text("cityId"))
     }
 }

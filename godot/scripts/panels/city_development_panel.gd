@@ -29,11 +29,20 @@ var population_scroll: ScrollContainer
 var queue_scroll: ScrollContainer
 # 概况子页容器：城市轰击面板挂在此页（main._build_city_tab 传入 city_combat.build）。
 var overview_page: VBoxContainer = null
+# 已占城后续入口：傀儡城市吞并、焚城中停止；仅在对应命令可执行时可见。
+var annex_button: Button = null
+var stop_raze_button: Button = null
 
 func build(city_page: VBoxContainer) -> void:
 	city_summary.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	city_summary.text = "选择一座己方城市进行管理。"
 	city_page.add_child(city_summary)
+	annex_button = orchestrator.button(city_page, "吞并此傀儡城市", func(): await _run_city("annexPuppet"))
+	annex_button.name = "AnnexPuppetCity"
+	annex_button.visible = false
+	stop_raze_button = orchestrator.button(city_page, "停止焚城", func(): await _run_city("stopRazing"))
+	stop_raze_button.name = "StopRazingCity"
+	stop_raze_button.visible = false
 	city_panel.hide()
 	# city_panel 直接位于城市页（非滚动容器），必须纵向 EXPAND_FILL 才能让内部 city_tabs
 	# 及其滚动子页获得真实高度；否则容器塌陷为页签栏高度，子页内容被裁剪到不可见/不可点击。
@@ -124,6 +133,8 @@ func _populate_city() -> void:
 	# 城市页顶部固定摘要：名称／人口／可管理状态（不随子页滚动）。
 	city_summary.text = "%s · 人口 %s%s" % [str(orchestrator.city_data.get("name", "")), orchestrator._num(orchestrator.city_data.get("population"), true),
 		("" if editable else "（不可管理：%s）" % str(orchestrator.city_data.get("reason", "")))]
+	annex_button.visible = bool(orchestrator.city_data.get("canAnnex", false))
+	stop_raze_button.visible = bool(orchestrator.city_data.get("canStopRazing", false))
 	city_overview.text = "每回合产出：%s" % orchestrator._format_stats(orchestrator.city_data.get("stats", {}))
 	var growth: Dictionary = orchestrator.city_data.get("growth", {})
 	var state := "停滞"

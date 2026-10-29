@@ -283,6 +283,50 @@ func verify_sizes() -> bool:
 	await smoke.get_tree().process_frame
 	return true
 
+# 赠送城邦：军事单位站在已相识城邦中心格→候选指向接收方文明→预览说明移交他国→确认后单位离开我方控制、
+# 城邦影响力上升、面板清除；精确移交结果与原生 UnitActions.GiftUnit 的差分由内核 UnitAbilityCommandsTest 覆盖。
+func verify_gift_city_state() -> bool:
+	var unit := await _load_and_select("unit-abilities-gift", "Warrior")
+	if unit.is_empty(): return false
+	if not await _open(): return false
+	var panel = _panel()
+	var id := int(unit.id)
+	var gift := _index_of(panel, "giftUnit")
+	if not smoke.check(gift >= 0, "赠送：候选含赠送城邦"): return false
+	var meta: Dictionary = panel.picker.get_item_metadata(gift)
+	if not smoke.check(bool(meta.get("enabled", false)), "城邦中心格赠送候选可执行"): return false
+	if not smoke.check(bool(meta.get("consumesUnit", false)), "赠送标注离开我方控制（按消耗预览）"): return false
+	var recipient := str(meta.get("target", {}).get("civ", ""))
+	if not smoke.check(not recipient.is_empty(), "候选指向接收方城邦文明"): return false
+	var influence_before: int = await city_state_influence(recipient)
+	if not await smoke.click_option(panel.picker, gift): return false
+	if not smoke.check(panel.description.text.contains("目标文明：" + recipient), "预览展示接收方文明"): return false
+	if not smoke.check(panel.description.text.contains("移交他国"), "预览说明单位移交他国"): return false
+	await smoke.screenshot("smoke-unit-abilities-gift.png")
+	var revision: int = app.client.revision
+	if not await smoke.click_control(panel.submit): return false
+	if not smoke.check(panel.confirmation.visible, "赠送：确认框已打开"): return false
+	if not smoke.check(panel.confirmation.dialog_text.contains("目标文明：" + recipient) and panel.confirmation.dialog_text.contains("移交他国"), "确认框复述接收方与移交后果"): return false
+	if not smoke.check(app.client.revision == revision, "打开确认框尚未写入"): return false
+	if not await _click_dialog(true): return false
+	if not smoke.check(app.client.revision == revision + 1, "赠送仅一次写入"): return false
+	if not smoke.check(not app._own_unit_exists(id), "赠送后单位离开我方控制"): return false
+	if not smoke.check(not panel.panel.visible and panel.unit_id == -1, "赠送后能力面板与选中清除"): return false
+	if not smoke.check(app.unit_id == -1, "赠送后主选择上下文清空"): return false
+	var influence_after: int = await city_state_influence(recipient)
+	if not smoke.check(influence_after > influence_before, "赠送提升城邦影响力（%s → %s）" % [influence_before, influence_after]): return false
+	await smoke.screenshot("smoke-unit-abilities-gift-done.png")
+	evidence.append({"step": "gift-city-state", "recipient": recipient, "influence": [influence_before, influence_after], "revision": app.client.revision})
+	return true
+
+# 只读取城邦当前影响力：来自外交候选（内核原生投影），前端不自行推算。
+func city_state_influence(civ_name: String) -> int:
+	var result: Dictionary = await app.execute("diplomacyOptions")
+	for entry in result.get("data", {}).get("civilizations", []):
+		if str(entry.get("name", "")) == civ_name:
+			return int(entry.get("influence", 0))
+	return 0
+
 # 太空船组装：部件驻首都→预览部件需求与目标首都→确认消耗→能力面板清除→胜利页部件进度更新。
 func verify_spaceship_assembly() -> bool:
 	var unit := await _load_and_select("unit-abilities-spaceship", "SS Booster")
@@ -340,7 +384,8 @@ func run(harness) -> bool:
 	if not await verify_stale_ticket(): return false
 	if not await verify_double_click_single_write(): return false
 	if not await verify_drop_response_retry(): return false
+	if not await verify_gift_city_state(): return false
 	if not await verify_spaceship_assembly(): return false
 	if not await verify_sizes(): return false
-	smoke.steps.append("单位能力面板：选择仅预览（含消耗单位／宗教压力等醒目说明）、独立按钮确认弹框、取消／关闭零写入、消耗型能力执行后清除选中、传教非消耗次数递减、禁用候选展示原因、旧票据失效、双击最多一次写入、丢响应同 requestId 重试、太空船部件组装与胜利页进度、三尺寸截图")
+	smoke.steps.append("单位能力面板：选择仅预览（含消耗单位／宗教压力等醒目说明）、独立按钮确认弹框、取消／关闭零写入、消耗型能力执行后清除选中、传教非消耗次数递减、禁用候选展示原因、旧票据失效、双击最多一次写入、丢响应同 requestId 重试、赠送城邦（移交控制＋影响力提升）、太空船部件组装与胜利页进度、三尺寸截图")
 	return true

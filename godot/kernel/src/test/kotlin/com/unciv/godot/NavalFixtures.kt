@@ -77,6 +77,13 @@ internal object NavalFixtures {
                 }
                 UnitActions.getBasicActions(unit(game, params.integer("unitId"))).first { it.type == type }.action!!.invoke()
             }
+            "disband" -> {
+                // 与网关闭包同源：只执行一次原生 MapUnit.disband 与其后的统计推进。
+                val u = unit(game, params.integer("unitId"))
+                check(u.hasMovement())
+                u.disband()
+                u.civ.updateStatsForNextTurn()
+            }
             "cityDecision" -> {
                 val alert = game.currentPlayerCiv.popupAlerts.first()
                 check(alert.type == AlertType.CityConquered && alert.value == params.text("cityId"))
@@ -105,6 +112,20 @@ internal object NavalFixtures {
     fun embarkation(): GameInfo = game(nation = "Denmark").also { game -> native(game) {
         add(game, "Warrior", 2, 0)
         add(game, "Worker", 2, 0)
+        ready(game)
+    } }
+
+    /** 陆上近战俘获平民：武士毗邻敌方工人，攻击即按原生“移动进入即俘获”收编。 */
+    fun landCapture(): GameInfo = game(technology = null).also { game -> native(game) {
+        add(game, "Warrior", 1, 0)
+        add(game, "Worker", 2, 0, enemy(game))
+        ready(game)
+    } }
+
+    /** 本方领土解散：武士站在首都旁已占用的草原格，解散会触发原生黄金返还分支。 */
+    fun disband(): GameInfo = game(technology = null).also { game -> native(game) {
+        game.currentPlayerCiv.cities.first().expansion.takeOwnership(game.tileMap[HexCoord(1, 0)])
+        add(game, "Warrior", 1, 0)
         ready(game)
     } }
 
@@ -141,6 +162,14 @@ internal object NavalFixtures {
             "attack" to dto("unitId" to conquest.currentPlayerCiv.units.getCivUnits().first().id, "x" to -6, "y" to 0),
             "cityDecision" to dto("cityId" to enemy(conquest).cities.first().id, "choice" to "puppet"),
             "victoryContinue" to dto(), "acknowledge" to dto(), "nextTurn" to dto(), "reload" to dto()))
+        // 陆上近战俘获平民：一次攻击即收编，验证前端可操作与原生窗口差分。
+        val land = landCapture()
+        val landWarrior = land.currentPlayerCiv.units.getCivUnits().first { it.name == "Warrior" }.id
+        record("landCapture", land, listOf("attack" to dto("unitId" to landWarrior, "x" to 2, "y" to 0)))
+        // 解散单位：前端确认框后走原生 disband；期望只调用一次原生逻辑。
+        val disbandFixture = disband()
+        val disbandUnit = disbandFixture.currentPlayerCiv.units.getCivUnits().first { it.name == "Warrior" }.id
+        record("disband", disbandFixture, listOf("disband" to dto("unitId" to disbandUnit)))
         // 构造器会重建 transient；按原格式重载后的单位列表生成指令，避免重复登记同一单位。
         val embark = copy(embarkation())
         check(embark.currentPlayerCiv.units.getCivUnits().map { it.id }.toList().let { it.size == 2 && it.toSet().size == 2 })

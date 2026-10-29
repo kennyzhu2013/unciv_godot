@@ -4,6 +4,7 @@ import com.unciv.godot.BattleFixtures.load
 import com.unciv.godot.BattleFixtures.native
 import com.unciv.godot.BattleFixtures.request
 import com.unciv.godot.BattleFixtures.run
+import com.unciv.godot.BattleFixtures.unit
 import com.unciv.godot.GameplayAssertions.assertGameplayEquals
 import com.unciv.logic.GameInfo
 import com.unciv.logic.city.CityFlags
@@ -283,17 +284,60 @@ class CityEconomyCommandsTest {
         reject(session, "UNSUPPORTED", "cityPurchase", "name" to "Nothing", "stat" to "Gold", "queueIndex" to 3)
     }
 
-    @Test fun airAndNuclearPurchaseRemainUnsupported() {
-        val (session, _) = scenario("unsupported")
-        for (name in listOf("Fighter", "Atomic Bomb")) {
-            assertTrue(name in session.game!!.ruleset.units)
-            reject(session, "UNSUPPORTED", "cityPurchase", "name" to name, "stat" to "Gold", "queueIndex" to -1)
+    /**
+     * 核武购买：科技、曼哈顿计划与铀到位后完全走原生 purchaseConstruction，
+     * 「曼哈顿计划前置」「铀消耗」与放置能力都不由网关推算。
+     */
+    @Test fun nuclearPurchaseMatchesNative() {
+        val (session, expected) = scenario("nuke-buy") { g ->
+            NavalFixtures.research(g, "Nuclear Fission")
+            DiplomacyFixtures.resource(g, g.currentPlayerCiv, "Uranium", 2)
+            EconomyFixtures.capital(g).cityConstructions.addBuilding(g.ruleset.buildings["Manhattan Project"]!!)
+            // 先接触希腊：购买后的原生资源刷新会重算可见地块，两端若从不同 HashSet 顺序首次接触，
+            // 会生成位置不确定的同一条见面通知。
+            g.currentPlayerCiv.diplomacyFunctions.makeCivilizationsMeet(BattleFixtures.enemy(g))
+            g.currentPlayerCiv.popupAlerts.clear()
+            g.currentPlayerCiv.notifications.clear()
         }
-        // 海军、伟人、宗教单位不再按类别一刀切：只保留空军与核武的未接入提示。
-        for (item in economy(session)["purchaseOptions"]!!.jsonArray.map { it.jsonObject }) {
-            assertFalse(item.text("name") in setOf("Fighter", "Atomic Bomb")
-                && item["supported"]!!.jsonPrimitive.boolean)
+        val atomicBomb = economy(session)["purchaseOptions"]!!.jsonArray.map { it.jsonObject }
+            .first { it.text("name") == "Atomic Bomb" }
+        assertTrue("核武购买已接入", atomicBomb["supported"]!!.jsonPrimitive.boolean)
+        val gold = atomicBomb["quotes"]!!.jsonArray.map { it.jsonObject }.first { it.text("stat") == "Gold" }
+        assertTrue(gold.toString(), gold["enabled"]!!.jsonPrimitive.boolean)
+        val cost = native(expected) {
+            expected.ruleset.units["Atomic Bomb"]!!.getStatBuyCost(EconomyFixtures.capital(expected), Stat.Gold)
         }
+        assertEquals(cost, gold["cost"]!!.jsonPrimitive.intOrNull)
+        purchase(session, expected, "Atomic Bomb")
+        val bought = unit(session.game!!, "Atomic Bomb")
+        assertTrue("核武停在城市中心", bought.currentTile.isCityCenter())
+        assertEquals(0f, bought.currentMovement)
+    }
+
+    /** 空军购买：科技与 Oil 到位后完全走原生 purchaseConstruction 放置，报价也不由网关推算。 */
+    @Test fun airUnitPurchaseMatchesNative() {
+        val (session, expected) = scenario("air-buy") { g ->
+            NavalFixtures.research(g, "Radar")
+            DiplomacyFixtures.resource(g, g.currentPlayerCiv, "Oil", 2)
+            // 先接触希腊：购买后的原生资源刷新会重算可见地块，若此时首次接触，两端会从
+            // HashSet 迭代出的不同希腊地块生成同一条见面通知，位置不确定。
+            g.currentPlayerCiv.diplomacyFunctions.makeCivilizationsMeet(BattleFixtures.enemy(g))
+            g.currentPlayerCiv.popupAlerts.clear()
+            g.currentPlayerCiv.notifications.clear()
+        }
+        val fighter = economy(session)["purchaseOptions"]!!.jsonArray.map { it.jsonObject }
+            .first { it.text("name") == "Fighter" }
+        assertTrue("空军购买已接入", fighter["supported"]!!.jsonPrimitive.boolean)
+        val gold = fighter["quotes"]!!.jsonArray.map { it.jsonObject }.first { it.text("stat") == "Gold" }
+        assertTrue(gold.toString(), gold["enabled"]!!.jsonPrimitive.boolean)
+        val cost = native(expected) {
+            expected.ruleset.units["Fighter"]!!.getStatBuyCost(EconomyFixtures.capital(expected), Stat.Gold)
+        }
+        assertEquals(cost, gold["cost"]!!.jsonPrimitive.intOrNull)
+        purchase(session, expected, "Fighter")
+        val bought = unit(session.game!!, "Fighter")
+        assertTrue("空军停在城市中心", bought.currentTile.isCityCenter())
+        assertEquals(0f, bought.currentMovement)
     }
 
     @Test fun saleReleasesSpecialistsAndOtherCityHasIndependentAllowance() {

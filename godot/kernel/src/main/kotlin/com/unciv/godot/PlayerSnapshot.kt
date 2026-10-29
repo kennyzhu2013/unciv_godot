@@ -148,6 +148,15 @@ internal class PlayerSnapshot(private val game: GameInfo) {
         return dto("unitId" to unit.id,
             "actions" to combat.actions(unit), "attackTargets" to combat.attackTargets(unit),
             "combatSupported" to combat.combatReason(unit).isEmpty(), "combatReason" to combat.combatReason(unit),
+            // 空军专属只读投影：空袭沿用 attackTargets，扫荡目标与转场候选分别给出，前端不自行推算。
+            // 核武同样以空军运行，但面板与目标是独立的 nuke 投影；搬运复用 airBases，攻击目标仍在 attackTargets。
+            "air" to if (unit.isAirUnit() && !unit.isNuclearWeapon()) combat.airInfo(unit) else null,
+            "nuke" to combat.nukeInfo(unit),
+            "airBases" to combat.rebaseTargets(unit),
+            "sweepTargets" to combat.sweepTargets(unit),
+            // 空降：能力摘要与合法落点均由原生 MayParadrop 与可达计算给出；无该能力时摘要为 null。
+            "paradrop" to combat.paradropInfo(unit),
+            "paradropTargets" to combat.paradropTargets(unit),
             "worker" to WorkerCommands(game).workerDto(raw),
             "progression" to UnitProgressionCommands(game).progressionDto(raw),
             "religion" to ReligionCommands(game).unitDto(raw),

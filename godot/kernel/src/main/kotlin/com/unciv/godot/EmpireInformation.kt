@@ -33,6 +33,7 @@ internal class EmpireInformation(private val game: GameInfo) {
             val production = city.currentConstructionName()
             dto("id" to city.id, "name" to city.name, "x" to city.location.x, "y" to city.location.y,
                 "population" to city.getPopulationCount(), "puppet" to city.isPuppet(),
+                "beingRazed" to city.isBeingRazed(),
                 "production" to production,
                 "turns" to if (production.isEmpty() || PerpetualConstruction.perpetualConstructionsMap.containsKey(production)) null
                     else city.constructions.turnsToConstruction(production).takeIf { it in 0..100000 },

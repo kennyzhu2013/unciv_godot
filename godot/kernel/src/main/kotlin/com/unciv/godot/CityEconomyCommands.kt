@@ -50,11 +50,8 @@ internal class CityEconomyCommands(private val game: GameInfo) {
         is PerpetualConstruction -> "持续生产项目不能购买"
         is Building -> if (c.hasUnique(UniqueType.CreatesOneImprovement, GameContext.IgnoreConditionals))
             "需要指定改良地块的建筑购买尚未接入" else ""
-        is BaseUnit -> when {
-            c.isAirUnit() -> "空军购买尚未接入"
-            c.hasUnique(UniqueType.NuclearWeapon, GameContext.IgnoreConditionals) -> "核武购买尚未接入"
-            else -> ""
-        }
+        // 空军与核武均已接入操作：购买资格、曼哈顿计划前置、铀消耗与放置能力全部交给原生购买流程。
+        is BaseUnit -> ""
         else -> "尚未接入该项目购买"
     }
 

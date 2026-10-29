@@ -37,10 +37,14 @@ internal class UnitAbilityCommands(private val game: GameInfo, private val sessi
         "createImprovement" to UnitActionType.CreateImprovement,
         "goldenAge" to UnitActionType.TriggerUnique,
         "assembleSpaceship" to UnitActionType.AddInCapital,
+        "giftUnit" to UnitActionType.GiftUnit,
     )
 
     /** 无关联 Unique 修饰符可直接读取的类型化动作：原生闭包恒定消耗单位。 */
     private val consumingTyped = setOf("hurryResearch", "hurryBuilding", "tradeMission", "assembleSpaceship")
+
+    /** 赠送不销毁单位但将其移交他国，对玩家而言等同于离开控制；预览按消耗单位提示。 */
+    private val exitsControl = setOf("giftUnit")
 
     /** 原生 SpreadReligion／RemoveHeresy／伟人类型化动作不携带 associatedUnique，按类型回查其动作 Unique 以读取次数与消耗。 */
     private val abilityUniques = mapOf(
@@ -107,6 +111,8 @@ internal class UnitAbilityCommands(private val game: GameInfo, private val sessi
     private fun consumesUnit(raw: MapUnit, candidate: Candidate): Boolean {
         // 伟人类型化动作（加速研究／加速建筑／贸易任务）与太空船组装的原生闭包恒定销毁单位，与 Unique 修饰符无关，先行判定。
         if (candidate.wireType in consumingTyped) return true
+        // 赠送将单位移交他国，不再属于我方，与控制卸除同构，恒返回真。
+        if (candidate.wireType in exitsControl) return true
         val unique = actionUnique(raw, candidate) ?: return false
         val left = usagesLeft(raw, unique)
         return unique.hasModifier(UniqueType.UnitActionConsumeUnit) ||
@@ -124,6 +130,8 @@ internal class UnitAbilityCommands(private val game: GameInfo, private val sessi
                 tile.owningCity?.let { dto("city" to it.name, "position" to it.location.dto()) }
             "createImprovement" -> dto("position" to tile.position.dto())
             "assembleSpaceship" -> player.getCapital()?.let { dto("city" to it.name, "position" to it.location.dto()) }
+            // 赠送目标为当前地块所属外国（recipient = tile.getOwner）；展示其文明与位置。
+            "giftUnit" -> tile.getOwner()?.let { dto("civ" to it.civName, "position" to tile.position.dto()) }
             else -> null
         }
     }
@@ -142,6 +150,7 @@ internal class UnitAbilityCommands(private val game: GameInfo, private val sessi
             "hurryBuilding" -> "消耗单位，为所在城市当前建筑追加产能（原生结算）"
             "tradeMission" -> "消耗单位，在城邦完成贸易任务获得金币与影响力（原生结算）"
             "assembleSpaceship" -> "消耗单位，将「${raw.name}」计入太空船组装进度（原生结算）"
+            "giftUnit" -> "将本单位赠送给所在地块所属外国（获得影响力，单位移交他国）"
             else -> candidate.action.title
         }
 

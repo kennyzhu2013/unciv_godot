@@ -71,6 +71,15 @@ var unit_abilities_checks
 var unit_abilities_evidence: Array[Dictionary] = []
 var presentation_checks
 var presentation_evidence: Array[Dictionary] = []
+# 第 7 批 7A 空军前端 smoke（转场／扫荡／空袭／空军购买）
+var air_checks
+var air_evidence: Array[Dictionary] = []
+# 第 7 批 7B 空降前端 smoke（准备／取消／落点／执行／三尺寸）
+var paradrop_checks
+var paradrop_evidence: Array[Dictionary] = []
+# 第 7 批 7C 核武前端 smoke（爆炸圈／风险预览／二次确认／布署／三尺寸）
+var nuke_checks
+var nuke_evidence: Array[Dictionary] = []
 
 # 真实 HTTP 后丢弃响应／延迟只读响应，属于客户端边界故障注入。
 class NavalFaultClient extends "res://scripts/kernel_client.gd":
@@ -305,6 +314,24 @@ func run(frontend) -> void:
 	if not await unit_abilities_checks.run(self):
 		return
 	print("Smoke 完成：unit-abilities")
+	print("Smoke 开始：air")
+	air_checks = load("res://tests/air_smoke.gd").new()
+	air_evidence = air_checks.evidence
+	if not await air_checks.run(self):
+		return
+	print("Smoke 完成：air")
+	print("Smoke 开始：paradrop")
+	paradrop_checks = load("res://tests/paradrop_smoke.gd").new()
+	paradrop_evidence = paradrop_checks.evidence
+	if not await paradrop_checks.run(self):
+		return
+	print("Smoke 完成：paradrop")
+	print("Smoke 开始：nuke")
+	nuke_checks = load("res://tests/nuke_smoke.gd").new()
+	nuke_evidence = nuke_checks.evidence
+	if not await nuke_checks.run(self):
+		return
+	print("Smoke 完成：nuke")
 	print("Smoke 开始：presentation")
 	presentation_checks = load("res://tests/presentation_smoke.gd").new()
 	presentation_evidence = presentation_checks.evidence
@@ -344,10 +371,10 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["new-game", "save-browser", "autosave-resume", "empire-overview", "notifications", "research-info", "policy-info", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat", "unit-orders", "unit-abilities", "presentation"],
+		"scenarios": ["new-game", "save-browser", "autosave-resume", "empire-overview", "notifications", "research-info", "policy-info", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat", "unit-orders", "unit-abilities", "air", "paradrop", "nuke", "presentation"],
 		"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "presentationEvidence": presentation_evidence,
+		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence,
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -583,10 +610,26 @@ func verify_naval_flow() -> bool:
 						return false
 					if unit.embarked and not check(art.ends_with("-Denmark"), "登船素材优先文明变体"):
 						return false
+				if scenario.name == "landCapture":
+					# 陆上近战俘获：敌方工人经一次攻击即收编为我方平民，前端可操作且与原生差分一致。
+					var captured: Array = app.client.snapshot.units.filter(func(u): return str(u.name) == "Worker" and bool(u.own) and bool(u.civilian))
+					if not check(captured.size() == 1, "陆上近战俘获：敌方工人收编为我方平民"):
+						return false
+					await screenshot("smoke-naval-landCapture-captured.png")
 			elif action == "cityDecision":
 				var controls: Array = app.capture_panel.get_children().filter(func(c): return c is Button and c.text == "傀儡")
 				if not check(controls.size() == 1, "沿岸占城复用处置按钮") or not await click_control(controls[0]):
 					return false
+			elif action == "disband":
+				# 解散：真实点击单位页解散按钮 → 确认框 → 原生 disband，期望端只执行一次原生逻辑。
+				if not await naval_select(int(order.params.unitId)):
+					return false
+				var disband_buttons: Array = app.unit_actions.get_children().filter(func(b): return b is Button and str(b.text).begins_with("解散单位"))
+				if not check(disband_buttons.size() == 1, "解散单位按钮可见") or not await click_control(disband_buttons[0]):
+					return false
+				if not check(app.disband_confirmation.visible, "解散弹出确认框" + str(app.disband_confirmation.dialog_text)) or not await click_disband_dialog(true):
+					return false
+				await screenshot("smoke-naval-disband.png")
 			elif action == "victoryContinue":
 				if not await open_victory() or not await click_control(app.victory_panel_inst.continue_button) or not await click_victory_dialog(true, true):
 					return false
@@ -706,6 +749,52 @@ func unitcity_select_city(city_id: String) -> bool:
 		return false
 	return check(app.city_id == city_id and app.active_context == "city" and app.tabs.current_tab == app.TAB_CITY, "真实选择己方城市并切到城市页")
 
+# 傀儡后续吞并：选中城市 → 城市页顶部「吞并此傀儡城市」按钮 → 核验状态回写。
+func unitcity_annex_puppet(params: Dictionary) -> bool:
+	if not await unitcity_select_city(str(params.cityId)):
+		return false
+	if not check(app.annex_button != null and app.annex_button.visible and app.annex_button.get_meta("allowed", true), "傀儡城市展示吞并入口"):
+		return false
+	var revision: int = app.client.revision
+	if not await click_control(app.annex_button):
+		return false
+	if not check(await city_is_puppet(str(params.cityId)) == false, "吞并后城市不再是傀儡"):
+		return false
+	if not check(app.client.revision == revision + 1, "吞并仅一次写入"):
+		return false
+	if not check(not app.annex_button.visible, "吞并后入口隐藏"):
+		return false
+	await screenshot("smoke-unitcity-annex-puppet.png")
+	return true
+
+# 停止焚城：选中城市 → 城市页顶部「停止焚城」按钮 → 核验焚毁标志清除。
+func unitcity_stop_razing(params: Dictionary) -> bool:
+	if not await unitcity_select_city(str(params.cityId)):
+		return false
+	if not check(app.stop_raze_button != null and app.stop_raze_button.visible and app.stop_raze_button.get_meta("allowed", true), "焚城中城市展示停止焚城入口"):
+		return false
+	var revision: int = app.client.revision
+	if not await click_control(app.stop_raze_button):
+		return false
+	if not check(await city_being_razed(str(params.cityId)) == false, "停止焚城后焚毁标志清除"):
+		return false
+	if not check(app.client.revision == revision + 1, "停止焚城仅一次写入"):
+		return false
+	if not check(not app.stop_raze_button.visible, "停止焚城后入口隐藏"):
+		return false
+	await screenshot("smoke-unitcity-stop-razing.png")
+	return true
+
+# 从城市发展查询读取傀儡状态（快照 cities 不含该字段，避免前端自建第二套状态）。
+func city_is_puppet(city_id: String) -> bool:
+	var result: Dictionary = await app.execute("cityOptions", {"cityId": city_id})
+	return bool(result.get("data", {}).get("puppet", false))
+
+# 从城市发展查询读取焚毁中状态（快照 cities 不含该字段，避免前端自建第二套状态）。
+func city_being_razed(city_id: String) -> bool:
+	var result: Dictionary = await app.execute("cityOptions", {"cityId": city_id})
+	return bool(result.get("data", {}).get("beingRazed", false))
+
 func promotion_index(promotion: String) -> int:
 	for index in range(app.unit_progression.promotions.size()):
 		if str(app.unit_progression.promotions[index].get("name")) == promotion:
@@ -717,6 +806,30 @@ func upgrade_index(target: String) -> int:
 		if str(app.unit_progression.upgrades[index].get("name")) == target:
 			return index
 	return -1
+
+# 解散确认对话框（main.disband_confirmation）：真实鼠标点击确认/取消，复用冻结落点避让。
+func click_disband_dialog(confirm: bool, twice := false) -> bool:
+	var dialog: ConfirmationDialog = app.disband_confirmation
+	if not check(dialog != null and dialog.visible, "解散确认对话框可见"):
+		return false
+	var control := dialog.get_ok_button() if confirm else dialog.get_cancel_button()
+	await get_tree().process_frame
+	var pos := control.get_global_rect().get_center()
+	if not check(dialog.get_visible_rect().encloses(control.get_global_rect()) and control.size.y >= 34, "解散确认按钮在窗口内且达到最小高度"):
+		return false
+	await window_motion(dialog, pos)
+	if not check(dialog.gui_get_hovered_control() == control, "解散确认窗口鼠标命中按钮"):
+		return false
+	var click_viewport: Viewport = dialog
+	var click_pos := pos
+	while click_viewport is Window and click_viewport.is_embedded():
+		click_pos = Vector2(click_viewport.position) + click_viewport.get_final_transform() * click_pos
+		click_viewport = click_viewport.get_parent().get_viewport()
+	await window_mouse(click_viewport, MOUSE_BUTTON_LEFT, click_pos, false)
+	if twice:
+		await window_mouse(click_viewport, MOUSE_BUTTON_LEFT, click_pos, false, true)
+	await settle()
+	return true
 
 # 单位动作确认对话框（晋升／升级／工作船共用）：复刻经济域真实窗口点击 OK/Cancel 与双击冻结落点。
 func click_unit_action_dialog(confirm: bool, twice := false) -> bool:
@@ -1147,7 +1260,7 @@ func verify_unitcity_flow() -> bool:
 	var expected_file := "res://.local/tests/unitcity-expected.json"
 	if not check(FileAccess.file_exists(expected_file), "独立单位城市原生期望存在，请先运行 :godot-kernel:test"): return false
 	unitcity_expected = JSON.parse_string(FileAccess.get_file_as_string(expected_file))
-	if not check(unitcity_expected.scenarios.size() == 4, "单位城市期望含四场景"): return false
+	if not check(unitcity_expected.scenarios.size() == 6, "单位城市期望含六场景"): return false
 	if not await verify_unitcity_previews(): return false
 	if not await verify_unitcity_transport(): return false
 	if not await verify_unitcity_sizes(): return false
@@ -1165,6 +1278,10 @@ func verify_unitcity_flow() -> bool:
 				if not await unitcity_bombard(p): return false
 			elif action == "createWaterImprovement":
 				if not await unitcity_workboat(p, true): return false
+			elif action == "annexPuppet":
+				if not await unitcity_annex_puppet(p): return false
+			elif action == "stopRazing":
+				if not await unitcity_stop_razing(p): return false
 			elif action == "reload":
 				if not await perform("load", {"path": app.last_saved_path}): return false
 			elif action == "nextTurn":
@@ -4227,7 +4344,7 @@ func _fail(message: String) -> void:
 			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
 			"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "presentationEvidence": presentation_evidence,
+			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
