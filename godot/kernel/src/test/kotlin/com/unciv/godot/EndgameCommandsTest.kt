@@ -138,4 +138,44 @@ class EndgameCommandsTest {
         assertGameplayEquals("灭亡后继续", expected, session.game!!)
         assertFalse(run(session, "victoryOptions")["data"]!!.jsonObject.boolean("requiresAcknowledgement"))
     }
+
+    // ---- 科学：六件部件全部经真实 move + unitAbility(assembleSpaceship) ----
+
+    @Test fun scientificVictoryCompletesThroughRealAssemblyCommands() {
+        val fixture = VictoryFixtures.science()
+        val session = load(fixture, "science")
+        var expected = expected(fixture)
+        assertEquals(0, session.game!!.currentPlayerCiv.victoryManager.currentsSpaceshipParts.sumValues())
+        val parts = session.game!!.currentPlayerCiv.units.getCivUnits().filter { it.name.startsWith("SS ") }
+            .map { it.id to it.name }.toList()
+        assertEquals(6, parts.size)
+        for ((index, part) in parts.withIndex()) {
+            val (id, name) = part
+            run(session, "move", "unitId" to id, "x" to 0, "y" to 0)
+            expected = VictoryFixtures.apply(expected, "move", dto("unitId" to id, "x" to 0, "y" to 0))
+            assertGameplayEquals("部件 $name 移入首都", expected, session.game!!)
+            val data = run(session, "unitAbilityOptions", "unitId" to id)["data"]!!.jsonObject
+            val candidate = data["candidates"]!!.jsonArray.map { it.jsonObject }
+                .first { it.text("type") == "assembleSpaceship" }
+            assertTrue("部件 $name 应可组装：${candidate.text("reason")}", candidate.boolean("enabled"))
+            // 进度只读投影来自原生计数，总进度逐件递增。
+            assertEquals(index, candidate["spaceship"]!!.jsonObject.integer("totalAssembled"))
+            assertEquals(6, candidate["spaceship"]!!.jsonObject.integer("totalRequired"))
+            run(session, "unitAbility", "unitId" to id, "candidateId" to candidate.text("id"),
+                "token" to data.text("token"))
+            expected = VictoryFixtures.apply(expected, "assembleSpaceship", dto("unitId" to id))
+            assertGameplayEquals("真实组装 $name", expected, session.game!!)
+            if (index < parts.size - 1) assertNull("部件未齐不得结算", session.game!!.victoryData)
+        }
+        assertEquals("Scientific", session.game!!.victoryData!!.victoryType)
+        val victory = PlayerSnapshot(session.game!!).pending().first { it.text("kind") == "victory" }
+        assertEquals("won", victory.text("target"))
+        val data = run(session, "victoryOptions")["data"]!!.jsonObject
+        assertEquals("won", data.text("outcome"))
+        run(session, "victoryContinue", "resultToken" to data["continue"]!!.jsonObject.text("token"))
+        expected.oneMoreTurnMode = true
+        assertGameplayEquals("科学胜利后继续", expected, session.game!!)
+    }
+
+    @Test fun exportEndgameSmokeScenarios() { VictoryFixtures.emitEndgames() }
 }

@@ -9,6 +9,7 @@ import com.unciv.logic.battle.TargetHelper
 import com.unciv.logic.civilization.AlertType
 import com.unciv.logic.files.UncivFiles
 import com.unciv.logic.map.HexCoord
+import com.unciv.models.UnitActionType
 import com.unciv.models.metadata.BaseRuleset
 import kotlinx.serialization.json.*
 import java.io.File
@@ -17,6 +18,9 @@ import java.io.File
 internal object VictoryFixtures {
     val root get() = BattleFixtures.root
     fun copy(game: GameInfo) = DiplomaticVoteFixtures.copy(game)
+    /** 期望端按 id 取己方单位；找不到时直接报出两侧 id 便于定位夹具与快照错位。 */
+    private fun owned(game: GameInfo, id: Int) = game.currentPlayerCiv.units.getCivUnits().firstOrNull { it.id == id }
+        ?: error("期望端找不到单位 $id，现有 " + game.currentPlayerCiv.units.getCivUnits().joinToString { "${it.id}:${it.name}" })
     fun game(rules: BaseRuleset = BaseRuleset.Civ_V_GnK): GameInfo = DiplomaticVoteFixtures.game(rules).also {
         it.gameParameters.victoryTypes = ArrayList(it.ruleset.victories.keys.filter { name -> name != "Neutral" })
         it.gameParameters.maxTurns = 500
@@ -111,11 +115,34 @@ internal object VictoryFixtures {
         game.setTransients()
         game.civilizations.forEach { it.popupAlerts.clear(); it.notifications.clear() }
     } }
+    /** 科学“动作前”边界：阿波罗计划已建成、六件部件单位停在首都相邻地块；组装与胜利都由真实命令触发。 */
+    fun science(): GameInfo = UnitAbilityFixtures.game().also { game -> native(game) {
+        game.gameParameters.victoryTypes = arrayListOf("Scientific")
+        UnitAbilityFixtures.capital(game).cityConstructions.addBuilding("Apollo Program")
+        val parts = game.ruleset.victories["Scientific"]!!.requiredSpaceshipParts
+        val ring = listOf(HexCoord(1, 0), HexCoord(-1, 0), HexCoord(0, 1), HexCoord(0, -1), HexCoord(1, -1), HexCoord(-1, 1))
+        check(parts.size == ring.size) { "科学胜利部件与预置地块数量应一致：$parts" }
+        for ((index, part) in parts.withIndex()) {
+            val coord = ring[index]
+            val unit = BattleFixtures.add(game, part, coord.x, coord.y)
+            check(unit.currentTile.position == coord) { "部件 $part 应停在 $coord" }
+        }
+        game.setTransients()
+        game.civilizations.forEach { it.popupAlerts.clear(); it.notifications.clear() }
+    } }
     fun apply(original: GameInfo, action: String, params: JsonObject = dto()): GameInfo = native(original) {
         var game = original
         when (action) {
             "reload" -> game = copy(game)
             "nextTurn" -> game = DiplomaticVoteFixtures.nextTurn(game)
+            // 与网关 move 同一原生路径：先清除本回合动作再走原生移动。
+            "move" -> {
+                val unit = owned(game, params.integer("unitId"))
+                unit.action = null
+                unit.movement.moveToTile(game.tileMap[HexCoord(params.integer("x"), params.integer("y"))])
+            }
+            // 与能力面板同一原生闭包：组装计数、销毁单位与胜利记录都由原生完成。
+            "assembleSpaceship" -> UnitAbilityFixtures.nativeAbility(game, owned(game, params.integer("unitId")), UnitActionType.AddInCapital)
             // 与政策面板选择同一原生入口；分支完成时的 Complete 政策由 adopt 内部递归采纳。
             "policy" -> game.currentPlayerCiv.policies.adopt(game.ruleset.policies[params.text("name")]!!)
             "victoryContinue" -> game.oneMoreTurnMode = true
@@ -141,40 +168,77 @@ internal object VictoryFixtures {
     }
     val runId = "victory-${System.currentTimeMillis()}"
     val runDir get() = File(root, "godot/.local/tests/$runId").apply { mkdirs() }
+
+    /** 一次场景：导出可加载 fixture，并逐步记录原生期望的完整持久化状态供真窗口逐帧差分。 */
+    private fun scenario(name: String, initial: GameInfo, actions: List<Pair<String, JsonObject>>): JsonObject {
+        val file = export(initial, name)
+        var expected = copy(initial)
+        screenUpdate(expected)
+        val states = linkedMapOf<String, JsonObject>()
+        fun record(key: String) {
+            val raw = File(runDir, "$name-$key-raw.json")
+            val normalized = File(runDir, "$name-$key-normalized.json")
+            raw.writeText(UncivFiles.gameInfoToString(expected, false))
+            normalized.writeText(GameplayAssertions.gameplay(expected).toString())
+            states[key] = dto("raw" to raw.absolutePath, "normalized" to normalized.absolutePath)
+        }
+        record("initial")
+        val steps = actions.mapIndexed { index, (action, params) ->
+            expected = apply(expected, action, params)
+            val key = "${index + 1}-$action"
+            record(key)
+            dto("action" to action, "params" to params, "step" to key)
+        }
+        return dto("name" to name, "fixture" to file.absolutePath, "steps" to steps, "initial" to "initial",
+            "states" to dto(*states.map { it.key to it.value }.toTypedArray()))
+    }
+
+    private fun write(name: String, scenarios: List<JsonObject>) = File(root, "godot/.local/tests/$name.json").writeText(
+        dto("scenarios" to scenarios, "setFields" to GameplayAssertions.setFields.toList(),
+            "mapOfSetFields" to GameplayAssertions.mapOfSetFields.toList()).toString())
+
     fun emit() {
         val scenarios = arrayListOf<JsonObject>()
-        fun add(name: String, initial: GameInfo, actions: List<Pair<String, JsonObject>>) {
-            val file = export(initial, name)
-            var expected = copy(initial)
-            screenUpdate(expected)
-            val states = linkedMapOf<String, JsonObject>()
-            fun record(key: String) {
-                val raw = File(runDir, "$name-$key-raw.json")
-                val normalized = File(runDir, "$name-$key-normalized.json")
-                raw.writeText(UncivFiles.gameInfoToString(expected, false))
-                normalized.writeText(GameplayAssertions.gameplay(expected).toString())
-                states[key] = dto("raw" to raw.absolutePath, "normalized" to normalized.absolutePath)
-            }
-            record("initial")
-            val steps = actions.mapIndexed { index, (action, params) ->
-                expected = apply(expected, action, params)
-                val key = "${index + 1}-$action"
-                record(key)
-                dto("action" to action, "params" to params, "step" to key)
-            }
-            scenarios.add(dto("name" to name, "fixture" to file.absolutePath, "steps" to steps, "initial" to "initial",
-                "states" to dto(*states.map { it.key to it.value }.toTypedArray())))
-        }
-        add("progress", game(), emptyList())
+        scenarios.add(scenario("progress", game(), emptyList()))
         for ((name, initial) in listOf("won" to recorded(true), "lost" to recorded(false), "defeated" to defeated())) {
-            add(name, initial, listOf("victoryContinue" to dto(), "reload" to dto(), "nextTurn" to dto(), "reload" to dto()))
+            scenarios.add(scenario(name, initial, listOf("victoryContinue" to dto(), "reload" to dto(), "nextTurn" to dto(), "reload" to dto())))
         }
         val conquest = conquest()
-        add("conquest", conquest, listOf(
+        scenarios.add(scenario("conquest", conquest, listOf(
             "attack" to dto("unitId" to BattleFixtures.unit(conquest, "Warrior").id, "x" to -6, "y" to 0),
             "cityDecision" to dto("cityId" to BattleFixtures.enemy(conquest).cities.first().id, "choice" to "puppet"),
-            "victoryContinue" to dto(), "reload" to dto()))
-        File(root, "godot/.local/tests/victory-expected.json").writeText(dto("scenarios" to scenarios,
-            "setFields" to GameplayAssertions.setFields.toList(), "mapOfSetFields" to GameplayAssertions.mapOfSetFields.toList()).toString())
+            "victoryContinue" to dto(), "reload" to dto())))
+        write("victory-expected", scenarios)
+    }
+
+    /**
+     * 第 8 批终局专项：五类胜利与玩家失败/灭亡的最后一步都不写结果，只由真实网关动作触发。
+     * 文化＝真实政策＋真实生产＋原生回合；时间＝原生回合跨过上限（胜/负两态）；灭亡＝原生回合丢城；
+     * 科学＝六次真实移动＋六次真实组装。与 [emit] 分开落盘，既有胜利场景不受影响。
+     */
+    fun emitEndgames() {
+        val scenarios = arrayListOf<JsonObject>()
+        val cultural = cultural()
+        scenarios.add(scenario("cultural", cultural, listOf(
+            "policy" to dto("name" to traditionPolicy(cultural)),
+            "production" to dto("cityId" to cultural.currentPlayerCiv.cities.first().id, "name" to "Utopia Project"),
+            "nextTurn" to dto(), "victoryContinue" to dto(), "reload" to dto())))
+        for (leads in listOf(true, false))
+            scenarios.add(scenario(if (leads) "time-win" else "time-lose", time(leads),
+                listOf("nextTurn" to dto(), "victoryContinue" to dto(), "reload" to dto())))
+        scenarios.add(scenario("lastStand", lastStand(),
+            listOf("nextTurn" to dto(), "victoryContinue" to dto(), "reload" to dto())))
+        val science = science()
+        // 内存夹具里的平民单位会因落地路径重复计数，动作脚本改从与落盘同构的副本取 id。
+        val scripted = copy(science)
+        val actions = arrayListOf<Pair<String, JsonObject>>()
+        for (unit in scripted.currentPlayerCiv.units.getCivUnits().filter { it.name.startsWith("SS ") }.toList()) {
+            actions.add("move" to dto("unitId" to unit.id, "x" to 0, "y" to 0))
+            actions.add("assembleSpaceship" to dto("unitId" to unit.id))
+        }
+        actions.add("victoryContinue" to dto())
+        actions.add("reload" to dto())
+        scenarios.add(scenario("science", science, actions))
+        write("endgame-expected", scenarios)
     }
 }

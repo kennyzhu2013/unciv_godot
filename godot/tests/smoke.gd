@@ -80,6 +80,10 @@ var paradrop_evidence: Array[Dictionary] = []
 # 第 7 批 7C 核武前端 smoke（爆炸圈／风险预览／二次确认／布署／三尺寸）
 var nuke_checks
 var nuke_evidence: Array[Dictionary] = []
+# 第 8 批整局验收前端 smoke（终局专项五类 + 三长局继续与耗时／内存取证）
+var endgame_checks
+var endgame_evidence: Array[Dictionary] = []
+var whole_game_evidence: Array[Dictionary] = []
 
 # 真实 HTTP 后丢弃响应／延迟只读响应，属于客户端边界故障注入。
 class NavalFaultClient extends "res://scripts/kernel_client.gd":
@@ -355,7 +359,8 @@ func run(frontend) -> void:
 		["asset-decisions", verify_asset_flow],
 		["city-state", verify_city_state_flow],
 		["event", verify_event_flow],
-		["unit-city-actions", verify_unitcity_flow]
+		["unit-city-actions", verify_unitcity_flow],
+		["endgame", verify_endgame_flow]
 	]:
 		print("Smoke 开始：", scenario[0])
 		if not await scenario[1].call():
@@ -371,10 +376,10 @@ func run(frontend) -> void:
 		"ok": true, "runId": run_id,
 		"startedAt": started_at, "finishedAt": Time.get_datetime_string_from_system(true),
 		"steps": steps, "checklist": checklist,
-		"scenarios": ["new-game", "save-browser", "autosave-resume", "empire-overview", "notifications", "research-info", "policy-info", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat", "unit-orders", "unit-abilities", "air", "paradrop", "nuke", "presentation"],
+		"scenarios": ["new-game", "save-browser", "autosave-resume", "empire-overview", "notifications", "research-info", "policy-info", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat", "unit-orders", "unit-abilities", "air", "paradrop", "nuke", "presentation", "endgame"],
 		"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence,
+		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence, "endgameEvidence": endgame_evidence, "wholeGameEvidence": whole_game_evidence,
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -4344,7 +4349,7 @@ func _fail(message: String) -> void:
 			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
 			"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence,
+			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence, "endgameEvidence": endgame_evidence, "wholeGameEvidence": whole_game_evidence,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
@@ -4361,6 +4366,14 @@ func archive_smoke_result() -> void:
 	if archive:
 		archive.store_string(FileAccess.get_file_as_string("res://.local/smoke-result.json"))
 		archive.close()
+
+# 第 8 批整局验收：终局专项与长局继续都在独立脚本内按真实控件点击完成，
+# 期望端只来自内核导出的 endgame-expected.json 与 whole-game 报告。
+func verify_endgame_flow() -> bool:
+	endgame_checks = load("res://tests/endgame_smoke.gd").new()
+	endgame_evidence = endgame_checks.evidence
+	whole_game_evidence = endgame_checks.whole_game_evidence
+	return await endgame_checks.run(self)
 
 # —— 发展流程（dev6，plan line 55-68）：全部经视口输入分发鼠标事件驱动真实控件 ——
 # 不使用 pressed.emit()／直接调 _select_*／map.handle_input()；OptionButton 弹层是独立 Window
