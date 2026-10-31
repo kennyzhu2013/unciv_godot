@@ -92,9 +92,15 @@ try {
     # 仅冒烟运行开启内核 debugInjectEvent 门控（真实游玩/交互窗口不设此变量，该命令等同不存在）。
     $env:UNCIV_SMOKE = if ($Smoke) { '1' } else { '' }
     $env:UNCIV_SMOKE_RUN_ID = if ($Smoke) { $context.runId } else { '' }
+    $kernelArgs = @('-Xmx2g')
+    # JDK 26+ 要求显式授权 GDX Json 反射恢复 final 字段；不屏蔽或重定向任何诊断。
+    if ((Get-JavaMajorVersion "$JavaHome\bin\java.exe") -ge 26) {
+        $kernelArgs += '--enable-final-field-mutation=ALL-UNNAMED'
+    }
+    $kernelArgs += @('-cp', "`"$libs`"", 'com.unciv.godot.GatewayMainKt', '--root', "`"$root`"", '--port', "$Port")
     $kernel = Start-Process -FilePath "$JavaHome\bin\java.exe" -PassThru -WindowStyle Hidden `
         -WorkingDirectory "$root\android\assets" `
-        -ArgumentList @('-Xmx2g', '-cp', "`"$libs`"", 'com.unciv.godot.GatewayMainKt', '--root', "`"$root`"", '--port', "$Port") `
+        -ArgumentList $kernelArgs `
         -RedirectStandardOutput "$local\kernel.log" -RedirectStandardError "$local\kernel-error.log"
     $ready = $false
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
@@ -109,7 +115,8 @@ try {
     if (-not $ready) { throw 'Kernel did not become ready; check .local/kernel-error.log.' }
     $godotArgs = @('--path', "`"$PSScriptRoot`"")
     if ($Headless) { $godotArgs += '--headless' }
-    if ($Smoke) { $godotArgs += @('--', '--smoke') }
+    # Smoke 保留退出资源诊断，便于定位 ObjectDB 泄漏；不影响双端 stderr 零字节门禁。
+    if ($Smoke) { $godotArgs += @('--verbose', '--', '--smoke') }
     $frontendStarted = Get-Date
     $frontend = Start-Process -FilePath $Godot -ArgumentList $godotArgs -PassThru `
         -RedirectStandardOutput "$local\godot.log" -RedirectStandardError "$local\godot-error.log"
@@ -137,6 +144,12 @@ try {
         if (-not $Headless -and @($report.screenshots).Count -eq 0) { throw 'Graphical smoke did not capture screenshots.' }
         if (Select-String -Path "$local\godot.log", "$local\godot-error.log" -Pattern '^(SCRIPT ERROR:|ERROR:)') {
             throw 'Godot reported runtime errors despite completing smoke.'
+        }
+        $context.errorLogBytes = [ordered]@{}
+        foreach ($name in @('godot-error.log', 'kernel-error.log')) {
+            $length = (Get-Item "$local\$name").Length
+            $context.errorLogBytes[$name] = $length
+            if ($length -ne 0) { throw "Smoke error log must be empty: $name ($length bytes)." }
         }
         Write-Host "Smoke passed ($($report.runId)). Results: $local\smoke-latest-$($context.mode).json"
     }

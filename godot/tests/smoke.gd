@@ -4370,8 +4370,11 @@ func archive_smoke_result() -> void:
 # 第 8 批整局验收：终局专项与长局继续都在独立脚本内按真实控件点击完成，
 # 期望端只来自内核导出的 endgame-expected.json 与 whole-game 报告。
 func verify_endgame_flow() -> bool:
-	endgame_checks = load("res://tests/endgame_smoke.gd").new()
-	endgame_evidence = endgame_checks.evidence
+	var script = load("res://tests/endgame_smoke.gd")
+	if not check(script != null and script.can_instantiate(), "终局脚本可实例化"):
+		return false
+	endgame_checks = script.new()
+	endgame_evidence = endgame_checks.endgame_evidence
 	whole_game_evidence = endgame_checks.whole_game_evidence
 	return await endgame_checks.run(self)
 

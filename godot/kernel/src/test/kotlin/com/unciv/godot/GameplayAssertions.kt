@@ -12,6 +12,9 @@ internal object GameplayAssertions {
      * 比较原存档持久化状态（含 AI、科技、政策、外交、建筑、地块），仅排除实际计时与写盘时才重算的校验和。
      * 以下差异在原引擎内本身就不确定（两份独立加载的原生内核各推进一回合也不同），只对它们做归一化：
      * - 文明 notifications：来源 viewableTiles 是 HashSet<Tile>，Tile 未重写 hashCode，"敌军出现"通知顺序不稳定，按内容排序；
+     *   每条通知的 actions 列表（多单位分支的 LocationAction）与 notificationsLog 内的同类数组同源不稳定，
+     *   在 [normalizeSets] 中一并按内容排序；“发现自然奇观”通知的坐标由 HashSet<Tile> 首个命中地块决定，
+     *   多地块奇观坐标不确定，按奇观名归一（见 [normalizeNotification]）；
      * - 原引擎以 HashSet 存储、序列化为数组的集合字段（见 [setFields]/[mapOfSetFields]，均已在 core 中核对为 HashSet）：
      *   独立加载及回合 clone() 重建的集合可能有不同迭代顺序，按内容排序；
      * - 伟人姓名：UniqueTriggerActivation 用未播种的 shuffled() 抽名，出生的单位、id、归属都一致，仅名字随机。
@@ -26,7 +29,9 @@ internal object GameplayAssertions {
             text = text.replace("\"$name\"", "\"<named unit $index>\"").replace("[$name]", "[<named unit $index>]")
         }
         val state = Json.parseToJsonElement(text).jsonObject
-        val civilizations = state["civilizations"]!!.jsonArray.map { JsonObject(it.jsonObject - "totalTurnTimeSeconds") }
+        val civilizations = state["civilizations"]!!.jsonArray.map { civ ->
+            JsonObject(civ.jsonObject - "totalTurnTimeSeconds")
+        }
         return normalizeSets(JsonObject(state - "currentTurnStartTime" - "checksum" + ("civilizations" to JsonArray(civilizations))), null).jsonObject
     }
 
@@ -42,12 +47,53 @@ internal object GameplayAssertions {
     private fun normalizeSets(element: JsonElement, key: String?): JsonElement = when {
         element is JsonObject && key in mapOfSetFields -> JsonObject(element.mapValues { sortedArray(it.value) })
         element is JsonObject -> JsonObject(element.mapValues { normalizeSets(it.value, it.key) })
-        element is JsonArray -> JsonArray(element.map { normalizeSets(it, null) }).let { if (key in setFields) sortedArray(it) else it }
+        element is JsonArray -> JsonArray(element.map { normalizeSets(it, null) }).let {
+            when (key) {
+                // notifications 与其每条 actions 都由未排序的 HashSet<Tile> 迭代产生（viewableTiles →
+                // addEnemyUnitNotification 的 LocationAction 列表），civilizations 与 notificationsLog
+                // 两处同源不稳定，条目与 actions 一并按内容排序；其余 setFields 只排序自身。
+                "notifications" -> sortedArray(JsonArray(it.map { entry -> normalizeNotification(entry) }))
+                in setFields -> sortedArray(it)
+                else -> it
+            }
+        }
         else -> element
     }
 
     private fun sortedArray(element: JsonElement): JsonElement =
         if (element is JsonArray) JsonArray(element.sortedBy { it.toString() }) else element
+
+    /**
+     * 单条通知归一化：actions 按内容排序（多单位分支由 HashSet<Tile> 迭代生成）；
+     * 两类通知的地图跳转坐标取自 viewableTiles(HashSet<Tile>) 迭代命中的地块，在独立加载的进程内不确定，
+     * 而相遇/发现的事实、对方对象与触发效果都与所选地块无关，故按文本中的确定名称归一：
+     * - "We have discovered [X]!"：discoverNaturalWonders 从 HashSet<Tile> 取首个命中的奇观地块，
+     *   多地块奇观（如大堡礁）坐标不确定；
+     * - "We have encountered [X]!"：CivInfoTransientCache.updateViewableTiles 以 viewedCivs[civ]=tile
+     *   记录“迭代 viewableTiles 时最后一次看到该文明的地块”，其 position 作为通知坐标，Tile 身份哈希→
+     *   两份独立加载内核迭代序不同→坐标不同（本例 (-6,0) vs (-4,1)），相遇事实与外交效果一致。
+     */
+    private fun normalizeNotification(entry: JsonElement): JsonElement {
+        if (entry !is JsonObject) return entry
+        val fields: MutableMap<String, JsonElement> = entry.toMutableMap()
+        val text = (fields["text"] as? JsonPrimitive)?.contentOrNull
+        val locationKey = when {
+            text != null && text.startsWith("We have discovered [") && text.endsWith("]!") -> "naturalWonder"
+            text != null && text.startsWith("We have encountered [") && text.endsWith("]!") -> "encounteredCiv"
+            else -> null
+        }
+        val actions = (fields["actions"] as? JsonArray)?.map { action ->
+            val location = (action.jsonObject["LocationAction"] as? JsonObject) ?: return@map action
+            if (locationKey == null) action
+            else JsonObject(action.jsonObject.toMutableMap().apply {
+                set("LocationAction", JsonObject(location.toMutableMap().apply {
+                    set("location", JsonObject(mapOf(locationKey to JsonPrimitive(text))))
+                }))
+            })
+        }
+        if (actions != null) fields["actions"] = sortedArray(JsonArray(actions))
+        return JsonObject(fields)
+    }
 
     fun assertGameplayEquals(step: String, expected: GameInfo, actual: GameInfo) {
         val expectedJson = gameplay(expected)

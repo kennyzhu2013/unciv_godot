@@ -615,6 +615,46 @@ class GameSessionTest {
         assertTrue("可见敌方地块不得泄漏剩余工期", enemy["turnsToImprovement"] is JsonNull)
     }
 
+    @Test fun contactDiscoveredDuringTurnCloneMatchesNativeAndRemainsActionable() {
+        val session = loadedSession(BattleFixtures.file("turn-clone-contact") { game ->
+            // 单个可见外军地块消除首次相遇通知坐标的 HashSet 遍历歧义。
+            BattleFixtures.enemy(game).cities.first { it.location == HexCoord(1, 0) }.destroyCity(true)
+            game.currentPlayerCiv.units.getCivUnits().filter { it.name == "Archer" }.toList().forEach { it.destroy() }
+        })
+        val game = session.game!!
+        val player = game.currentPlayerCiv
+        val other = BattleFixtures.enemy(game)
+        // 最小化复现长局实测边界：当前快照无待决，下一次原生视野重建才发现接触。
+        player.diplomacy.remove(other.civID)
+        other.diplomacy.remove(player.civID)
+        resolveSupportedDecisions(session)
+        assertTrue(PlayerSnapshot(game).pending().isEmpty())
+        assertFalse(player.knows(other))
+        val before = gameplay(game)
+        val native = game.clone()
+        withNativeGame(native) {
+            native.setTransients()
+            assertTrue("克隆重建视野确实产生首次接触", native.currentPlayerCiv.popupAlerts.any { it.type == AlertType.FirstContact })
+            native.nextTurn()
+            VictoryFixtures.screenUpdate(native)
+        }
+        val revision = session.revision
+        val command = request(session, "nextTurn")
+        val result = session.handle(command)
+        assertTrue(result.toString(), result.boolean("ok"))
+        assertEquals(revision + 1, session.revision)
+        assertEquals(game.turns + 1, session.game!!.turns)
+        assertEquals("旧对局未被克隆副作用改写", before, gameplay(game))
+        assertGameplayEquals("克隆内新接触随原生回合提交而不丢弃", native, session.game!!)
+        assertEquals(result, session.handle(command))
+        assertEquals(revision + 1, session.revision)
+        val blocked = session.handle(request(session, "nextTurn"))
+        assertEquals("新提示必须在后续回合前处置", "PENDING_DECISION", blocked["error"]!!.jsonObject.text("code"))
+        resolveSupportedDecisions(session, Native(native))
+        val saved = run(session, "save", "name" to "turn-clone-contact-resume").text("savedPath")
+        assertGameplayEquals("新接触处置后跨会话续局", session.game!!, loadedSession(File(saved)).game!!)
+    }
+
     @Test fun turnIsBlockedUntilDecisionsAreResolved() {
         val session = loadedSession()
         val result = session.handle(request(session, "nextTurn"))

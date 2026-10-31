@@ -6,8 +6,8 @@ extends RefCounted
 #    条件（政策分支进度、差一点生产力的乌托邦工程、回合上限、城市血量、阿波罗计划与停在首都相邻地块的
 #    六件部件），最终结算一律由真实窗口动作触发：政策面板提交、城市队列入队、原生回合、能力面板组装、
 #    胜利页继续。每一步都保存完整存档并与独立原生期望逐字段比较。
-# 2) 长局继续：加载内核 WholeGameTest 两条固定种子长局与 Medium 基线产生的中点存档，在真实窗口逐回合
-#    点击推进，记录加载／回合耗时、静态内存与地图规模，并做一次真实保存退出后继续。长局全程元数据
+# 2) 长局继续：加载内核 WholeGameTest 三条固定种子短程长局与 Medium 基线产生的中点存档，在真实窗口逐回合
+#    点击推进，记录加载／回合耗时、静态内存与地图规模，并保存后在同会话重载（尚未验证进程退出重启）。长局元数据
 #    （回合数、命令数、总耗时、堆用）直接读内核报告，不在此重算。
 
 var smoke
@@ -104,6 +104,41 @@ func click_dialog(dialog: ConfirmationDialog, confirm: bool, twice := false) -> 
 	await smoke.settle()
 	return true
 
+# 最后动作已真实结算后再取证，不加载预写胜利记录的布局夹具。
+func verify_result_sizes(name: String) -> bool:
+	var panel = app.victory_panel_inst
+	if not await smoke.click_tab(app.tabs, app.TAB_MATTERS):
+		return false
+	if not panel.panel.is_visible_in_tree():
+		if not await smoke.click_control(panel.open_button):
+			return false
+	var original: Vector2i = smoke.get_window().size
+	var sizes := [original] if DisplayServer.get_name() == "headless" else [Vector2i(1024, 720), Vector2i(1600, 900)]
+	for size in sizes:
+		smoke.get_window().size = size
+		await smoke.settle()
+		smoke.scroll_into_view(panel.result_text)
+		await smoke.settle()
+		var label := "%s-%dx%d" % [name, size.x, size.y]
+		if not smoke.check(panel.panel.is_visible_in_tree() and panel.result_text.size.x <= app.tabs.size.x
+				and panel.continue_button.get_meta("allowed", false), "真实终局结算可读且可继续：" + label):
+			return false
+		await smoke.screenshot("smoke-endgame-" + label + "-result.png")
+		var revision: int = app.client.revision
+		if not await smoke.click_control(panel.continue_button):
+			return false
+		await smoke.screenshot("smoke-endgame-" + label + "-confirm.png")
+		if not await click_dialog(panel.confirmation, false):
+			return false
+		if not smoke.check(app.client.revision == revision and not app.client.snapshot.victory.oneMoreTurnMode,
+				"取消继续不写状态：" + label):
+			return false
+		if DisplayServer.get_name() != "headless":
+			smoke.window_sizes_checked.append("endgame-" + label)
+	smoke.get_window().size = original
+	await smoke.settle()
+	return true
+
 func continue_victory() -> bool:
 	var panel = app.victory_panel_inst
 	if not panel.panel.is_visible_in_tree():
@@ -140,9 +175,16 @@ func open_city(city_id: String) -> Dictionary:
 			found = entry
 	if not smoke.check(not found.is_empty(), "终局场景己方城市存在：" + city_id):
 		return {}
-	app.map.center_on(Vector2i(int(found.x), int(found.y)))
-	await smoke.settle()
-	if not await smoke.click_map(Vector2i(int(found.x), int(found.y))):
+	# 城中心可能驻有己方单位，地图点击按现有交互优先选单位；城市选择器始终能明确选城。
+	if not await smoke.click_tab(app.tabs, app.TAB_CITY):
+		return {}
+	var index := -1
+	for i in range(app.city_picker.item_count):
+		if str(app.city_picker.get_item_metadata(i)) == city_id:
+			index = i
+	if not smoke.check(index >= 0, "城市选择器含目标城市：" + city_id):
+		return {}
+	if not await smoke.click_option(app.city_picker, index):
 		return {}
 	if not smoke.check(app.active_context == "city" and app.city_id == city_id, "真实点选己方城市：" + city_id):
 		return {}
@@ -156,7 +198,7 @@ func enqueue(city_id: String, name: String) -> bool:
 		return false
 	if not await smoke.click_tab(app.city_tabs, app.CTAB_QUEUE):
 		return false
-	var index := smoke.production_option_index(name)
+	var index: int = smoke.production_option_index(name)
 	if not smoke.check(index >= 0, "候选下拉可按名称定位项目：" + name):
 		return false
 	await smoke.select_option(app.production_picker, index)
@@ -224,6 +266,8 @@ func verify_scenario(scenario: Dictionary) -> bool:
 				if not smoke.check(app.client.snapshot.turn == turn + 1, "终局推进原生回合：" + scenario.name):
 					return false
 			"victoryContinue":
+				if not await verify_result_sizes(str(scenario.name)):
+					return false
 				if not await continue_victory():
 					return false
 			"reload":
@@ -275,12 +319,19 @@ func enqueue_first(city_id: String) -> bool:
 		return false
 	for index in range(app.production_picker.item_count):
 		var meta = app.production_picker.get_item_metadata(index)
-		if meta is Dictionary and not bool(meta.get("enabled", true)):
+		# 分类分隔符没有项目元数据；可用性由控件保存，不在元数据中。
+		if not meta is Dictionary or app.production_picker.is_item_disabled(index):
 			continue
-		await smoke.select_option(app.production_picker, index)
+		var name := str(meta.get("name", ""))
+		if name.is_empty():
+			continue
+		if not await smoke.click_option(app.production_picker, index):
+			return false
+		var revision: int = app.client.revision
 		if not await smoke.click_control(smoke.find_by_name(app.city_panel, "EnqueueProduction")):
 			return false
-		return smoke.check(not app.city_data.get("queue", []).is_empty(), "长局待决城市已选择生产")
+		return smoke.check(app.client.revision == revision + 1 and app.city_data.get("queue", []).has(name),
+			"长局待决城市真实入队一次：" + name)
 	return smoke.check(false, "长局待决城市没有可生产项目")
 
 # 科技／政策都走帝国信息面板的真实页签、搜索、列表选择与提交。
@@ -375,10 +426,15 @@ func run(harness) -> bool:
 		return false
 	if not smoke.check(smoke.information_checks != null, "帝国信息真实点击助手已就绪"):
 		return false
+	var expected_checks := 0
 	for scenario in expected.scenarios:
+		expected_checks += 1 + scenario.steps.size()
 		if not await verify_scenario(scenario):
 			return false
+	if not smoke.check(endgame_evidence.size() == expected_checks and endgame_evidence.all(func(entry): return entry.matched),
+			"全部终局初态与动作后差分已归档，数量与原生脚本一致"):
+		return false
 	if not await verify_whole_game():
 		return false
-	smoke.steps.append("整局验收：文化／时间胜负／灭亡／科学由真实面板与回合结算；三条固定种子长局中点存档在真实窗口逐回合点击继续、保存退出重载一致，并记录 Tiny／Small／Medium 耗时与内存")
+	smoke.steps.append("8A 终局专项：文化／时间胜负／灭亡／科学由真实面板与回合结算；三条固定种子路线中点续玩并同会话保存重载，记录 Tiny／Small／Medium 早期耗时与内存；尚非从新游戏到结算的完整长局或进程重启证据")
 	return true

@@ -268,8 +268,8 @@ internal class GameSession(root: File, private val saveDirectory: File =
                 thunk
             },
             executeFn = { ctx, _ ->
-                val pending = ctx.snapshot.pending()
-                ensure(pending.isEmpty(), "PENDING_DECISION", pending.joinToString("；") { entry -> entry.text("message") })
+                // 门禁已在 prepare 检查当前局。与 WorldScreen 一致，clone/setTransients 后直接推进：
+                // 重建视野新产生的接触等弹窗随候选提交，不能拒绝并丢弃它们而让当前局永远无从处置。
                 ctx.candidate.nextTurn()
                 // 复刻 AlertPopup：无效事件（shouldOpen==false）在原生 update 中被直接移除，这里在回合推进后清理队首无效事件。
                 EventCommands(ctx.candidate).drainInvalidEventAlerts()

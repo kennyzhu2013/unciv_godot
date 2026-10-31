@@ -5,6 +5,11 @@ import org.gradle.api.tasks.testing.logging.TestLogEvent
 // Java 21+ deprecates dynamic agent loading: https://openjdk.org/jeps/451
 val mockitoAgent = configurations.create("mockitoAgent")
 
+// 与项目 Java 21 基线对齐，避免新 JDK 上 Java/Kotlin 默认目标版本不同而阻断回归。
+kotlin.compilerOptions.jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21
+java.sourceCompatibility = JavaVersion.VERSION_21
+java.targetCompatibility = JavaVersion.VERSION_21
+
 // Support Gradle 9 caching seeing the mockito agent
 private class MockitoAgentArgumentProvider(
     @get:Classpath val agentJar: FileCollection

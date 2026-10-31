@@ -63,5 +63,7 @@ tasks.test {
         .map { rootProject.file("godot/.local/tests/unitcity-$it.json") })
     outputs.files(listOf("information", "information-free", "information-expected")
         .map { rootProject.file("godot/.local/tests/$it.json") })
+    outputs.file(rootProject.file("godot/.local/tests/endgame-expected.json"))
+    outputs.dir(rootProject.file("godot/.local/tests/whole-game"))
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = true }
 }

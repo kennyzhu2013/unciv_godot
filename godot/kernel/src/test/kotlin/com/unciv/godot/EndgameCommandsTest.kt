@@ -36,6 +36,18 @@ class EndgameCommandsTest {
 
     private fun expected(fixture: GameInfo) = VictoryFixtures.copy(fixture).also { VictoryFixtures.screenUpdate(it) }
 
+    /** 实际端必须读取自己刚保存的文件；期望端独立序列化，不能拿期望文件冒充存档回归。 */
+    private fun reloadSaved(session: GameSession, native: GameInfo, label: String): GameInfo {
+        val saved = run(session, "save", "name" to "endgame-$label").text("savedPath")
+        val expected = expected(native)
+        val resumed = GameSession(root)
+        run(resumed, "load", "path" to saved)
+        assertGameplayEquals("$label 跨会话继续", expected, resumed.game!!)
+        run(session, "load", "path" to saved)
+        assertGameplayEquals("$label 原会话重载", expected, session.game!!)
+        return expected
+    }
+
     // ---- 文化：真实采纳第五分支末项政策 + 真实选择并完成乌托邦工程 ----
 
     @Test fun culturalVictoryCompletesThroughRealPolicyAndProduction() {
@@ -62,6 +74,7 @@ class EndgameCommandsTest {
             dto("cityId" to cityId, "name" to "Utopia Project"))
         assertGameplayEquals("真实选择乌托邦工程", expected, session.game!!)
         assertNull("队列还没走完不得结算", session.game!!.victoryData)
+        expected = reloadSaved(session, expected, "cultural-before")
 
         run(session, "nextTurn")
         expected = DiplomaticVoteFixtures.apply(expected, "nextTurn")
@@ -76,9 +89,7 @@ class EndgameCommandsTest {
         run(session, "victoryContinue", "resultToken" to data["continue"]!!.jsonObject.text("token"))
         expected.oneMoreTurnMode = true
         assertGameplayEquals("文化胜利后继续", expected, session.game!!)
-        run(session, "save", "name" to "endgame-cultural")
-        run(session, "load", "path" to export(expected, "cultural-reload").absolutePath)
-        assertGameplayEquals("文化胜利继续后重载", VictoryFixtures.copy(expected), session.game!!)
+        reloadSaved(session, expected, "cultural-continued")
     }
 
     // ---- 时间：真实 nextTurn 跨越回合上限，胜者由原生分数决定 ----
@@ -92,6 +103,7 @@ class EndgameCommandsTest {
             var expected = expected(fixture)
             assertEquals(1, session.game!!.gameParameters.maxTurns)
             assertNull("尚未跨越回合上限时不得结算", session.game!!.victoryData)
+            expected = reloadSaved(session, expected, "time-$playerLeads-before")
 
             run(session, "nextTurn")
             expected = DiplomaticVoteFixtures.apply(expected, "nextTurn")
@@ -104,6 +116,7 @@ class EndgameCommandsTest {
             run(session, "victoryContinue", "resultToken" to data["continue"]!!.jsonObject.text("token"))
             expected.oneMoreTurnMode = true
             assertGameplayEquals("时间胜利后继续 playerLeads=$playerLeads", expected, session.game!!)
+            reloadSaved(session, expected, "time-$playerLeads-continued")
         }
     }
 
@@ -116,6 +129,7 @@ class EndgameCommandsTest {
         val session = load(fixture, "defeat")
         var expected = expected(fixture)
         assertFalse("开局时玩家尚未灭亡", session.game!!.currentPlayerCiv.isDefeated())
+        expected = reloadSaved(session, expected, "defeat-before")
 
         run(session, "nextTurn")
         expected = DiplomaticVoteFixtures.apply(expected, "nextTurn")
@@ -136,6 +150,7 @@ class EndgameCommandsTest {
         run(session, "victoryContinue", "resultToken" to data["continue"]!!.jsonObject.text("token"))
         expected.oneMoreTurnMode = true
         assertGameplayEquals("灭亡后继续", expected, session.game!!)
+        reloadSaved(session, expected, "defeat-continued")
         assertFalse(run(session, "victoryOptions")["data"]!!.jsonObject.boolean("requiresAcknowledgement"))
     }
 
@@ -150,6 +165,7 @@ class EndgameCommandsTest {
             .map { it.id to it.name }.toList()
         assertEquals(6, parts.size)
         for ((index, part) in parts.withIndex()) {
+            if (index == parts.lastIndex) expected = reloadSaved(session, expected, "science-before-last")
             val (id, name) = part
             run(session, "move", "unitId" to id, "x" to 0, "y" to 0)
             expected = VictoryFixtures.apply(expected, "move", dto("unitId" to id, "x" to 0, "y" to 0))
@@ -175,6 +191,7 @@ class EndgameCommandsTest {
         run(session, "victoryContinue", "resultToken" to data["continue"]!!.jsonObject.text("token"))
         expected.oneMoreTurnMode = true
         assertGameplayEquals("科学胜利后继续", expected, session.game!!)
+        reloadSaved(session, expected, "science-continued")
     }
 
     @Test fun exportEndgameSmokeScenarios() { VictoryFixtures.emitEndgames() }

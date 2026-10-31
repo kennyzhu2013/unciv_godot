@@ -88,8 +88,13 @@ class WholeGameTest {
                 "barbarians" to false, "ruins" to false, "seed" to profile.seed))
             assertEquals("新局从第 0 回合开始", 0, session.game!!.turns)
             record("newGame", "mapSize" to profile.mapSize, "mapType" to profile.mapType, "seed" to profile.seed)
-            while (session.game!!.turns < profile.turns) {
+            // 固定地图种子不固定 gameId 与完整发展轨迹。最低回合数之后仍须达到研发门槛，
+            // 只允许继续真实命令／AI 回合，并以两倍预算封顶；不降断言、不重开抽取更快的对局。
+            while (session.game!!.turns < profile.turns ||
+                session.game!!.currentPlayerCiv.tech.techsResearched.size < profile.minTechnologies) {
                 val turn = session.game!!.turns
+                assertTrue("${profile.name} 到第 $turn 回合仍未达到研发门槛 ${profile.minTechnologies}",
+                    turn < profile.turns * 2)
                 if (turn == profile.turns / 2) saveAndReload(turn)
                 resolvePending()
                 act(turn)
@@ -101,7 +106,7 @@ class WholeGameTest {
             }
         }
 
-        // ---- 存档退出后继续：期望端是写盘前的当前局，实际端是独立加载的新会话 ----
+        // ---- 跨会话重载：期望端是写盘前的当前局；此处没有操作系统进程退出重启 ----
 
         private fun saveAndReload(turn: Int) {
             val expected = session.game!!
@@ -110,7 +115,7 @@ class WholeGameTest {
             val continued = GameSession(root, directory)
             run(continued, "load", "path" to path)
             assertEquals("继续后的回合", turn, continued.game!!.turns)
-            GameplayAssertions.assertGameplayEquals("${profile.name} 保存退出继续（第 $turn 回合）", expected, continued.game!!)
+            GameplayAssertions.assertGameplayEquals("${profile.name} 保存后跨会话重载（第 $turn 回合）", expected, continued.game!!)
             session = continued
             record("reload", "turn" to turn, "save" to File(path).name)
         }
@@ -434,7 +439,8 @@ class WholeGameTest {
             val evidence = dto(
                 "profile" to profile.name, "mapSize" to profile.mapSize, "mapType" to profile.mapType,
                 "seed" to profile.seed, "aiPlayers" to profile.aiPlayers, "cityStates" to profile.cityStates,
-                "targetTurns" to profile.turns, "turns" to game?.turns,
+                "targetTurns" to profile.turns, "turnLimit" to profile.turns * 2,
+                "minimumTechnologies" to profile.minTechnologies, "turns" to game?.turns,
                 "cities" to player?.cities?.size, "units" to player?.units?.getCivUnits()?.count(),
                 "technologies" to player?.tech?.techsResearched?.size, "policies" to player?.policies?.getAdoptedPolicies()?.size,
                 "warStarted" to warStarted, "actionCount" to trace.size, "actions" to trace,
