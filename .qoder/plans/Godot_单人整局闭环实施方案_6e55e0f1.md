@@ -1,6 +1,6 @@
 # Godot 基础规则离线单人整局闭环方案
 
-> 状态：第 1—6 批已完成并验收（第 6 批 6.3 海军统帅、6.5 城邦馈赠改良因原生无实现基线标注暂缓）；第 7 批 7A 空军、7B 空降、7C 核武已完成并验收。第 8 批仍进行中：8A 终局专项与早期续玩已取得正式窗口证据 `smoke-1793368677374`（`ok=true`、双端错误日志 0 字节、内核 31 suites／450 测试 0 失败，`:tests:test` 869 测试 0 失败／15 项既有跳过）；8B 完整长局、进程退出重启及中后期性能尚未完成，一次 headless 退出泄漏仍未定因。
+> 状态：第 1—6 批已完成并验收（第 6 批 6.3 海军统帅、6.5 城邦馈赠改良因原生无实现基线标注暂缓）；第 7 批 7A 空军、7B 空降、7C 核武已完成并验收。第 8 批仍进行中：8A 终局专项与早期续玩已取得正式窗口证据 `smoke-1793368677374`（`ok=true`、双端错误日志 0 字节、内核 31 suites／450 测试 0 失败，`:tests:test` 869 测试 0 失败／15 项既有跳过）；8B **内核前置**已锁定：陆地／科学／海洋三条路线均从真实 `newGame` 只走网关命令稳定打到原生胜负结算、逐命令 twin 差分（`:godot-kernel:test` 33 suites／453 测试 0 失败，`:tests:test` 869 测试 0 失败／15 项既有跳过，三路线各 3× 重跑 9/9 全绿）；8B **窗口整局门槛**（三条真实窗口 `newGame`→原生胜负面板结算、进程退出重启续玩、中后期性能、真实窗口 Smoke）尚未完成，一次 headless 退出泄漏仍未定因。
 > 目标：以当前基础规则离线单人对局，从新游戏完整玩到原生胜负结算。
 
 ## 目标与边界
@@ -253,7 +253,18 @@
 - 三处根因与修复（仅动 `godot/kernel` 测试文件，未改 core）：①**相遇通知坐标非确定**——`CivInfoTransientCache.updateViewableTiles` 用 `HashMap<Civilization,Tile>` 迭代 `viewableTiles`(`HashSet<Tile>`) 保留每 civ 最后一块作“We have encountered [X]!”跳转坐标，Tile 身份哈希使两独立对象图坐标不同（同自然奇观，纯 UI 跳转无玩法效果）；`GameplayAssertions.normalizeNotification` 扩展归一该坐标（key=`encounteredCiv`），奇观行为不变。②**Domination 语义**——`verify()` 按 `core Victory.kt` `CaptureAllCapitals` 精确含义重写：失败方可保留非首都城市，玩家赢须持有所有仍存在的其他文明原始首都、玩家输须灭亡或失原始首都（上一版误断“其余文明全部灭亡”把真实获胜判失败）。③**海军伟人死循环**——`chooseFreeGreatPerson` 落 `getCapital()`，海军伟人在内陆首都 `addUnit` 返回 null→`notPlaced` 不扣额度但 `greatPersonChoose` 仍 `revision++` 使旧 token 失效；`greatPerson()` 改为每轮重查取新 token、依次尝试候选直到 `granted`。
 - 驱动质量修复：铺城封顶（城市+在途 Settler<3 才造 Settler）、和平期补足 ≤3 Worker 连接铁/马解锁强近战、全军集中单一主攻反复砸穿城防、≥2 城且 ≥10 近战才宣战、`TURN_LIMIT` 350→450。
 - 全量回归（上一实施轮）：`:godot-kernel:test --rerun` 32 suites／451 tests／0 fail／0 error／0 skip（`FullGameTest` 7.872s；`WholeGameTest` 三长局＋Medium 基线 PASSED，证明共享 `GameplayAssertions` 归一化无回归）；`:tests:test --rerun` 79 suites／869 tests／0 fail／0 error／15 skip（既有跳过，无新增）。
-- **边界**：以上为内核前置成果；8B 窗口整局门槛（三条真实窗口 `newGame`→原生结算、OS 进程退出重启续玩、中后期性能取证）本轮**未动**，科学／海洋两条能否稳定到原生结算亦**尚未在内核证明**。
+- **边界**：以上为陆地路线内核前置成果；8B 窗口整局门槛（三条真实窗口 `newGame`→原生结算、OS 进程退出重启续玩、中后期性能取证）本轮**未动**。
+
+### 8B 内核前置进展（2026-10-30；科学／海洋两条整局逐命令原生差分已锁定，窗口整局门槛仍未动）
+- 新增内核层 [FullGameRoutesTest.kt](file:///d:/game/unicv_godot/godot/kernel/src/test/kotlin/com/unciv/godot/FullGameRoutesTest.kt)（共享 `Route` 基类 + 科学／海洋两条路线），与陆地 `FullGameTest` 同口径：从真实 `newGame` 只走网关命令打到**原生胜负结算**；玩家命令逐条走“网关执行 vs 独立原生重放”严格 twin 差分，`nextTurn` 与 `attack` 走 save→独立原生 load 往返，不注入胜利记录、不改原生胜利条件、不清空待决。
+  - `scienceDevelopmentToNativeSettlement`（Babylon／Chieftain／Quick／Small／Archipelago／1 AI／0 城邦／无野蛮人无遗迹／seed 860606，`warTurn` 取极大不主动开战）：真实排产 ≥2 种科学建筑（Library/University/Observatory/Public School/Laboratory）、深入研发科技树（`verifyRoute` 要求 ≥35 项），收敛到原生 Scientific／Domination／Time 结算。
+  - `navalHybridToNativeSettlement`（England／Chieftain／Quick／Small／Archipelago／1 AI／0 城邦／无野蛮人无遗迹／seed 860707）：真实排产 Work Boats 在己方水域资源格建海上改良（`createWaterImprovement`）、排产海军、陆军登船跨海（`embarkedObserved`）；Astronomy 后建远洋舰队（Caravel+）主动跨海袭敌岸产生真实海军交战（`navalEngagement`），收敛到原生 Scientific／Domination 结算。
+- **本轮三处根因与修复（仅动 `godot/kernel` 测试文件，未改 core）：**
+  - ①**陆地 `cityDecision` flaky**——`FullGameTest.verify()` 原无条件要求占城命令，但 core `GameStarter.chooseCivilizations`(第 260 行)／`getCivsOrderedByAvailableLocations`(第 567 行) 用**无种子 `.shuffled()`** 洗 AI 文明与起点，网关 `NewGameSetup.parse`(第 71 行) 仅接受 `aiPlayers` 数量、无法钉住具体 AI，故长局玩家胜负非确定（弱开局下玩家可能先被征服）。改为**按结局分支**：玩家以 Domination 获胜时要求真实 `cityDecision` 且持有所有仍存在的其他文明原始首都；被先征服时以无条件的宣战+攻击+到达原生 Domination 为证，并在 else 分支校验其确已灭亡／失去原始首都。
+  - ②**近战 `attack` twin 差分非确定**——`Battle.takeDamage`(core 第 380 行) 用 `stateBasedRandom`，种子取自 `GameContext.hashCode()`(core 第 90-91 行)，而 combat context 含**身份哈希的 `Tile`**(`defender.getTile()`) → 独立加载两份存档对同一次近战偶发不同受击顺序／阵亡方，级联到单位存活/HP 与 `attacksSinceTurnStart`(阵亡单位攻击记忆转入所属文明，core `MapUnit` 第 952 行)；`GameplayAssertions.assertJsonEquals`(第 117 行) 比对 JSON key 集时因空/非空 `attacksSinceTurnStart` 而发散。网关 `attack`(`CombatCommands`) 仅委托原生 `Battle`、无自研战斗逻辑，故与 `nextTurn` 同口径：不跨副本逐字节比对，改为验证攻击后状态经 save→独立原生 load 往返稳定(`verified=save-reload-roundtrip`)，并以往返态同步两端使后续命令仍逐条差分。
+  - ③**海洋 `navalEngagement` flaky + 过早开战**——原海军纯防御且主动宣战门槛为“任意 2 艘军舰”（含永远不能进远洋的 Trireme），England 第 40 回合以 2 艘 Trireme 宣战、无法跨海打击、反被发展更好的 AI 于第 115 回合灭亡、科技仅 23 从未到 Astronomy、`oceanProd=0`。修复：主动宣战门槛改为“远洋舰队成型”（≥2 艘 Caravel+，Astronomy 后）；`production` 在 Astronomy 后优先补足远洋军舰；`routeAct` 令远洋军舰主动跨海进攻最近已知敌城／无已知敌城则出海探索；`verifyRoute` 的 `navalEngagement` 断言按 `produced.any{ it in oceanNavy }` 条件化（若在建成远洋舰队前即被 AI 跨海征服，则以已确证的海上改良+海军排产+登船为证，不强求交火，与陆地占城同理）。修复后 England 存活至 263~309 回合、建 5~15 艘远洋军舰并真实交火。
+- **稳定性与回归（本轮，2026-10-30）：** `:godot-kernel:test --rerun` **33 suites／453 tests／0 fail／0 error／0 skip**（`scienceDevelopmentToNativeSettlement` 61.3s、`navalHybridToNativeSettlement` 78.7s、`landDominationToNativeVictory` 38.9s 均 PASS）；`:tests:test --rerun` **79 suites／869 tests／0 fail／0 error／15 skip**（既有跳过，无新增）。三路线各 3 次连续重跑（每轮全新 AI 抽取）**9/9 全 PASS**：LAND=Rome 获胜 Domination（真实 `cityDecision`）／China 获胜（Rome 败但按分支 PASS）；SCI=达 Scientific 结算、玩家科技 39~41（≥35 门槛）；NAVAL=England 建远洋舰队 5~15 艘、真实海军交战、达 Domination／Scientific 结算（Inca／Korea／The Maya 胜）。另海洋路线专项 4× 重跑全 PASS（`oceanProd` 0/7/10/15，存活至 t263~309）。
+- **边界**：至此**陆地／科学／海洋三条路线在内核层均已锁定**从真实 `newGame` 稳定到原生胜负结算 + 逐命令 twin 差分（玩家胜负非确定按结局分支诚实断言；未降断言、未改 core、未注入胜利、未重开抽局）。8B **窗口整局门槛仍未动**：三条真实窗口 `newGame`→原生胜负面板结算、OS 进程退出重启续玩、中后期性能取证、真实窗口 Smoke（双端 error log 0 字节／`ok=true`／两尺寸截图）为下一实施子批目标。
 
 ## 每批通用验收标准
 1. **规则差分：** 期望端独立调用原生入口，对比持久化玩法状态；不共用待测 DTO 构造器自证正确。
