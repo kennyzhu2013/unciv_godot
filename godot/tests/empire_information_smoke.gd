@@ -106,6 +106,8 @@ func normalize(value, key := ""):
 		return result
 	if value is Array:
 		var result: Array = value.map(func(item): return normalize(item))
+		if key == "notifications":
+			result = result.map(func(item): return smoke.normalize_notification(item))
 		if key in expected.setFields:
 			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
 		return result

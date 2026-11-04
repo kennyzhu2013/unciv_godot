@@ -29,6 +29,8 @@ internal class GameSession(root: File, private val saveDirectory: File =
     private val saves = GameSaves(saveDirectory)
     /** 仅冒烟运行时（run.ps1 -Smoke 设置 UNCIV_SMOKE=1）开启：允许 debugInjectEvent 向实时会话注入合成事件；真实游玩不设该变量即完全不存在此命令。 */
     internal val smokeEnabled: Boolean = System.getenv("UNCIV_SMOKE") == "1"
+    /** 冒烟整局自动驱动，按会话持久：跨回合保留 warStarted/knownEnemyCities 记忆（与内核 FullGameTest 单一 Conquest 实例一致）；对局切换（新游戏/读档）时由驱动自身按 gameId 重置。 */
+    private var autoplayDriver: AutoplayDriver? = null
 
     /**
      * 命令唯一登记处。领域命令由各自 contribute 加入；此处只组合它们。
@@ -65,6 +67,16 @@ internal class GameSession(root: File, private val saveDirectory: File =
             if (action == "hello") return reply("data" to dto("saveDirectory" to saveDirectory.absolutePath))
             ensure(request.text("session") == sessionId, "SESSION", "会话已失效，请重新连接")
             if (action == "snapshot") return reply("snapshot" to game?.let { PlayerSnapshot(it).build() })
+            // 冒烟专用整局自动驱动：仅 UNCIV_SMOKE 门控下存在（真实游玩不设该变量即等同未实现命令）。
+            // 作为传输动词在注册表分发前处理——它对本会话 handle 做重入子请求逐条走真实网关命令，
+            // 故不套外层备份/回滚（每条子命令在各自的 handle 内已有回滚）；遇原生胜负结算即停手交回窗口。
+            if (action == "autoplay") {
+                ensure(smokeEnabled, "UNKNOWN_COMMAND", "未实现命令：autoplay")
+                ensure(request.integer("revision") == revision, "STALE_STATE", "状态已变化，请刷新后重试")
+                val driver = autoplayDriver ?: AutoplayDriver(this).also { autoplayDriver = it }
+                val summary = driver.playTurn()
+                return reply("snapshot" to PlayerSnapshot(requireGame()).build(), "autoplay" to summary)
+            }
             val requestId = request.text("requestId")
             ensure(requestId.length in 1..100, "REQUEST_ID", "无效请求 ID")
             responses[requestId]?.let { (original, response) ->

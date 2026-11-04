@@ -20,6 +20,17 @@ func _ready() -> void:
 		add_child(p)
 		_players.append(p)
 
+# 退出前主动停播并释放池与缓存：播放中的 AudioStreamPlayer 持有 AudioStreamPlaybackMP3，
+# 缓存字典持有 AudioStreamMP3；若随场景树一起销毁而未先停播／置空，会在 ObjectDB 清理时报
+# “instances leaked at exit”并写入 error log。此处显式释放，保证冒烟退出时双端 error log 为 0 字节。
+func _exit_tree() -> void:
+	for p in _players:
+		if p != null:
+			p.stop()
+			p.stream = null
+	_players.clear()
+	_cache.clear()
+
 # 懒加载并缓存；失败缓存 null，避免每次重扫磁盘。
 func _stream(key: String) -> AudioStream:
 	if _cache.has(key):

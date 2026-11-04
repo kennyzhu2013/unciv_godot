@@ -17,6 +17,7 @@ var expected: Dictionary = {}
 var endgame_steps := 0
 var endgame_evidence: Array[Dictionary] = []
 var whole_game_evidence: Array[Dictionary] = []
+var autoplay_evidence: Array[Dictionary] = []
 
 const PROFILES = [
 	{"name": "land-conquest", "mapSize": "Tiny", "turns": 10},
@@ -43,6 +44,8 @@ func normalize(value, key := ""):
 		return result
 	if value is Array:
 		var result: Array = value.map(func(item): return normalize(item))
+		if key == "notifications":
+			result = result.map(func(item): return smoke.normalize_notification(item))
 		if key in expected.setFields:
 			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
 		return result
@@ -103,6 +106,33 @@ func click_dialog(dialog: ConfirmationDialog, confirm: bool, twice := false) -> 
 		await smoke.window_mouse(viewport, MOUSE_BUTTON_LEFT, click_pos, false, true)
 	await smoke.settle()
 	return true
+
+# 真实点击嵌入窗口内的按钮（AcceptDialog 中的「创建新游戏」）：冻结窗口坐标，支持双击。
+func click_window(control: Control, twice := false) -> bool:
+	var window := control.get_viewport()
+	await smoke.get_tree().process_frame
+	var position := control.get_global_rect().get_center()
+	if not smoke.check(window.get_visible_rect().encloses(control.get_global_rect()), "开局按钮完整可见"):
+		return false
+	await smoke.window_motion(window, position)
+	if not smoke.check(window.gui_get_hovered_control() == control, "开局窗口鼠标命中按钮"):
+		return false
+	while window is Window and window.is_embedded():
+		position = Vector2(window.position) + window.get_final_transform() * position
+		window = window.get_parent().get_viewport()
+	await smoke.window_mouse(window, MOUSE_BUTTON_LEFT, position, false)
+	if twice:
+		await smoke.window_mouse(window, MOUSE_BUTTON_LEFT, position, false, true)
+	await smoke.settle()
+	return true
+
+# 新游戏配置下拉：按候选文本定位并选中（表单赋值属测试输入准备，创建／切换仍为真实按钮点击）。
+func select_setup_option(picker: OptionButton, text: String) -> bool:
+	for index in range(picker.item_count):
+		if picker.get_item_text(index) == text:
+			picker.select(index)
+			return smoke.check(picker.get_item_text(picker.selected) == text, "新游戏配置项已选中：" + text)
+	return smoke.check(false, "新游戏配置缺少候选项：" + text)
 
 # 最后动作已真实结算后再取证，不加载预写胜利记录的布局夹具。
 func verify_result_sizes(name: String) -> bool:
@@ -307,10 +337,143 @@ func resolve_pending() -> bool:
 			"policy":
 				if not await choose_first("policy"):
 					return false
+			# 其余待决镜像内核 AutoplayDriver.resolvePending：长局只推进回合、不指挥单位，这些分支覆盖
+			# 自然产生的交易／外交／资产／事件／伟人／宗教／占城待决，查询对应选项后选首个可用项经真实网关命令处置。
+			"trade":
+				if not await smoke.perform("declineTrade"):
+					return false
+			"cityCapture":
+				if not await smoke.perform("cityDecision", {"cityId": str(entry.get("target", "")), "choice": "annex"}):
+					return false
+			"diplomacyAlert":
+				if not await resolve_diplomacy_alert():
+					return false
+			"assetDecision":
+				if not await resolve_asset_decision():
+					return false
+			"event":
+				if not await resolve_event():
+					return false
+			"greatPerson":
+				if not await resolve_great_person():
+					return false
+			"religion":
+				if not await resolve_religion():
+					return false
 			_:
 				return smoke.check(false, "长局出现无法在真实窗口处置的待决：" + kind)
 		await smoke.settle()
 	return smoke.check(false, "长局待决处置次数超限")
+
+# 查询类动词返回 {ok, data}；用 sub_dict/sub_array 做类型安全提取，data 缺失时由调用方断言一致性。
+func query_data(action: String) -> Dictionary:
+	var res: Dictionary = await app.execute(action)
+	if not smoke.check(res.get("ok", false), "长局查询待决选项：" + action):
+		return {}
+	return sub_dict(res, "data")
+
+func sub_dict(value, key: String) -> Dictionary:
+	var child = value.get(key) if value is Dictionary else null
+	return child if child is Dictionary else {}
+
+func sub_array(value, key: String) -> Array:
+	var child = value.get(key) if value is Dictionary else null
+	return child if child is Array else []
+
+func first_enabled(choices: Array) -> Dictionary:
+	for choice in choices:
+		if choice is Dictionary and bool(choice.get("enabled", false)):
+			return choice
+	return {}
+
+func resolve_diplomacy_alert() -> bool:
+	var data: Dictionary = await query_data("diplomacyOptions")
+	var alert := sub_dict(data, "pendingAlert")
+	if not smoke.check(not alert.is_empty(), "长局外交待决与查询一致"):
+		return false
+	var choice := first_enabled(sub_array(alert, "choices"))
+	if not smoke.check(not choice.is_empty(), "长局外交待决存在可用选项"):
+		return false
+	return await smoke.perform("diplomacyAlertDecision",
+		{"alertToken": str(alert.get("alertToken", "")), "choice": str(choice.get("id", ""))})
+
+func resolve_asset_decision() -> bool:
+	var data: Dictionary = await query_data("assetDecisionOptions")
+	var decision := sub_dict(data, "decision")
+	if not smoke.check(not decision.is_empty(), "长局资产待决与查询一致"):
+		return false
+	var choice := first_enabled(sub_array(decision, "choices"))
+	if not smoke.check(not choice.is_empty(), "长局资产待决存在可用选项"):
+		return false
+	return await smoke.perform("assetDecision",
+		{"decisionToken": str(decision.get("token", "")), "choice": str(choice.get("id", ""))})
+
+func resolve_event() -> bool:
+	var data: Dictionary = await query_data("eventOptions")
+	var decision := sub_dict(data, "decision")
+	if not smoke.check(not decision.is_empty(), "长局事件待决与查询一致"):
+		return false
+	var params := {"eventToken": str(decision.get("token", ""))}
+	var choices := sub_array(decision, "choices")
+	if not choices.is_empty() and choices[0] is Dictionary:
+		params["index"] = int(choices[0].get("index", 0))
+	return await smoke.perform("eventChoose", params)
+
+# 免费伟人可能因候选无法在首都落位（如海军伟人而首都不沿海）而未授予；镜像内核逐个候选重试至 granted。
+func resolve_great_person() -> bool:
+	var tried: Array = []
+	for attempt in range(30):
+		var data: Dictionary = await query_data("greatPersonOptions")
+		var decision := sub_dict(data, "decision")
+		if decision.is_empty():
+			return true
+		if not smoke.check(bool(decision.get("enabled", false)), "长局免费伟人待决可领取"):
+			return false
+		var token := str(decision.get("token", ""))
+		var picked := ""
+		for candidate in sub_array(data, "candidates"):
+			if not candidate is Dictionary:
+				continue
+			var unit_name := str(candidate.get("unitName", ""))
+			if bool(candidate.get("enabled", false)) and not tried.has(unit_name):
+				picked = unit_name
+				break
+		if not smoke.check(not picked.is_empty(), "长局存在可落位免费伟人候选"):
+			return false
+		tried.append(picked)
+		var chosen: Dictionary = await app.execute("greatPersonChoose", {"unitName": picked, "decisionToken": token})
+		if not smoke.check(chosen.get("ok", false), "长局领取免费伟人：" + picked):
+			return false
+		await smoke.settle()
+		if str(sub_dict(chosen, "greatPersonResult").get("outcome", "")) == "granted":
+			return true
+	return smoke.check(false, "长局免费伟人处置次数超限")
+
+func resolve_religion() -> bool:
+	var data: Dictionary = await query_data("religionOptions")
+	var decision := sub_dict(data, "decision")
+	if not smoke.check(not decision.is_empty(), "长局宗教待决与查询一致"):
+		return false
+	if not smoke.check(bool(decision.get("supported", false)), "长局宗教待决可处置"):
+		return false
+	var beliefs: Array = []
+	for slot in sub_array(decision, "slots"):
+		var ids := sub_array(slot, "candidateIds")
+		if not smoke.check(not ids.is_empty(), "长局宗教信条槽位存在候选"):
+			return false
+		beliefs.append(str(ids[0]))
+	var token := str(decision.get("token", ""))
+	if str(decision.get("mode", "")) == "foundReligion":
+		var symbol: Dictionary = {}
+		for candidate in sub_array(data, "symbols"):
+			if candidate is Dictionary and bool(candidate.get("available", false)):
+				symbol = candidate
+				break
+		if not smoke.check(not symbol.is_empty(), "长局存在可用宗教符号"):
+			return false
+		return await smoke.perform("religionFound", {"decisionToken": token,
+			"religionId": str(symbol.get("id", "")), "displayName": str(symbol.get("defaultName", "")), "beliefs": beliefs})
+	return await smoke.perform("religionChooseBeliefs", {"decisionToken": token, "beliefs": beliefs})
 
 func enqueue_first(city_id: String) -> bool:
 	if (await open_city(city_id)).is_empty():
@@ -415,6 +578,103 @@ func verify_whole_game() -> bool:
 		evidence.append({"step": "whole-game", "profile": name, "turns": played, "turnMillis": elapsed})
 	return true
 
+# ---- 8B 整局：真实窗口新游戏 → 逐回合（HTTP autoplay 指挥 + 真实点击结束回合）→ 原生胜负结算两尺寸 ----
+#
+# 决策驱动复用内核 AutoplayGameTest 已验证的 main-source AutoplayDriver（经网关 autoplay 动词，仅 UNCIV_SMOKE
+# 门控下存在）：每回合由 autoplay 处置全部待决并指挥单位／战争，窗口真实点击「结束回合」推进 AI；到达原生
+# 胜负结算即停手，复用 verify_result_sizes／continue_victory 取两尺寸胜负面板证据。不注入胜利、不改原生胜利
+# 条件、不清空有效待决；玩家胜负非确定（core AI 无种子 shuffle），按到达的真实原生结局如实取证。
+func verify_new_game_to_settlement() -> bool:
+	var panel = app.game_setup
+	var setup := {"nation": "Rome", "difficulty": "Chieftain", "speed": "Standard", "mapSize": "Tiny",
+		"mapType": "Pangaea", "aiPlayers": 1, "cityStates": 0, "barbarians": false, "ruins": false, "seed": "860505"}
+	# 真实点击「新游戏」：内部查询 newGameOptions 填充候选与默认值并弹出配置窗口。
+	if not await smoke.click_control(panel.new_button):
+		return false
+	if not smoke.check(panel.setup_dialog.visible and panel.options_loaded, "整局：新游戏配置窗口已打开并加载候选"):
+		return false
+	for key in ["nation", "difficulty", "speed", "mapSize", "mapType"]:
+		if not select_setup_option(panel.fields[key], str(setup[key])):
+			return false
+	panel.fields.aiPlayers.value = int(setup.aiPlayers)
+	panel.fields.cityStates.value = int(setup.cityStates)
+	panel.fields.seed.text = str(setup.seed)
+	panel.fields.barbarians.button_pressed = bool(setup.barbarians)
+	panel.fields.ruins.button_pressed = bool(setup.ruins)
+	var revision: int = app.client.revision
+	# 真实点击「创建新游戏」；endgame 之前已加载长局存档，故切换需真实确认。
+	if not await click_window(panel.start_button):
+		return false
+	if panel.confirmation.visible:
+		if not await click_dialog(panel.confirmation, true, true):
+			return false
+	if not smoke.check(app.client.revision == revision + 1 and app.client.snapshot.nation == str(setup.nation)
+			and int(app.client.snapshot.turn) == 0, "整局：真实窗口创建新游戏且仅提交一次"):
+		return false
+	var game_id: String = app.current_game
+	await smoke.screenshot("smoke-endgame-autoplay-land-newgame.png")
+
+	var limit := 450
+	var played := 0
+	var cumulative_actions := 0
+	var ever_war := false
+	var max_cities := 0
+	var max_techs := 0
+	var checkpoints: Array[Dictionary] = []
+	var started := Time.get_ticks_msec()
+	while true:
+		if app._victory_pending():
+			break
+		var result: Dictionary = await app.execute("autoplay", {})
+		if not smoke.check(result.get("ok", false), "整局：autoplay 命令成功：" + str(result.get("error"))):
+			return false
+		await smoke.settle()
+		var summary: Dictionary = result.get("autoplay", {})
+		cumulative_actions += int(summary.get("actionsIssued", 0))
+		ever_war = ever_war or bool(summary.get("warStarted", false))
+		max_cities = maxi(max_cities, int(summary.get("cities", 0)))
+		max_techs = maxi(max_techs, int(summary.get("technologies", 0)))
+		if played % 40 == 0:
+			checkpoints.append({"turn": int(summary.get("turn", -1)), "cities": int(summary.get("cities", 0)),
+				"units": int(summary.get("units", 0)), "technologies": int(summary.get("technologies", 0)),
+				"actionsIssued": int(summary.get("actionsIssued", 0)), "warStarted": bool(summary.get("warStarted", false))})
+		if bool(summary.get("victoryReached", false)) or app._victory_pending():
+			break
+		var turn_before: int = app.client.snapshot.turn
+		if not await smoke.click_control(app.turn_button):
+			return false
+		if not smoke.check(app.client.snapshot.turn == turn_before + 1, "整局：真实点击推进 AI 回合"):
+			return false
+		played += 1
+		if played >= limit:
+			return smoke.check(false, "整局：autoplay 回合数超限 " + str(limit))
+	var elapsed := Time.get_ticks_msec() - started
+
+	var settlement: Dictionary = app.client.snapshot.get("victory", {})
+	if not smoke.check(bool(settlement.get("requiresAcknowledgement", false)), "整局：到达原生胜负结算并待确认"):
+		return false
+	var outcome := str(settlement.get("outcome", ""))
+	var recorded: Dictionary = settlement.get("recorded") if settlement.get("recorded") is Dictionary else {}
+	await smoke.screenshot("smoke-endgame-autoplay-land-settlement.png")
+	# 两尺寸原生胜负面板 + 真实「继续游戏」写入一次（复用终局专项已验证路径）。
+	if not await verify_result_sizes("autoplay-land"):
+		return false
+	if not await continue_victory():
+		return false
+	autoplay_evidence.append({
+		"route": "land-domination", "gameId": game_id, "setup": setup, "outcome": outcome,
+		"victoryType": str(recorded.get("type", "")), "winningCiv": str(recorded.get("name", "")),
+		"playerWon": outcome == "won", "turns": int(app.client.snapshot.turn), "turnsClicked": played,
+		"oneMoreTurnMode": bool(app.client.snapshot.get("victory", {}).get("oneMoreTurnMode", false)),
+		"cumulativeActions": cumulative_actions, "everWar": ever_war,
+		"maxCities": max_cities, "maxTechnologies": max_techs, "elapsedMillis": elapsed,
+		"checkpoints": checkpoints,
+		"staticMemory": int(Performance.get_monitor(Performance.MEMORY_STATIC)),
+		"peakStaticMemory": int(OS.get_static_memory_peak_usage()),
+		"windowSizes": smoke.window_sizes_checked.filter(func(s): return str(s).begins_with("endgame-autoplay-land")),
+	})
+	return true
+
 func run(harness) -> bool:
 	smoke = harness
 	app = smoke.app
@@ -436,5 +696,8 @@ func run(harness) -> bool:
 		return false
 	if not await verify_whole_game():
 		return false
+	if not await verify_new_game_to_settlement():
+		return false
 	smoke.steps.append("8A 终局专项：文化／时间胜负／灭亡／科学由真实面板与回合结算；三条固定种子路线中点续玩并同会话保存重载，记录 Tiny／Small／Medium 早期耗时与内存；尚非从新游戏到结算的完整长局或进程重启证据")
+	smoke.steps.append("8B 整局：真实窗口新游戏（Rome／Chieftain／Standard／Tiny／Pangaea／1AI／0CS／seed860505／无野蛮人无遗迹）→逐回合 HTTP autoplay 指挥＋真实点击「结束回合」推进 AI→原生胜负结算面板两尺寸并继续；局长／结局／累计动作／交战／城市／科技见 autoplayEvidence")
 	return true

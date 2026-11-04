@@ -84,6 +84,7 @@ var nuke_evidence: Array[Dictionary] = []
 var endgame_checks
 var endgame_evidence: Array[Dictionary] = []
 var whole_game_evidence: Array[Dictionary] = []
+var autoplay_evidence: Array[Dictionary] = []
 
 # 真实 HTTP 后丢弃响应／延迟只读响应，属于客户端边界故障注入。
 class NavalFaultClient extends "res://scripts/kernel_client.gd":
@@ -379,7 +380,7 @@ func run(frontend) -> void:
 		"scenarios": ["new-game", "save-browser", "autosave-resume", "empire-overview", "notifications", "research-info", "policy-info", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat", "unit-orders", "unit-abilities", "air", "paradrop", "nuke", "presentation", "endgame"],
 		"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence, "endgameEvidence": endgame_evidence, "wholeGameEvidence": whole_game_evidence,
+		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence, "endgameEvidence": endgame_evidence, "wholeGameEvidence": whole_game_evidence, "autoplayEvidence": autoplay_evidence,
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -404,6 +405,29 @@ func naval_scenario(name: String) -> Dictionary:
 			return scenario
 	return {}
 
+# 单条通知归一化，镜像内核 GameplayAssertions.normalizeNotification：actions 列表由 HashSet<Tile>
+# 迭代生成需按内容排序；"发现自然奇观/相遇文明"通知的地图坐标取自不确定的 viewableTiles 命中地块，
+# 按文本中的确定名称归一，与内核保持一致，使窗口比较器校准与原生差分对齐。
+func normalize_notification(entry):
+	if not entry is Dictionary:
+		return entry
+	var fields: Dictionary = entry.duplicate(true)
+	var text_value = fields.get("text")
+	var text := "" if text_value == null else str(text_value)
+	var location_key := ""
+	if text.begins_with("We have discovered [") and text.ends_with("]!"):
+		location_key = "naturalWonder"
+	elif text.begins_with("We have encountered [") and text.ends_with("]!"):
+		location_key = "encounteredCiv"
+	var actions = fields.get("actions")
+	if actions is Array:
+		if not location_key.is_empty():
+			for action in actions:
+				if action is Dictionary and action.get("LocationAction") is Dictionary:
+					action["LocationAction"]["location"] = {location_key: text}
+		actions.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
+	return fields
+
 func normalize_naval(value, key := ""):
 	if value is Dictionary:
 		var result := {}
@@ -414,6 +438,8 @@ func normalize_naval(value, key := ""):
 		return result
 	if value is Array:
 		var result: Array = value.map(func(item): return normalize_naval(item))
+		if key == "notifications":
+			result = result.map(func(item): return normalize_notification(item))
 		if key in naval_expected.setFields:
 			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
 		return result
@@ -690,6 +716,8 @@ func normalize_unitcity(value, key := ""):
 		return result
 	if value is Array:
 		var result: Array = value.map(func(item): return normalize_unitcity(item))
+		if key == "notifications":
+			result = result.map(func(item): return normalize_notification(item))
 		if key in unitcity_expected.setFields:
 			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
 		return result
@@ -1307,6 +1335,8 @@ func normalize_asset(value, key := ""):
 		return result
 	if value is Array:
 		var result: Array = value.map(func(item): return normalize_asset(item))
+		if key == "notifications":
+			result = result.map(func(item): return normalize_notification(item))
 		if key in asset_expected.setFields:
 			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
 		return result
@@ -1670,6 +1700,8 @@ func normalize_city_state(value, key := ""):
 		return result
 	if value is Array:
 		var result: Array = value.map(func(item): return normalize_city_state(item))
+		if key == "notifications":
+			result = result.map(func(item): return normalize_notification(item))
 		if key in citystate_expected.setFields:
 			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
 		return result
@@ -1781,6 +1813,8 @@ func normalize_great_person(value, key := ""):
 		return result
 	if value is Array:
 		var result: Array = value.map(func(item): return normalize_great_person(item))
+		if key == "notifications":
+			result = result.map(func(item): return normalize_notification(item))
 		if key in great_person_expected.setFields:
 			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
 		return result
@@ -3120,6 +3154,8 @@ func normalize_diplomacy(value, key := ""):
 		return result
 	if value is Array:
 		var result: Array = value.map(func(item): return normalize_diplomacy(item))
+		if key == "notifications":
+			result = result.map(func(item): return normalize_notification(item))
 		if key in diplomacy_expected.setFields:
 			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
 		return result
@@ -3747,6 +3783,8 @@ func normalize_religion(value, key := ""):
 		return result
 	if value is Array:
 		var result: Array = value.map(func(item): return normalize_religion(item))
+		if key == "notifications":
+			result = result.map(func(item): return normalize_notification(item))
 		if key in religion_expected.setFields:
 			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
 		return result
@@ -4058,6 +4096,8 @@ func normalize_economy(value, key := ""):
 		return result
 	if value is Array:
 		var result: Array = value.map(func(item): return normalize_economy(item))
+		if key == "notifications":
+			result = result.map(func(item): return normalize_notification(item))
 		if key in economy_expected.setFields:
 			result.sort_custom(func(a, b): return JSON.stringify(a) < JSON.stringify(b))
 		return result
@@ -4349,7 +4389,7 @@ func _fail(message: String) -> void:
 			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
 			"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence, "endgameEvidence": endgame_evidence, "wholeGameEvidence": whole_game_evidence,
+			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence, "endgameEvidence": endgame_evidence, "wholeGameEvidence": whole_game_evidence, "autoplayEvidence": autoplay_evidence,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
@@ -4376,6 +4416,7 @@ func verify_endgame_flow() -> bool:
 	endgame_checks = script.new()
 	endgame_evidence = endgame_checks.endgame_evidence
 	whole_game_evidence = endgame_checks.whole_game_evidence
+	autoplay_evidence = endgame_checks.autoplay_evidence
 	return await endgame_checks.run(self)
 
 # —— 发展流程（dev6，plan line 55-68）：全部经视口输入分发鼠标事件驱动真实控件 ——
