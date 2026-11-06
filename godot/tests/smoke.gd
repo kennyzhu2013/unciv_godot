@@ -85,6 +85,8 @@ var endgame_checks
 var endgame_evidence: Array[Dictionary] = []
 var whole_game_evidence: Array[Dictionary] = []
 var autoplay_evidence: Array[Dictionary] = []
+var restart_evidence: Array[Dictionary] = []
+var performance_evidence: Array[Dictionary] = []
 
 # 真实 HTTP 后丢弃响应／延迟只读响应，属于客户端边界故障注入。
 class NavalFaultClient extends "res://scripts/kernel_client.gd":
@@ -221,7 +223,16 @@ func run(frontend) -> void:
 	if run_id.is_empty():
 		run_id = "smoke-%d" % int(Time.get_unix_time_from_system() * 1000.0)
 	started_at = Time.get_datetime_string_from_system(true)
-	get_tree().create_timer(900.0).timeout.connect(func(): _fail("端到端验证超时"))
+	get_tree().create_timer(5100.0).timeout.connect(func(): _fail("端到端验证超时"))
+	var restart_phase := _restart_phase_arg()
+	if not restart_phase.is_empty():
+		# t10：OS 进程退出重启续玩取证。运行器以两个独立进程生命周期分别跑 save／continue 两阶段，
+		# 本进程只执行单阶段后写报告退出；跨阶段状态只经磁盘存档与证据文件传递，不在内存中延续。
+		if not await _run_restart_phase(restart_phase):
+			_fail("重启取证场景失败：" + restart_phase)
+			return
+		await _finish_report()
+		return
 	for x in range(-12, 13):
 		for y in range(-12, 13):
 			var coordinate := Vector2i(x, y)
@@ -367,6 +378,33 @@ func run(frontend) -> void:
 		if not await scenario[1].call():
 			return
 		print("Smoke 完成：", scenario[0])
+	await _finish_report()
+
+func _restart_phase_arg() -> String:
+	for arg in OS.get_cmdline_user_args():
+		if str(arg).begins_with("--restart-proof="):
+			return str(arg).substr(len("--restart-proof="))
+	return ""
+
+func _run_restart_phase(phase: String) -> bool:
+	var script = load("res://tests/endgame_smoke.gd")
+	if not check(script != null and script.can_instantiate(), "重启取证脚本可实例化"):
+		return false
+	endgame_checks = script.new()
+	endgame_checks.smoke = self
+	endgame_checks.app = app
+	endgame_evidence = endgame_checks.endgame_evidence
+	whole_game_evidence = endgame_checks.whole_game_evidence
+	autoplay_evidence = endgame_checks.autoplay_evidence
+	restart_evidence = endgame_checks.restart_evidence
+	match phase:
+		"save":
+			return await endgame_checks.verify_restart_save()
+		"continue":
+			return await endgame_checks.verify_restart_continue()
+	return check(false, "未知重启取证阶段：" + phase)
+
+func _finish_report() -> void:
 	await get_tree().process_frame
 	await get_tree().process_frame
 	var directory := ProjectSettings.globalize_path("res://.local")
@@ -380,7 +418,7 @@ func run(frontend) -> void:
 		"scenarios": ["new-game", "save-browser", "autosave-resume", "empire-overview", "notifications", "research-info", "policy-info", "hex-roundtrip", "demo-baseline", "settlement-promise", "combat", "development", "ui-display", "city-economy", "diplomacy", "religion", "great-person", "diplomatic-vote", "victory", "asset-decisions", "city-state", "event", "naval", "embarkation", "unit-promotion", "unit-upgrade", "city-bombard", "workboat", "unit-orders", "unit-abilities", "air", "paradrop", "nuke", "presentation", "endgame"],
 		"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence, "endgameEvidence": endgame_evidence, "wholeGameEvidence": whole_game_evidence, "autoplayEvidence": autoplay_evidence,
+		"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence, "endgameEvidence": endgame_evidence, "wholeGameEvidence": whole_game_evidence, "autoplayEvidence": autoplay_evidence, "restartEvidence": restart_evidence, "performanceEvidence": performance_evidence,
 		"windowSizes": window_sizes_checked,
 		"inputMethod": "viewport-window-mouse-motion-press-release + keyboard (Input.parse_input_event)",
 		"screenshots": screenshots,
@@ -4389,7 +4427,7 @@ func _fail(message: String) -> void:
 			"renderBackend": DisplayServer.get_name(), "windowSizesChecked": window_sizes_checked,
 			"victorySteps": victory_steps, "victoryEvidence": victory_evidence,
 		"navalSteps": naval_steps, "embarkationSteps": embarkation_steps, "navalEvidence": naval_evidence,
-			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence, "endgameEvidence": endgame_evidence, "wholeGameEvidence": whole_game_evidence, "autoplayEvidence": autoplay_evidence,
+			"unitcitySteps": unitcity_steps, "unitcityEvidence": unitcity_evidence, "lifecycleEvidence": lifecycle_evidence, "informationEvidence": information_evidence, "unitOrdersEvidence": unit_orders_evidence, "unitAbilitiesEvidence": unit_abilities_evidence, "airEvidence": air_evidence, "paradropEvidence": paradrop_evidence, "nukeEvidence": nuke_evidence, "presentationEvidence": presentation_evidence, "endgameEvidence": endgame_evidence, "wholeGameEvidence": whole_game_evidence, "autoplayEvidence": autoplay_evidence, "performanceEvidence": performance_evidence,
 			"steps": steps, "checklist": checklist, "screenshots": screenshots,
 			"inputTrace": input_trace, "economySteps": economy_steps, "diplomacySteps": diplomacy_steps,
 			"religionSteps": religion_steps, "greatPersonSteps": great_person_steps,
@@ -4417,6 +4455,7 @@ func verify_endgame_flow() -> bool:
 	endgame_evidence = endgame_checks.endgame_evidence
 	whole_game_evidence = endgame_checks.whole_game_evidence
 	autoplay_evidence = endgame_checks.autoplay_evidence
+	performance_evidence = endgame_checks.performance_evidence
 	return await endgame_checks.run(self)
 
 # —— 发展流程（dev6，plan line 55-68）：全部经视口输入分发鼠标事件驱动真实控件 ——

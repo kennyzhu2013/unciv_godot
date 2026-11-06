@@ -6,8 +6,10 @@
     [switch]$SkipBuild,
     [switch]$Smoke,
     [switch]$Headless,
-    [ValidateRange(1, 3600)]
-    [int]$SmokeTimeoutSeconds = 1200
+    [ValidateSet('', 'save', 'continue')]
+    [string]$RestartProof = '',
+    [ValidateRange(1, 7200)]
+    [int]$SmokeTimeoutSeconds = 5400
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'tools\common.ps1')
@@ -48,6 +50,8 @@ try {
     }
     $JavaHome = Resolve-JavaHome -Explicit $JavaHome
     if ($Headless -and -not $Smoke) { throw '-Headless requires -Smoke.' }
+    # t10 重启取证：单阶段分发（save／continue）只在 Smoke 下有意义，由外部编排两次调用完成“退出→重启”。
+    if ($RestartProof -and -not $Smoke) { throw '-RestartProof requires -Smoke.' }
     $env:JAVA_HOME = $JavaHome
     if ($Smoke) {
         $context.godotVersion = (& $Godot --version | Out-String).Trim()
@@ -116,7 +120,11 @@ try {
     $godotArgs = @('--path', "`"$PSScriptRoot`"")
     if ($Headless) { $godotArgs += '--headless' }
     # Smoke 保留退出资源诊断，便于定位 ObjectDB 泄漏；不影响双端 stderr 零字节门禁。
-    if ($Smoke) { $godotArgs += @('--verbose', '--', '--smoke') }
+    if ($Smoke) {
+        $godotArgs += @('--verbose', '--', '--smoke')
+        # t10：--restart-proof 须落在 '--' 之后成为 user arg，供 smoke.gd 单阶段分发读取。
+        if ($RestartProof) { $godotArgs += '--restart-proof=' + $RestartProof }
+    }
     $frontendStarted = Get-Date
     $frontend = Start-Process -FilePath $Godot -ArgumentList $godotArgs -PassThru `
         -RedirectStandardOutput "$local\godot.log" -RedirectStandardError "$local\godot-error.log"

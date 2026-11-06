@@ -18,6 +18,10 @@ var endgame_steps := 0
 var endgame_evidence: Array[Dictionary] = []
 var whole_game_evidence: Array[Dictionary] = []
 var autoplay_evidence: Array[Dictionary] = []
+# t10 OS 进程退出重启续玩取证：跨两个独立进程生命周期（save／continue）传递的证据。
+var restart_evidence: Array[Dictionary] = []
+# t11 中后期性能取证：真实窗口各地图尺寸中后期回合的耗时／快照／内存／界面可响应性。
+var performance_evidence: Array[Dictionary] = []
 
 const PROFILES = [
 	{"name": "land-conquest", "mapSize": "Tiny", "turns": 10},
@@ -25,6 +29,21 @@ const PROFILES = [
 	{"name": "naval", "mapSize": "Small", "turns": 10},
 	{"name": "medium-baseline", "mapSize": "Medium", "turns": 5},
 ]
+
+# t11 中后期性能取证：各地图尺寸真实 autoplay 推进到的目标回合（须尚未结算，且城市／单位／快照已明显增长），
+# 以及同尺寸内核 whole-game 固定种子长局报告（提供不含 UI 的纯内核回合均值，补齐"非纯内核回合延迟"缺口）。
+const PERF_PROFILES = [
+	{"name": "perf-tiny", "mapSize": "Tiny", "aiPlayers": 1, "seed": "860505", "targetTurn": 40,
+		"kernelReport": "land-conquest"},
+	{"name": "perf-small", "mapSize": "Small", "aiPlayers": 2, "seed": "860506", "targetTurn": 35,
+		"kernelReport": "science"},
+	{"name": "perf-medium", "mapSize": "Medium", "aiPlayers": 3, "seed": "860507", "targetTurn": 25,
+		"kernelReport": "medium-baseline"},
+]
+
+# t10 重启取证：phase A 打到中局的回合数（必须尚未结算），以及跨进程交接证据文件（磁盘持久，两进程共享）。
+const RESTART_TURNS := 24
+const RESTART_EVIDENCE := "res://.local/restart-proof.json"
 
 func unit_snapshot(id: int) -> Dictionary:
 	for unit in app.client.snapshot.units:
@@ -580,14 +599,32 @@ func verify_whole_game() -> bool:
 
 # ---- 8B 整局：真实窗口新游戏 → 逐回合（HTTP autoplay 指挥 + 真实点击结束回合）→ 原生胜负结算两尺寸 ----
 #
-# 决策驱动复用内核 AutoplayGameTest 已验证的 main-source AutoplayDriver（经网关 autoplay 动词，仅 UNCIV_SMOKE
-# 门控下存在）：每回合由 autoplay 处置全部待决并指挥单位／战争，窗口真实点击「结束回合」推进 AI；到达原生
-# 胜负结算即停手，复用 verify_result_sizes／continue_victory 取两尺寸胜负面板证据。不注入胜利、不改原生胜利
+# 决策驱动复用内核 AutoplayGameTest／AutoplayRouteTest 已验证的 main-source AutoplayDriver（经网关 autoplay 动词，
+# 仅 UNCIV_SMOKE 门控下存在，route 参数随请求透传）：每回合由 autoplay 处置全部待决并指挥单位／战争，窗口真实
+# 点击「结束回合」推进 AI；到达原生胜负结算即停手，复用 verify_result_sizes／continue_victory 取两尺寸胜负面板
+# 证据。三条路线（land 征服／science 科学／naval 海洋）场景与内核已锁定路线完全同源。不注入胜利、不改原生胜利
 # 条件、不清空有效待决；玩家胜负非确定（core AI 无种子 shuffle），按到达的真实原生结局如实取证。
 func verify_new_game_to_settlement() -> bool:
+	for route in ["land", "science", "naval"]:
+		if not await verify_route_to_settlement(route):
+			return false
+	return true
+
+func verify_route_to_settlement(route: String) -> bool:
 	var panel = app.game_setup
 	var setup := {"nation": "Rome", "difficulty": "Chieftain", "speed": "Standard", "mapSize": "Tiny",
 		"mapType": "Pangaea", "aiPlayers": 1, "cityStates": 0, "barbarians": false, "ruins": false, "seed": "860505"}
+	var limit := 450
+	if route == "science":
+		setup = {"nation": "Babylon", "difficulty": "Chieftain", "speed": "Quick", "mapSize": "Small",
+			"mapType": "Archipelago", "aiPlayers": 1, "cityStates": 0, "barbarians": false, "ruins": false, "seed": "860606"}
+		limit = 560
+	elif route == "naval":
+		setup = {"nation": "England", "difficulty": "Chieftain", "speed": "Quick", "mapSize": "Small",
+			"mapType": "Archipelago", "aiPlayers": 1, "cityStates": 0, "barbarians": false, "ruins": false, "seed": "860707"}
+		limit = 560
+	var prefix := "autoplay-" + route
+	var label := "autoplay-" + route + "-settlement"
 	# 真实点击「新游戏」：内部查询 newGameOptions 填充候选与默认值并弹出配置窗口。
 	if not await smoke.click_control(panel.new_button):
 		return false
@@ -612,21 +649,24 @@ func verify_new_game_to_settlement() -> bool:
 			and int(app.client.snapshot.turn) == 0, "整局：真实窗口创建新游戏且仅提交一次"):
 		return false
 	var game_id: String = app.current_game
-	await smoke.screenshot("smoke-endgame-autoplay-land-newgame.png")
+	await smoke.screenshot("smoke-endgame-" + prefix + "-newgame.png")
 
-	var limit := 450
 	var played := 0
 	var cumulative_actions := 0
 	var ever_war := false
 	var max_cities := 0
 	var max_techs := 0
+	var max_science_built := 0
+	var max_water_improvements := 0
+	var max_naval_units := 0
+	var max_embarked := 0
 	var checkpoints: Array[Dictionary] = []
 	var started := Time.get_ticks_msec()
 	while true:
 		if app._victory_pending():
 			break
-		var result: Dictionary = await app.execute("autoplay", {})
-		if not smoke.check(result.get("ok", false), "整局：autoplay 命令成功：" + str(result.get("error"))):
+		var result: Dictionary = await app.execute("autoplay", {"route": route})
+		if not smoke.check(result.get("ok", false), "整局(" + route + ")：autoplay 命令成功：" + str(result.get("error"))):
 			return false
 		await smoke.settle()
 		var summary: Dictionary = result.get("autoplay", {})
@@ -634,6 +674,10 @@ func verify_new_game_to_settlement() -> bool:
 		ever_war = ever_war or bool(summary.get("warStarted", false))
 		max_cities = maxi(max_cities, int(summary.get("cities", 0)))
 		max_techs = maxi(max_techs, int(summary.get("technologies", 0)))
+		max_science_built = maxi(max_science_built, int(summary.get("scienceBuildingsBuilt", 0)))
+		max_water_improvements = maxi(max_water_improvements, int(summary.get("waterImprovements", 0)))
+		max_naval_units = maxi(max_naval_units, int(summary.get("navalUnits", 0)))
+		max_embarked = maxi(max_embarked, int(summary.get("embarkedUnits", 0)))
 		if played % 40 == 0:
 			checkpoints.append({"turn": int(summary.get("turn", -1)), "cities": int(summary.get("cities", 0)),
 				"units": int(summary.get("units", 0)), "technologies": int(summary.get("technologies", 0)),
@@ -643,36 +687,362 @@ func verify_new_game_to_settlement() -> bool:
 		var turn_before: int = app.client.snapshot.turn
 		if not await smoke.click_control(app.turn_button):
 			return false
-		if not smoke.check(app.client.snapshot.turn == turn_before + 1, "整局：真实点击推进 AI 回合"):
+		if not smoke.check(app.client.snapshot.turn == turn_before + 1, "整局(" + route + ")：真实点击推进 AI 回合"):
 			return false
 		played += 1
 		if played >= limit:
-			return smoke.check(false, "整局：autoplay 回合数超限 " + str(limit))
+			return smoke.check(false, "整局(" + route + ")：autoplay 回合数超限 " + str(limit))
 	var elapsed := Time.get_ticks_msec() - started
 
 	var settlement: Dictionary = app.client.snapshot.get("victory", {})
-	if not smoke.check(bool(settlement.get("requiresAcknowledgement", false)), "整局：到达原生胜负结算并待确认"):
+	if not smoke.check(bool(settlement.get("requiresAcknowledgement", false)), "整局(" + route + ")：到达原生胜负结算并待确认"):
 		return false
 	var outcome := str(settlement.get("outcome", ""))
 	var recorded: Dictionary = settlement.get("recorded") if settlement.get("recorded") is Dictionary else {}
-	await smoke.screenshot("smoke-endgame-autoplay-land-settlement.png")
+	await smoke.screenshot("smoke-endgame-" + label + ".png")
 	# 两尺寸原生胜负面板 + 真实「继续游戏」写入一次（复用终局专项已验证路径）。
-	if not await verify_result_sizes("autoplay-land"):
+	if not await verify_result_sizes(prefix):
 		return false
 	if not await continue_victory():
 		return false
+	# 路线专属真实行为证据（与内核 AutoplayRouteTest 验收同口径）：科学=科技峰值＋建成科学建筑峰值；
+	# 海洋=海上改良峰值＋海军单位峰值＋登船峰值。结算类型只接受原生四胜利之一，不如实标注即失败。
+	var types := ["Scientific", "Domination", "Cultural", "Time"]
+	var victory_type := str(recorded.get("type", ""))
+	if not smoke.check(victory_type in types, "整局(" + route + ")：结算类型应为原生胜负之一，实际 " + victory_type):
+		return false
+	if route == "science":
+		if not smoke.check(max_techs >= 35 and max_science_built >= 2,
+				"整局(science)：真实科学发展证据（科技峰值 " + str(max_techs) + "，建成科学建筑峰值 " + str(max_science_built) + "）"):
+			return false
+	if route == "naval":
+		if not smoke.check(max_water_improvements >= 1 and max_naval_units >= 1 and max_embarked >= 1,
+				"整局(naval)：真实海上作业证据（海上改良峰值 " + str(max_water_improvements) + "，海军峰值 "
+				+ str(max_naval_units) + "，登船峰值 " + str(max_embarked) + "）"):
+			return false
 	autoplay_evidence.append({
-		"route": "land-domination", "gameId": game_id, "setup": setup, "outcome": outcome,
-		"victoryType": str(recorded.get("type", "")), "winningCiv": str(recorded.get("name", "")),
+		"route": route, "gameId": game_id, "setup": setup, "outcome": outcome,
+		"victoryType": victory_type, "winningCiv": str(recorded.get("name", "")),
 		"playerWon": outcome == "won", "turns": int(app.client.snapshot.turn), "turnsClicked": played,
 		"oneMoreTurnMode": bool(app.client.snapshot.get("victory", {}).get("oneMoreTurnMode", false)),
 		"cumulativeActions": cumulative_actions, "everWar": ever_war,
 		"maxCities": max_cities, "maxTechnologies": max_techs, "elapsedMillis": elapsed,
+		"maxScienceBuildingsBuilt": max_science_built, "maxWaterImprovements": max_water_improvements,
+		"maxNavalUnits": max_naval_units, "maxEmbarkedUnits": max_embarked,
 		"checkpoints": checkpoints,
 		"staticMemory": int(Performance.get_monitor(Performance.MEMORY_STATIC)),
 		"peakStaticMemory": int(OS.get_static_memory_peak_usage()),
-		"windowSizes": smoke.window_sizes_checked.filter(func(s): return str(s).begins_with("endgame-autoplay-land")),
+		"windowSizes": smoke.window_sizes_checked.filter(func(s): return str(s).begins_with("endgame-" + prefix)),
 	})
+	prints("整局取证：路线", route, "结局", outcome, "类型", victory_type, "回合", int(app.client.snapshot.turn),
+		"真实点击", played, "动作", cumulative_actions, "科技峰值", max_techs, "科学建筑峰值", max_science_built,
+		"海上改良峰值", max_water_improvements, "海军峰值", max_naval_units, "登船峰值", max_embarked,
+		"耗时ms", elapsed)
+	return true
+
+# ---- t10：OS 进程退出重启续玩取证 ----
+#
+# 前端进程无法自杀重启，故「退出→重启」由运行器编排为两次独立的 run.ps1 调用：run.ps1 的 finally 会
+# Stop-Process 前端与内核，两次调用之间前后端进程真实退出。跨阶段状态只经磁盘传递——phase A（save）
+# 打到中局后把副本存到 godot/.local/saves/restart-proof.json，并把 gameId／回合／城市／单位／金币／存档
+# 路径／本进程 PID 写入证据文件 res://.local/restart-proof.json；phase B（continue）是全新进程、全新内核
+# （session.game 为 null，内存中没有任何对局），只能读证据文件并 load 磁盘存档恢复同一对局，再续玩到原生
+# 结算。内核 AutoplayDriver 在 gameId 变化时清空跨回合记忆、并每回合从快照重新推导敌军城市与战争状态
+# （见 playTurn/act/tryDeclareWar），故进程重启后读档能无缝续打征服路线。不注入胜利、不改原生胜利条件、
+# 不清空有效待决；玩家胜负非确定（core AI 无种子 shuffle），按到达的真实原生结局如实取证。
+func _restart_evidence_path() -> String:
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("res://.local"))
+	return ProjectSettings.globalize_path(RESTART_EVIDENCE)
+
+# phase A：真实窗口新游戏 → 逐回合（HTTP autoplay 指挥 + 真实点击结束回合）推进到中局 → 真实保存副本 →
+# 写跨进程证据文件。本进程随后由运行器终止；不在内存中延续到 phase B。
+func verify_restart_save() -> bool:
+	var panel = app.game_setup
+	var setup := {"nation": "Rome", "difficulty": "Chieftain", "speed": "Standard", "mapSize": "Tiny",
+		"mapType": "Pangaea", "aiPlayers": 1, "cityStates": 0, "barbarians": false, "ruins": false, "seed": "860505"}
+	if not await smoke.click_control(panel.new_button):
+		return false
+	if not smoke.check(panel.setup_dialog.visible and panel.options_loaded, "重启取证：新游戏配置窗口已打开并加载候选"):
+		return false
+	for key in ["nation", "difficulty", "speed", "mapSize", "mapType"]:
+		if not select_setup_option(panel.fields[key], str(setup[key])):
+			return false
+	panel.fields.aiPlayers.value = int(setup.aiPlayers)
+	panel.fields.cityStates.value = int(setup.cityStates)
+	panel.fields.seed.text = str(setup.seed)
+	panel.fields.barbarians.button_pressed = bool(setup.barbarians)
+	panel.fields.ruins.button_pressed = bool(setup.ruins)
+	var revision: int = app.client.revision
+	if not await click_window(panel.start_button):
+		return false
+	if panel.confirmation.visible:
+		if not await click_dialog(panel.confirmation, true, true):
+			return false
+	if not smoke.check(app.client.revision == revision + 1 and app.client.snapshot.nation == str(setup.nation)
+			and int(app.client.snapshot.turn) == 0, "重启取证：真实窗口创建新游戏且仅提交一次"):
+		return false
+	var game_id: String = app.current_game
+	# 打到中局：RESTART_TURNS 回合内必须始终未出现原生结算，才能证明 phase B 是「续玩」而非「重开已完成局」。
+	for i in range(RESTART_TURNS):
+		if app._victory_pending():
+			return smoke.check(false, "重启取证：中局回合内过早到达原生结算，无法证明续玩")
+		var result: Dictionary = await app.execute("autoplay", {})
+		if not smoke.check(result.get("ok", false), "重启取证：autoplay 命令成功：" + str(result.get("error"))):
+			return false
+		await smoke.settle()
+		if bool(result.get("autoplay", {}).get("victoryReached", false)) or app._victory_pending():
+			return smoke.check(false, "重启取证：中局回合内过早到达原生结算，无法证明续玩")
+		var turn_before: int = app.client.snapshot.turn
+		if not await smoke.click_control(app.turn_button):
+			return false
+		if not smoke.check(app.client.snapshot.turn == turn_before + 1, "重启取证：真实点击推进 AI 回合"):
+			return false
+	if not smoke.check(int(app.client.snapshot.turn) == RESTART_TURNS, "重启取证：已推进到中局第 " + str(RESTART_TURNS) + " 回合"):
+		return false
+	# 真实保存副本：固定名 restart-proof → godot/.local/saves/restart-proof.json（路径不含 runId，跨进程稳定）。
+	if not await smoke.perform("save", {"name": "restart-proof"}):
+		return false
+	var save_path: String = app.last_saved_path
+	if not smoke.check(not save_path.is_empty() and FileAccess.file_exists(save_path), "重启取证：中局副本已真实落盘：" + save_path):
+		return false
+	var snapshot: Dictionary = app.client.snapshot
+	var cities: int = snapshot.get("cities", []).size()
+	var units: int = snapshot.get("units", []).size()
+	var gold: int = int(snapshot.get("gold", 0))
+	var save_pid: int = OS.get_process_id()
+	var saved_at := Time.get_datetime_string_from_system(true)
+	# 跨进程交接：只把磁盘存档路径与关键状态写入证据文件；phase B 全新进程读此文件后 load 续玩。
+	var evidence_path := _restart_evidence_path()
+	var record := {"gameId": game_id, "turn": int(snapshot.turn), "savePath": save_path, "cities": cities,
+		"units": units, "gold": gold, "setup": setup, "savePid": save_pid, "savedAt": saved_at}
+	var file := FileAccess.open(evidence_path, FileAccess.WRITE)
+	if not smoke.check(file != null, "重启取证：跨进程证据文件可写：" + evidence_path):
+		return false
+	file.store_string(JSON.stringify(record, "\t"))
+	file.close()
+	await smoke.screenshot("smoke-restart-save.png")
+	restart_evidence.append({"phase": "save", "gameId": game_id, "turn": int(snapshot.turn), "savePath": save_path,
+		"cities": cities, "units": units, "gold": gold, "savePid": save_pid, "evidencePath": evidence_path,
+		"savedAt": saved_at, "staticMemory": int(Performance.get_monitor(Performance.MEMORY_STATIC))})
+	smoke.steps.append("t10 重启取证 phase A：真实窗口新游戏→逐回合 autoplay＋真实点击推进到中局第 %d 回合→保存副本 %s 并写跨进程证据文件；本进程随后由运行器终止（PID %d）" % [RESTART_TURNS, save_path, save_pid])
+	return true
+
+# phase B：全新进程、全新内核（内存无任何对局）→ 读证据文件 → load 磁盘存档恢复同一对局并逐字段核对 →
+# 从中局续玩（autoplay 指挥 + 真实点击结束回合）到原生结算 → 两尺寸胜负面板并继续。
+func verify_restart_continue() -> bool:
+	var evidence_path := _restart_evidence_path()
+	if not smoke.check(FileAccess.file_exists(evidence_path), "重启取证：跨进程证据文件存在：" + evidence_path):
+		return false
+	var parsed = JSON.parse_string(FileAccess.get_file_as_string(evidence_path))
+	var record: Dictionary = parsed if parsed is Dictionary else {}
+	if not smoke.check(not record.is_empty(), "重启取证：跨进程证据文件可解析"):
+		return false
+	var save_path := str(record.get("savePath", ""))
+	if not smoke.check(not save_path.is_empty() and FileAccess.file_exists(save_path), "重启取证：phase A 磁盘副本仍在：" + save_path):
+		return false
+	# 全新进程起始内存无对局；PID 必与 phase A 不同——直接证明前端经历了真实 OS 进程退出重启。
+	if not smoke.check(app.current_game.is_empty(), "重启取证：phase B 起始内存无 phase A 对局（全新进程）"):
+		return false
+	if not smoke.check(int(record.get("savePid", -1)) != OS.get_process_id(), "重启取证：phase B 前端进程 PID 与 phase A 不同"):
+		return false
+	if not await smoke.perform("load", {"path": save_path}):
+		return false
+	var snapshot: Dictionary = app.client.snapshot
+	if not smoke.check(str(snapshot.get("gameId", "")) == str(record.get("gameId", "")), "重启取证：跨进程恢复同一对局 gameId"):
+		return false
+	if not smoke.check(int(snapshot.get("turn", -1)) == int(record.get("turn", -2)), "重启取证：跨进程恢复回合一致"):
+		return false
+	if not smoke.check(snapshot.get("cities", []).size() == int(record.get("cities", -1)), "重启取证：跨进程恢复城市数一致"):
+		return false
+	if not smoke.check(snapshot.get("units", []).size() == int(record.get("units", -1)), "重启取证：跨进程恢复单位数一致"):
+		return false
+	if not smoke.check(int(snapshot.get("gold", -1)) == int(record.get("gold", -2)), "重启取证：跨进程恢复金币一致"):
+		return false
+	if not smoke.check(snapshot.get("tiles", []).size() > 0 and snapshot.get("cities", []).size() > 0, "重启取证：读档后地图与城市可渲染"):
+		return false
+	await smoke.screenshot("smoke-restart-loaded.png")
+	var resumed_turn: int = int(snapshot.turn)
+	# 从中局续玩到原生结算：与 verify_new_game_to_settlement 同法（autoplay 指挥 + 真实点击结束回合推进 AI）。
+	var limit := 450
+	var played := 0
+	var cumulative_actions := 0
+	var ever_war := false
+	var max_cities := 0
+	var max_techs := 0
+	var started := Time.get_ticks_msec()
+	while true:
+		if app._victory_pending():
+			break
+		var result: Dictionary = await app.execute("autoplay", {})
+		if not smoke.check(result.get("ok", false), "重启取证：续玩 autoplay 命令成功：" + str(result.get("error"))):
+			return false
+		await smoke.settle()
+		var summary: Dictionary = result.get("autoplay", {})
+		cumulative_actions += int(summary.get("actionsIssued", 0))
+		ever_war = ever_war or bool(summary.get("warStarted", false))
+		max_cities = maxi(max_cities, int(summary.get("cities", 0)))
+		max_techs = maxi(max_techs, int(summary.get("technologies", 0)))
+		if bool(summary.get("victoryReached", false)) or app._victory_pending():
+			break
+		var turn_before: int = app.client.snapshot.turn
+		if not await smoke.click_control(app.turn_button):
+			return false
+		if not smoke.check(app.client.snapshot.turn == turn_before + 1, "重启取证：续玩真实点击推进 AI 回合"):
+			return false
+		played += 1
+		if played >= limit:
+			return smoke.check(false, "重启取证：续玩回合数超限 " + str(limit))
+	var elapsed := Time.get_ticks_msec() - started
+	var settlement: Dictionary = app.client.snapshot.get("victory", {})
+	if not smoke.check(bool(settlement.get("requiresAcknowledgement", false)), "重启取证：续玩到达原生胜负结算并待确认"):
+		return false
+	var outcome := str(settlement.get("outcome", ""))
+	var recorded: Dictionary = settlement.get("recorded") if settlement.get("recorded") is Dictionary else {}
+	await smoke.screenshot("smoke-restart-settlement.png")
+	# 两尺寸原生胜负面板 + 真实「继续游戏」写入一次（复用终局专项已验证路径）。
+	if not await verify_result_sizes("restart-land"):
+		return false
+	if not await continue_victory():
+		return false
+	restart_evidence.append({
+		"phase": "continue", "gameId": str(record.get("gameId", "")), "resumedTurn": resumed_turn,
+		"setup": record.get("setup", {}), "outcome": outcome,
+		"victoryType": str(recorded.get("type", "")), "winningCiv": str(recorded.get("name", "")),
+		"playerWon": outcome == "won", "turns": int(app.client.snapshot.turn), "turnsClicked": played,
+		"oneMoreTurnMode": bool(app.client.snapshot.get("victory", {}).get("oneMoreTurnMode", false)),
+		"cumulativeActions": cumulative_actions, "everWar": ever_war, "maxCities": max_cities,
+		"maxTechnologies": max_techs, "elapsedMillis": elapsed, "savePath": save_path, "evidencePath": evidence_path,
+		"savePid": int(record.get("savePid", -1)), "continuePid": OS.get_process_id(),
+		"staticMemory": int(Performance.get_monitor(Performance.MEMORY_STATIC)),
+		"peakStaticMemory": int(OS.get_static_memory_peak_usage()),
+		"windowSizes": smoke.window_sizes_checked.filter(func(s): return str(s).begins_with("endgame-restart-land")),
+	})
+	smoke.steps.append("t10 重启取证 phase B：全新进程（PID %d≠phase A %d）读磁盘副本恢复同一对局（gameId/回合/城市/单位/金币一致）→从中局第 %d 回合续玩到原生结算（%s）→两尺寸胜负面板并继续" % [OS.get_process_id(), int(record.get("savePid", -1)), resumed_turn, outcome])
+	return true
+
+# ---- t11：中后期性能取证（真实窗口 Tiny／Small／Medium autoplay 到中后期回合） ----
+#
+# 目标不是设定性能硬阈值（性能大改另立任务，不混入规则接入），而是取证：中后期快照与 AI 回合不会让界面
+# 失去响应。每个地图尺寸真实 newGame（Rome／Chieftain／Standard／Pangaea／对应 AI 数／无野蛮人无遗迹），
+# 逐回合 HTTP autoplay 指挥＋真实点击「结束回合」推进到目标回合（各尺寸的中后期，尚未结算）。在目标回合：
+# 计时真实 AI 回合端到端耗时（内核 AI＋HTTP＋快照应用＋面板刷新，用户可感），只读快照 HTTP 往返（内核序列化
+# ＋传输），真实切换页签验证界面及时响应且状态确实改变，并用 Engine.get_frames_drawn() 增量证明 AI 回合等待
+# 期间渲染循环未冻结（HTTP 走线程）；记录快照字节与窗口静态内存／峰值。另从同尺寸内核 whole-game 固定种子
+# 报告取纯内核回合均值（elapsedMillis／turns，不含 UI）与堆用量，补齐"turnAverageMillis 非纯内核回合延迟"缺口。
+func verify_performance_forensics() -> bool:
+	for profile in PERF_PROFILES:
+		var name := str(profile.name)
+		var target := int(profile.targetTurn)
+		var panel = app.game_setup
+		var setup := {"nation": "Rome", "difficulty": "Chieftain", "speed": "Standard",
+			"mapSize": str(profile.mapSize), "mapType": "Pangaea", "aiPlayers": int(profile.aiPlayers),
+			"cityStates": 0, "barbarians": false, "ruins": false, "seed": str(profile.seed)}
+		if not await smoke.click_control(panel.new_button):
+			return false
+		if not smoke.check(panel.setup_dialog.visible and panel.options_loaded, "性能取证：新游戏配置窗口已打开：" + name):
+			return false
+		for key in ["nation", "difficulty", "speed", "mapSize", "mapType"]:
+			if not select_setup_option(panel.fields[key], str(setup[key])):
+				return false
+		panel.fields.aiPlayers.value = int(setup.aiPlayers)
+		panel.fields.cityStates.value = int(setup.cityStates)
+		panel.fields.seed.text = str(setup.seed)
+		panel.fields.barbarians.button_pressed = bool(setup.barbarians)
+		panel.fields.ruins.button_pressed = bool(setup.ruins)
+		if not await click_window(panel.start_button):
+			return false
+		if panel.confirmation.visible:
+			if not await click_dialog(panel.confirmation, true, true):
+				return false
+		if not smoke.check(int(app.client.snapshot.turn) == 0, "性能取证：真实窗口创建新游戏：" + name):
+			return false
+		var limit := target + 90
+		var played := 0
+		var turn_times: Array[int] = []
+		var frames_per_turn: Array[int] = []
+		while int(app.client.snapshot.turn) < target:
+			if app._victory_pending():
+				break
+			var result: Dictionary = await app.execute("autoplay", {})
+			if not smoke.check(result.get("ok", false), "性能取证：autoplay 成功：" + name + " " + str(result.get("error"))):
+				return false
+			await smoke.settle()
+			var turn_before: int = app.client.snapshot.turn
+			var frames_before := Engine.get_frames_drawn()
+			var turn_started := Time.get_ticks_msec()
+			if not await smoke.click_control(app.turn_button):
+				return false
+			var turn_millis := Time.get_ticks_msec() - turn_started
+			var frames_delta := Engine.get_frames_drawn() - frames_before
+			if not smoke.check(int(app.client.snapshot.turn) == turn_before + 1, "性能取证：真实点击推进回合：" + name):
+				return false
+			played += 1
+			if turn_before >= int(target / 2):
+				turn_times.append(turn_millis)
+				frames_per_turn.append(frames_delta)
+			if played >= limit:
+				return smoke.check(false, "性能取证：回合推进超限 " + name)
+		var snapshot: Dictionary = app.client.snapshot
+		var snapshot_bytes := JSON.stringify(snapshot).length()
+		var cities: int = snapshot.get("cities", []).size()
+		var units: int = snapshot.get("units", []).size()
+		var tiles: int = snapshot.get("tiles", []).size()
+		var reached := int(snapshot.turn)
+		if not smoke.check(reached >= target and tiles > 0 and cities >= 1,
+				"性能取证：已推进到中后期且快照非空：" + name):
+			return false
+		var http_started := Time.get_ticks_msec()
+		var snap_result: Dictionary = await app.client.command("snapshot")
+		var snapshot_http_millis := Time.get_ticks_msec() - http_started
+		if not smoke.check(snap_result.get("ok", false), "性能取证：只读快照往返成功：" + name):
+			return false
+		# 界面可响应性：切到与当前不同的页签，须及时完成且 current_tab 确实改变。
+		var ui_target: int = app.TAB_MATTERS if app.tabs.current_tab != app.TAB_MATTERS else app.TAB_CITY
+		var ui_started := Time.get_ticks_msec()
+		if not await smoke.click_tab(app.tabs, ui_target):
+			return false
+		var ui_millis := Time.get_ticks_msec() - ui_started
+		if not smoke.check(app.tabs.current_tab == ui_target, "性能取证：中后期真实切换页签生效：" + name):
+			return false
+		if not smoke.check(ui_millis < 5000, "性能取证：中后期界面响应及时（%d ms）：%s" % [ui_millis, name]):
+			return false
+		var min_frames := 0
+		for f in frames_per_turn:
+			min_frames = f if min_frames == 0 else mini(min_frames, f)
+		# headless 无实际渲染，get_frames_drawn 可能不递增；仅图形模式下要求帧未冻结。
+		if DisplayServer.get_name() != "headless":
+			if not smoke.check(not frames_per_turn.is_empty() and min_frames >= 1,
+					"性能取证：中后期 AI 回合渲染循环未冻结：" + name):
+				return false
+		var turn_sum := 0
+		for t in turn_times:
+			turn_sum += t
+		var avg_turn := int(turn_sum / maxi(turn_times.size(), 1))
+		if not smoke.check(avg_turn < 30000, "性能取证：中后期 AI 回合端到端未卡死（均 %d ms）：%s" % [avg_turn, name]):
+			return false
+		var kernel: Dictionary = {}
+		var kpath := "res://.local/tests/whole-game/%s.json" % str(profile.kernelReport)
+		if FileAccess.file_exists(kpath):
+			var krep: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(kpath))
+			var kturns := int(krep.get("turns", 0))
+			kernel = {"report": str(profile.kernelReport), "turns": kturns,
+				"elapsedMillis": int(krep.get("elapsedMillis", 0)),
+				"turnAverageMillis": int(int(krep.get("elapsedMillis", 0)) / maxi(kturns, 1)),
+				"heapUsedBytes": int(krep.get("heapUsedBytes", 0))}
+		await smoke.screenshot("smoke-perf-" + name + ".png")
+		performance_evidence.append({
+			"mapSize": str(profile.mapSize), "profile": name, "targetTurn": target, "reachedTurn": reached,
+			"aiPlayers": int(profile.aiPlayers), "cities": cities, "units": units, "tiles": tiles,
+			"snapshotBytes": snapshot_bytes, "snapshotHttpMillis": snapshot_http_millis,
+			"turnEndToEndAvgMillis": avg_turn, "turnSamples": turn_times.size(),
+			"framesPerTurnMin": min_frames, "uiResponsiveMillis": ui_millis,
+			"staticMemory": int(Performance.get_monitor(Performance.MEMORY_STATIC)),
+			"peakStaticMemory": int(OS.get_static_memory_peak_usage()),
+			"kernelBaseline": kernel,
+		})
+		smoke.steps.append("t11 中后期性能取证 %s：真实 autoplay＋真实点击到第 %d 回合（城市 %d／单位 %d／地块 %d），快照 %d B、AI 回合端到端均 %d ms、只读快照往返 %d ms、页签响应 %d ms、渲染循环未冻结；内核 %s 报告纯内核回合均值 %s ms" % [
+			str(profile.mapSize), reached, cities, units, tiles, snapshot_bytes, avg_turn, snapshot_http_millis,
+			ui_millis, str(profile.kernelReport), str(kernel.get("turnAverageMillis", "?"))])
 	return true
 
 func run(harness) -> bool:
@@ -698,6 +1068,9 @@ func run(harness) -> bool:
 		return false
 	if not await verify_new_game_to_settlement():
 		return false
+	if not await verify_performance_forensics():
+		return false
 	smoke.steps.append("8A 终局专项：文化／时间胜负／灭亡／科学由真实面板与回合结算；三条固定种子路线中点续玩并同会话保存重载，记录 Tiny／Small／Medium 早期耗时与内存；尚非从新游戏到结算的完整长局或进程重启证据")
-	smoke.steps.append("8B 整局：真实窗口新游戏（Rome／Chieftain／Standard／Tiny／Pangaea／1AI／0CS／seed860505／无野蛮人无遗迹）→逐回合 HTTP autoplay 指挥＋真实点击「结束回合」推进 AI→原生胜负结算面板两尺寸并继续；局长／结局／累计动作／交战／城市／科技见 autoplayEvidence")
+	smoke.steps.append("8B 整局三路线：真实窗口按 land（Rome／Standard／Tiny／Pangaea／seed860505）、science（Babylon／Quick／Small／Archipelago／seed860606）、naval（England／Quick／Small／Archipelago／seed860707）逐局：newGame→逐回合 HTTP autoplay(route 透传) 指挥＋真实点击「结束回合」推进 AI→原生胜负结算面板两尺寸并继续；局长／结局／累计动作／交战／城市／科技／路线专属证据（科学建筑／海上改良／海军／登船峰值）见 autoplayEvidence")
+	smoke.steps.append("8B t11 中后期性能：真实窗口 Tiny／Small／Medium autoplay＋真实点击到中后期回合，取证 AI 回合端到端耗时／快照字节／只读快照往返／页签响应／渲染循环未冻结／内存，并附内核固定种子长局纯内核回合均值（见 performanceEvidence）")
 	return true

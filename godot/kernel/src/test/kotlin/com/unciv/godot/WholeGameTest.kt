@@ -282,8 +282,12 @@ class WholeGameTest {
             if (profile.warTurn != null && turn >= profile.warTurn) pursueWar()
             val units = snapshot["units"]!!.jsonArray.map { it.jsonObject }.filter { it.boolean("own") }
             // 三个以上陆军单位才向可见敌方城市推进；否则回防首都，避免长局因空城被 AI 直接占领。
-            val soldiers = units.count { it.text("domain") == "land" && !it.boolean("civilian") }
+            val soldiers = units.count { isLandSoldier(it) }
             val enemy = if (warStarted && soldiers >= 3) visibleEnemyCity(snapshot) else null
+            // 开战后首都至少留两名陆军回防：core AI 的无种子 shuffle 可能集中兵力反推，全军压上会让首都
+            // 真空而被灭亡（长局偶发 flake）。先把不足的两名守军调回首都，再放其余单位进攻。
+            var garrison = units.count { isLandSoldier(it) && home != null &&
+                it.integer("x") == home[0] && it.integer("y") == home[1] }
             purchase(cities)
             var founded = cities.size
             for (unit in units) {
@@ -297,9 +301,18 @@ class WholeGameTest {
                     continue
                 }
                 if (worker(unit, options) || attack(unit, options)) continue
-                move(unit, options, explored, home, enemy)
+                // 守军未满两人时把该在野陆军本回合目标改为回防首都（move 在 warStarted 且无进攻目标时向 home 收拢）。
+                val atHome = home != null && unit.integer("x") == home[0] && unit.integer("y") == home[1]
+                val target = if (warStarted && isLandSoldier(unit) && garrison < 2 && !atHome) {
+                    garrison++
+                    null
+                } else enemy
+                move(unit, options, explored, home, target)
             }
         }
+
+        private fun isLandSoldier(unit: JsonObject): Boolean =
+            unit.text("domain") == "land" && !unit.boolean("civilian")
 
         /** 当前格施工：进行中的工程不移动，完工后由下一回合重新评估。 */
         private fun worker(unit: JsonObject, options: JsonObject): Boolean {

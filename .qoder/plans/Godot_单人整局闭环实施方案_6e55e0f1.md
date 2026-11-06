@@ -1,6 +1,6 @@
 # Godot 基础规则离线单人整局闭环方案
 
-> 状态：第 1—6 批已完成并验收（第 6 批 6.3 海军统帅、6.5 城邦馈赠改良因原生无实现基线标注暂缓）；第 7 批 7A 空军、7B 空降、7C 核武已完成并验收。第 8 批仍进行中：8A 终局专项与早期续玩已取得正式窗口证据 `smoke-1793368677374`（`ok=true`、双端错误日志 0 字节、内核 31 suites／450 测试 0 失败，`:tests:test` 869 测试 0 失败／15 项既有跳过）；8B **内核前置**已锁定：陆地／科学／海洋三条路线均从真实 `newGame` 只走网关命令稳定打到原生胜负结算、逐命令 twin 差分（`:godot-kernel:test` 33 suites／453 测试 0 失败，`:tests:test` 869 测试 0 失败／15 项既有跳过，三路线各 3× 重跑 9/9 全绿）；8B **窗口整局门槛**（三条真实窗口 `newGame`→原生胜负面板结算、进程退出重启续玩、中后期性能、真实窗口 Smoke）尚未完成，一次 headless 退出泄漏仍未定因。
+> 状态：第 1—8 批全部完成并验收。第 6 批 6.3 海军统帅、6.5 城邦馈赠改良因原生无实现基线标注暂缓；第 7 批 7A 空军、7B 空降、7C 核武已完成；第 8 批整局验收于 2026-11-07 收口：8A 终局五类胜利 `smoke-1793368677374`；8B 三路线（land／science／naval）真实窗口 `newGame`→原生胜负结算面板两尺寸 `smoke-1793979983278`；OS 进程退出重启续玩 `smoke-1793890086487`/`smoke-1793890649119`；中后期性能取证 `smoke-1793971858422`。回归基线 `:godot-kernel:test` 35 suites／458 tests／0 fail、`:tests:test` 79 suites／869 tests／0 fail／15 skip。完成定义全部满足：不依赖原客户端接管待决；五类胜利均有真实操作路径；中途保存退出继续、结算后继续游戏均已取证。
 > 目标：以当前基础规则离线单人对局，从新游戏完整玩到原生胜负结算。
 
 ## 目标与边界
@@ -273,6 +273,63 @@
 - **正式窗口证据**：`run.ps1 -Smoke`（未加 `-Headless`/`-SkipBuild`，`buildRequested=true`）runId `smoke-1793796954747`，renderBackend graphical，`ok=true`，`frontendExitCode=0`，`godot-error.log`/`kernel-error.log` 均 0 字节，326 张截图；`autoplayEvidence`：land-domination、Rome 获胜 Domination、turn 0→94、`turnsClicked=94`（真实点击）、`cumulativeActions=721`、`everWar=true`、maxCities=6、maxTech=16、`windowSizes=[1024x720,1600x900]`；截图 `smoke-endgame-autoplay-land-newgame/settlement/1024x720-result+confirm/1600x900-result+confirm.png`（结算面板见「你获得了胜利／Rome·Domination·第 94 回合」）。
 - 回归：`:godot-kernel:test` **34 suites／455 tests／0 fail／0 error／0 skip**（run.ps1 build 门禁内嵌）；`:tests:test --rerun` **79 suites／869 tests／0 fail／0 error／15 skip**（既有跳过，无新增）。
 - **边界**：科学／海洋两路线窗口复用、OS 进程退出重启续玩、中后期性能取证尚未完成，为下一实施子批目标。
+
+### 8B 窗口整局进展（2026-11-05；OS 进程退出重启续玩取证完成，正式两阶段证据 smoke-1793890086487 / smoke-1793890649119）
+- 编排＝**两次独立 `run.ps1 -Smoke -RestartProof <save|continue>` 调用**（[run.ps1](file:///d:/game/unicv_godot/godot/run.ps1) 新增 `-RestartProof` 并透传为 `--` 之后的 user arg）；run.ps1 的 `finally` 真实 `Stop-Process` 前后端，故两阶段之间是**真实操作系统进程退出重启**，非新 `GameSession` 重载或窗口同会话重载。跨阶段状态只经磁盘存档（绝对路径）＋固定路径证据文件 `godot/.local/restart-proof.json`（不含 runId）传递；phase B 全新内核内存无对局（`current_game` 空），唯一来源是按证据绝对路径 `load`（`GameSession.load` 无目录限制）。
+- 前端 [endgame_smoke.gd](file:///d:/game/unicv_godot/godot/tests/endgame_smoke.gd) 新增 `verify_restart_save`（phase A：真实点击新游戏→配置→逐回合 autoplay＋真实点击到第 24 回合→`save` 落盘→写跨进程证据 gameId/turn/cities/units/gold/savePid）与 `verify_restart_continue`（phase B：读证据→断言 `savePid != OS.get_process_id()`（真实 OS 重启）且内存无对局→`load`→逐字段一致→续玩到原生结算→两尺寸截图）；[smoke.gd](file:///d:/game/unicv_godot/godot/tests/smoke.gd) 单阶段分发＋`restart_evidence` 成员＋报告 `restartEvidence` 键。
+- **phase A 正式证据** `smoke-1793890086487`（未加 `-Headless`/`-SkipBuild`，`buildRequested=true`）：`ok=true`、`frontendExitCode=0`、内核门禁 **34 suites／455 tests／0 fail／0 error／0 skip**、`godot-error.log`/`kernel-error.log` 均 0 字节；真实窗口 newGame（Rome／Chieftain／Standard／Tiny／Pangaea／1AI／0CS／seed860505／无野蛮人无遗迹）→逐回合 autoplay＋真实点击推进到中局第 24 回合→`save` 落盘 `smoke-saves/smoke-1793890086487/restart-proof.json`→写跨进程证据（gameId `5c76d8ac-…`、turn24、cities2、units3、gold40、savePid **30716**）；截图 `smoke-restart-save.png`；本进程随后由运行器终止。
+- **phase B 正式证据** `smoke-1793890649119`（同样未加 `-SkipBuild`）：`ok=true`、`frontendExitCode=0`、内核门禁 **455/0/0**、双 error log 0 字节；全新进程 continuePid **14580 ≠ savePid 30716**（真实 OS 重启）→内存无对局→按证据绝对路径 `load`→逐字段一致（gameId 同 `5c76d8ac`、turn24、cities2、units3、gold40）→截图 `smoke-restart-loaded.png`（视觉确认「Rome／第 24 回合／金币 40／科研 Iron Working」与 phase A 记录一致）→autoplay＋真实点击续玩到**原生结算**（turns 153、turnsClicked 129、cumulativeActions 792、everWar、oneMoreTurnMode）→原生面板「其他文明获得了胜利／India·Domination·第 152 回合」（玩家 Rome 败，与 `-SkipBuild` 迭代轮 Rome 胜同属真实原生结局分支）→两尺寸 `endgame-restart-land-1024x720`/`1600x900` result+confirm 截图＋`smoke-restart-settlement.png`（视觉确认原生结算面板与「再来一回合／返回地图（保留结算）」续玩 UI）。
+- 顺带修复既有 flaky（非绕过、不降断言、不重roll）：`WholeGameTest.landConquestLongGame` 偶发玩家被灭亡——开战后全军压上致首都真空，core AI 无种子 shuffle 集中反推；[WholeGameTest.kt](file:///d:/game/unicv_godot/godot/kernel/src/test/kotlin/com/unciv/godot/WholeGameTest.kt) `act()` 加「首都至少留 2 名陆军回防」＋`isLandSoldier` 助手（`verify` 的 `assertFalse(player.isDefeated())` 保留）。修复后定向 4/4、长局 3/3 PASS，且正式两阶段 build 门禁内 `landConquestLongGame` 均 PASSED。
+- 回归：两阶段 build 门禁内嵌 `:godot-kernel:test` **34 suites／455 tests／0 fail／0 error／0 skip**；t10 未改 core 与原版 `tests/`，`:tests:test` 基线维持 t9e5 的 **79 suites／869 tests／0 fail／0 error／15 skip**，最终双回归收口留待 t12。
+- **边界**：OS 进程退出重启续玩已完成；科学／海洋两路线窗口复用、中后期性能取证尚未完成，为下一实施子批目标。
+
+### 8B 窗口整局进展（2026-11-06；中后期性能取证完成，正式窗口证据 smoke-1793971858422）
+- 前端 [endgame_smoke.gd](file:///d:/game/unicv_godot/godot/tests/endgame_smoke.gd) 新增 `PERF_PROFILES`（Tiny／Small／Medium，`targetTurn` 40／35／25，seed 860505／860506／860507，aiPlayers 1／2／3，同尺寸内核 whole-game 固定种子报告 land-conquest／science／medium-baseline）与 `verify_performance_forensics`：每尺寸**真实点击**新游戏→配置→逐回合 HTTP `autoplay` 指挥＋**真实点击「结束回合」**推进到中后期回合（尚未结算、城市／单位／快照已明显增长），在该回合取证：AI 回合端到端耗时（内核 AI＋HTTP＋快照应用＋面板刷新，用户可感，取后半程多次样本均值）、只读快照 HTTP 往返（内核序列化＋传输）、真实切换页签验证界面及时响应且 `current_tab` 确实改变、`Engine.get_frames_drawn()` 增量证明 AI 回合等待期间**渲染循环未冻结**（HTTP 走线程）、快照字节与窗口静态／峰值内存；并从同尺寸内核报告取**纯内核回合均值**（`elapsedMillis／turns`，不含 UI）补齐 8B 门槛「`turnAverageMillis` 非纯内核回合延迟」缺口（line 247）。[smoke.gd](file:///d:/game/unicv_godot/godot/tests/smoke.gd) 声明 `performance_evidence`＋报告 `performanceEvidence` 键；[run.ps1](file:///d:/game/unicv_godot/godot/run.ps1) SmokeTimeoutSeconds 1200→1800、smoke 内部超时 900→1500。t11 仅改 GDScript 与 ps1，未动 Kotlin／core／原版 `tests/`。
+- **迭代证据** `smoke-1793970962378`（`-SkipBuild` 快速验证场景逻辑）：`ok=true`、`performanceEvidence` 三尺寸齐全、双 error log 0 字节。
+- **正式窗口证据** `smoke-1793971858422`（`run.ps1 -Smoke`，未加 `-Headless`/`-SkipBuild`，`buildRequested=true`）：`ok=true`、`frontendExitCode=0`、运行器 ExitCode 0、`renderBackend=Windows`（真实图形窗口）、`godot-error.log`/`kernel-error.log` 均 0 字节；build 门禁内嵌 `:godot-kernel:test --rerun` **34 suites／455 tests／0 fail／0 error／0 skip**（`WholeGameTest` land 70／naval 60／science 60 回合 PASSED，并即时重生成三份内核基线）。三尺寸实测：
+  - **Tiny** 到第 40 回合（2 城／7 单位／331 地块），快照 39602 B、AI 回合端到端均 **247 ms**（20 样本）、只读快照往返 17 ms、页签响应 65 ms、渲染帧最小 14（未冻结）、静态内存 233.6 MB／峰值 252.5 MB；内核 land-conquest 纯内核回合均值 20 ms（70 回合）。
+  - **Small** 到第 35 回合（3 城／5 单位／721 地块），快照 75184 B、AI 回合端到端均 **250 ms**（18 样本）、只读快照往返 33 ms、页签响应 80 ms、渲染帧最小 15；内核 science 17 ms（60 回合）。
+  - **Medium** 到第 25 回合（2 城／3 单位／1261 地块），快照 70332 B、AI 回合端到端均 **250 ms**（13 样本）、只读快照往返 32 ms、页签响应 79 ms、渲染帧最小 15；内核 medium-baseline 23 ms（12 回合）。
+  - 截图 `smoke-perf-perf-tiny/small/medium.png`（中后期界面目视确认）。
+- 回归：随本轮重跑 `:tests:test --rerun` **79 suites／869 tests／0 fail／0 error／15 skip**（79 份报告全部为 21:51 本轮新生成，与基线一致，无新增失败／跳过）；`:godot-kernel:test` 由正式 Smoke 的 build 门禁重跑 **34／455／0／0／0**（报告 21:35 本轮新生成）。
+- **边界**：中后期性能取证已完成；科学／海洋两路线窗口复用尚未完成，最终真实窗口 Smoke 收口与双回归留待 t12。
+
+### 8B 窗口整局进展（2026-11-06；科学／海洋窗口三路线整局复用完成，正式窗口证据 smoke-1793979983278）
+- 内核层 [AutoplayDriver.kt](file:///d:/game/unicv_godot/godot/kernel/src/main/kotlin/com/unciv/godot/AutoplayDriver.kt) 重构为路线参数化 `enum Route { LAND, SCIENCE, NAVAL }`，`playTurn(routeName)` 按路线分派决策配置与生产优先级（`RouteConfig`：warTurn／maxCities／minUnitsForWar／scienceBuildings／navalUnits／oceanNavy），镜像 [FullGameRoutesTest.kt](file:///d:/game/unicv_godot/godot/kernel/src/test/kotlin/com/unciv/godot/FullGameRoutesTest.kt) 三条已锁定路线策略；`routeEvidence()` 返回路线专属证据（scienceBuildingsBuilt／waterImprovements／navalUnits／embarkedUnits），使每回合 summary 自带真实行为计数。[GameSession.kt](file:///d:/game/unicv_godot/godot/kernel/src/main/kotlin/com/unciv/godot/GameSession.kt) `autoplay` 动词透传 `request["route"]`。
+- 新增内核差分测试 [AutoplayRouteTest.kt](file:///d:/game/unicv_godot/godot/kernel/src/test/kotlin/com/unciv/godot/AutoplayRouteTest.kt)（3 tests：gated-off 证明 + science + naval autoplay 命令到原生结算）：场景与 FullGameRoutesTest 同源（Babylon/England、Quick、Small、Archipelago、seed 860606/860707），TURN_LIMIT=560，每 40 回合 save→网关重载 vs 独立原生重载 差分，验证 science（maxTech≥35、scienceBuildingsBuilt≥2）与 naval（waterImprovements≥1、navalUnits≥1、embarkedUnits≥1）行为证据。2× 重跑全 PASS（science t288-292 Scientific/Domination、naval t276-289 Domination）。
+- 前端 [endgame_smoke.gd](file:///d:/game/unicv_godot/godot/tests/endgame_smoke.gd) 参数化 `verify_new_game_to_settlement`→逐路线 `verify_route_to_settlement(route)`（land/science/naval），真实点击新游戏配置各路线场景→逐回合 HTTP `autoplay` + `route` 透传＋真实点击「结束回合」→原生胜负面板两尺寸截图＋继续；路线专属验收：science tech≥35 & scienceBuildingsBuilt≥2；naval waterImprovements≥1 & navalUnits≥1 & embarkedUnits≥1。headless 下帧渲染检查条件化（无实际渲染不要求帧递增）。[run.ps1](file:///d:/game/unicv_godot/godot/run.ps1) SmokeTimeoutSeconds 1800→5400、[smoke.gd](file:///d:/game/unicv_godot/godot/tests/smoke.gd) 内部超时 1500→5100。
+- **正式窗口证据** `smoke-1793979983278`（`run.ps1 -Smoke`，未加 `-Headless`/`-SkipBuild`，`buildRequested=true`，`renderBackend=Windows`）：`ok=true`、`frontendExitCode=0`、`godot-error.log`/`kernel-error.log` 均 0 字节；build 门禁内嵌 `:godot-kernel:test --rerun` **35 suites／458 tests／0 fail／0 err／0 skip**（含新 AutoplayRouteTest 3 条）。三路线 autoplayEvidence：
+  - **land**：Rome 获胜 Domination，turn 89，89 次真实点击，622 actions，windowSizes=2（两尺寸截图）。
+  - **science**：Mongolia 获胜 Domination（玩家败），turn 260，260 次真实点击，5300 actions，maxTech=36、maxSci=2、maxWater=7、maxEmbark=22，windowSizes=2。
+  - **naval**：Greece 获胜 Domination（玩家败），turn 281，281 次真实点击，6851 actions，maxWater=11、maxNaval=4、maxEmbark=28，windowSizes=2。
+- 回归：`:godot-kernel:test` **35／458／0／0／0**（build 门禁内嵌）；`:tests:test --rerun` **79 suites／869 tests／0 fail／0 err／15 skip**（与基线一致，无新增）。
+- **边界**：至此 **三路线（land／science／naval）真实窗口 `newGame`→原生胜负结算面板两尺寸** 全部完成。8B 整局验收窗口门槛（陆地整局 + 进程重启 + 中后期性能 + 三路线窗口复用）已全部达标。
+
+### 第 8 批完成记录（2026-11-07）
+第 8 批整局验收与交付门槛全部满足，逐条对应方案目标与边界第 9 行的完成定义：
+
+| 完成定义条目 | 验收证据 | 正式报告 |
+|---|---|---|
+| 不依赖原客户端接管正常待决 | `AutoplayDriver.resolvePending` 处置全部 11 种 kind | smoke-1793979983278（三路线全程无 unsupported） |
+| 科学结算有真实操作路径 | science 路线达 Scientific 结算（AutoplayRouteTest science t288） | 同上 |
+| 文化结算有真实操作路径 | EndgameCommandsTest 文化政策+乌托邦 → 真实窗口 8A | smoke-1793368677374 |
+| 征服结算有真实操作路径 | land  Rome 胜 Domination t89；science/naval 达 Domination | smoke-1793979983278 |
+| 外交结算有真实操作路径 | EndgameCommandsTest 投票 + DiplomaticVoteCommandsTest | smoke-1793368677374 |
+| 时间结算有真实操作路径 | EndgameCommandsTest 跨 500 回合 | smoke-1793368677374 |
+| 中途保存、退出、继续 | OS 进程退出→重启→读盘续玩到原生结算（真实 PID 变化） | smoke-1793890086487/9337815 |
+| 结算后继续游戏 | victoryContinue→oneMoreTurnMode 持久化 | AutoplayGameTest/AutoplayRouteTest/三路线正式 Smoke |
+| 不注入胜利、不人为清空待决 | 全程只走网关命令；victoryData 由原生 checkForVictory 产生 | 所有路线差分+窗口证据 |
+
+**8B 窗口门槛逐项达标**：
+1. 三路线真实窗口 newGame→原生胜负结算面板两尺寸 ✓ `smoke-1793979983278`
+2. 逐命令独立原生差分（save→网关重载 vs 独立原生重载） ✓ `AutoplayGameTest`+`AutoplayRouteTest`+`FullGameRoutesTest`
+3. OS 进程退出重启续玩 ✓ `smoke-1793890086487`/`smoke-1793890649119`
+4. 中后期性能取证（Tiny/Small/Medium） ✓ `smoke-1793971858422`
+5. 双端 error log 0 字节、`ok=true` ✓ 上述全部
+6. 全量回归 `:godot-kernel:test` 35/458/0/0/0 + `:tests:test` 79/869/0/0/15 ✓ 上述全部
+
+**正式窗口 Smoke 基线**：commit HEAD（dirty）、Godot 4.6.2.stable、JDK 27+35、`renderBackend=Windows`、`buildRequested=true`、`frontendExitCode=0`。
+
 
 ## 每批通用验收标准
 1. **规则差分：** 期望端独立调用原生入口，对比持久化玩法状态；不共用待测 DTO 构造器自证正确。

@@ -74,7 +74,8 @@ internal class GameSession(root: File, private val saveDirectory: File =
                 ensure(smokeEnabled, "UNKNOWN_COMMAND", "未实现命令：autoplay")
                 ensure(request.integer("revision") == revision, "STALE_STATE", "状态已变化，请刷新后重试")
                 val driver = autoplayDriver ?: AutoplayDriver(this).also { autoplayDriver = it }
-                val summary = driver.playTurn()
+                // route 参数（land/science/naval）由窗口请求携带；缺省 land 保持既有取证调用行为不变。
+                val summary = driver.playTurn(request["route"]?.jsonPrimitive?.contentOrNull ?: "land")
                 return reply("snapshot" to PlayerSnapshot(requireGame()).build(), "autoplay" to summary)
             }
             val requestId = request.text("requestId")
